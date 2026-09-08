@@ -239,7 +239,7 @@ mod tests {
     fn error_display_and_io_conversion() {
         let e = Error::WalCorrupt { offset: 128 };
         assert!(e.to_string().contains("128"));
-        let io = std::io::Error::new(std::io::ErrorKind::Other, "boom");
+        let io = std::io::Error::other("boom");
         let e2: Error = io.into();
         assert!(matches!(e2, Error::Io(_)));
         assert!(std::error::Error::source(&e2).is_some());

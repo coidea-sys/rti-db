@@ -105,10 +105,7 @@ impl UringFile {
                 completed += 1;
             }
             if completed != pushed {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "io_uring lost completion",
-                ));
+                return Err(io::Error::other("io_uring lost completion"));
             }
         }
         Ok(total)
@@ -137,7 +134,7 @@ impl UringFile {
         if completed {
             Ok(())
         } else {
-            Err(io::Error::new(io::ErrorKind::Other, "io_uring lost fsync completion"))
+            Err(io::Error::other("io_uring lost fsync completion"))
         }
     }
 }

@@ -273,7 +273,7 @@ impl UringPipeline {
         }
         let idx = user_data as usize;
         if idx >= self.slots.len() {
-            return Err(io::Error::new(io::ErrorKind::Other, "io_uring bogus user_data").into());
+            return Err(io::Error::other("io_uring bogus user_data").into());
         }
         let slot = &mut self.slots[idx];
         let expect = slot.len;
@@ -363,7 +363,7 @@ impl UringPipeline {
             (true, None) => Ok(()),
             (true, Some(e)) => Err(e.into()),
             (false, _) => {
-                Err(io::Error::new(io::ErrorKind::Other, "io_uring lost fsync completion").into())
+                Err(io::Error::other("io_uring lost fsync completion").into())
             }
         }
     }

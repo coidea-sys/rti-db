@@ -58,6 +58,12 @@ pub struct BitWriter {
     nbits: u32,
 }
 
+impl Default for BitWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BitWriter {
     /// Create a new empty writer.
     pub fn new() -> Self {

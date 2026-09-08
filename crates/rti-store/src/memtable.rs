@@ -176,7 +176,7 @@ impl MemTable {
         let mut out = BTreeMap::new();
         let index = std::mem::take(&mut self.index);
         for (series, entry) in index {
-            if let Some(mut buf) = self.pool.get_mut(entry.slot).map(|b| std::mem::take(b)) {
+            if let Some(mut buf) = self.pool.get_mut(entry.slot).map(std::mem::take) {
                 buf.sort_by_key(|s| s.ts);
                 buf.dedup_by_key(|s| s.ts);
                 out.insert(series, buf);
