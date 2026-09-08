@@ -90,7 +90,7 @@ pub trait EpisodeSink { fn write_chunk(&mut self, cols: &Chunk) -> Result<()>; f
 pub fn export_episode(db: &Db, spec: &EpisodeSpec, sink: impl EpisodeSink) -> Result<ExportMeta>;
 ```
 
-**Contracts.** Output layout follows LeRobot v2 dataset conventions
+**Contracts.** Output layout follows LeRobot dataset conventions (current `data/chunk-000` layout; tracked as LeRobot evolves)
 (`data/chunk-000/episode_000000.parquet` + `meta/`); timestamps remain nanoseconds in a
 `timestamp` column; `frame_hz` resampling uses last-value-carry-forward and records the
 original-sample count per frame in `meta/stats.json`. CLI: `rti-export --db PATH
