@@ -71,6 +71,11 @@ fn encode_frame(rec: &Record, out: &mut [u8; FRAME_LEN]) {
     out[24..28].copy_from_slice(&crc.to_le_bytes());
 }
 
+/// checkpoint 临时文件路径（`wal.log` → `wal.tmp`）。
+fn checkpoint_tmp_path(path: &Path) -> PathBuf {
+    path.with_extension("tmp")
+}
+
 fn decode_frame(buf: &[u8]) -> std::result::Result<Record, ()> {
     if buf.len() < FRAME_LEN {
         return Err(());
@@ -157,12 +162,21 @@ pub struct StdWalWriter {
     /// 下一条记录的偏移。
     offset: u64,
     last_sync: Instant,
+    /// 批量编码暂存缓冲（复用，避免每批分配）。
+    scratch: Vec<u8>,
 }
 
 impl StdWalWriter {
     /// 打开（不存在则创建）`path` 并定位到末尾；已有内容被视为历史有效记录。
+    ///
+    /// v0.6：同时清理 checkpoint 中途崩溃可能遗留的临时文件（`wal.tmp`）——
+    /// rename 之前崩溃时旧 WAL 完好，临时文件可直接删除。
     pub fn open(path: impl AsRef<Path>, sync: SyncPolicy) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
+        let tmp = checkpoint_tmp_path(&path);
+        if tmp.exists() {
+            let _ = std::fs::remove_file(&tmp);
+        }
         let file = OpenOptions::new().read(true).append(true).open(&path).or_else(|_| {
             OpenOptions::new().create(true).read(true).append(true).open(&path)
         })?;
@@ -173,12 +187,95 @@ impl StdWalWriter {
             sync,
             offset,
             last_sync: Instant::now(),
+            scratch: Vec::new(),
         })
     }
 
     /// 文件路径。
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// v0.6：批量追加——整批编码进暂存缓冲、一次 `write_all`，
+    /// 随后只做一次 [`StdWalWriter::maybe_sync`] 检查。
+    ///
+    /// 与逐条 [`WalWriter::append`] 语义等价（同一帧格式、同一策略），
+    /// 但把每条的 `write_all` + 时钟读取摊薄到每批一次；
+    /// [`SyncPolicy::Always`] 下整批一次 sync（调用方按批即组边界）。
+    pub fn append_batch_fast(&mut self, recs: &[Record]) -> Result<()> {
+        if recs.is_empty() {
+            return Ok(());
+        }
+        self.scratch.clear();
+        self.scratch.reserve(recs.len() * FRAME_LEN);
+        for rec in recs {
+            let mut frame = [0u8; FRAME_LEN];
+            encode_frame(rec, &mut frame);
+            self.scratch.extend_from_slice(&frame);
+        }
+        self.writer.write_all(&self.scratch)?;
+        self.offset += self.scratch.len() as u64;
+        self.maybe_sync()
+    }
+
+    /// v0.6：仅在 sync 到期时刷盘（Group：距上次 sync ≥ interval）。
+    ///
+    /// 组提交的调用点（ingest 批边界）以此替代无条件 `sync_now`：
+    /// fsync 频率由策略 interval 决定，而不是由批大小决定。
+    /// `Always` 策略下等同 `sync_now`；`None` 策略下为 no-op。
+    pub fn sync_if_due(&mut self) -> Result<()> {
+        self.maybe_sync()
+    }
+
+    /// v0.6 WAL checkpoint：截断 WAL，仅保留 `keep` 中的记录。
+    ///
+    /// **调用方必须保证**除 `keep` 外的全部记录已被 segment 覆盖并落盘
+    /// （rti-db 在 MemTable seal 成功、segment fsync 之后调用；`keep`
+    /// 为 seal 点后进入新 MemTable、仍需 WAL 保护的记录）。
+    ///
+    /// 崩溃安全：`keep` 先完整编码写入 `wal.tmp` 并 fsync，再原子
+    /// rename 覆盖 `wal.log`，最后 fsync 目录。rename 前崩溃 → 旧 WAL
+    /// 完好（已覆盖记录与 segment 重复，恢复时按 ts 去重）；rename 后
+    /// 崩溃 → 新 WAL（仅 `keep`）+ 已落盘 segment，两方向都无丢失。
+    /// 偏移重置为 `keep` 的字节长度，后续追加接在其后。
+    pub fn checkpoint_keep(&mut self, keep: &[Record]) -> Result<()> {
+        self.writer.flush()?;
+        let tmp = checkpoint_tmp_path(&self.path);
+        {
+            let mut f = File::create(&tmp)?;
+            self.scratch.clear();
+            self.scratch.reserve(keep.len() * FRAME_LEN);
+            for rec in keep {
+                let mut frame = [0u8; FRAME_LEN];
+                encode_frame(rec, &mut frame);
+                self.scratch.extend_from_slice(&frame);
+            }
+            f.write_all(&self.scratch)?;
+            f.sync_data()?;
+        }
+        std::fs::rename(&tmp, &self.path)?;
+        if let Some(dir) = self.path.parent() {
+            // 保证 rename 的目录项持久（Linux 下目录可以只读打开）。
+            if let Ok(d) = File::open(dir) {
+                let _ = d.sync_data();
+            }
+        }
+        let file = OpenOptions::new().read(true).append(true).open(&self.path)?;
+        self.writer = BufWriter::new(file);
+        self.offset = (keep.len() * FRAME_LEN) as u64;
+        self.last_sync = Instant::now();
+        Ok(())
+    }
+
+    /// v0.6：把已缓冲但尚未写给 OS 的字节 flush 到内核（不 fsync）。
+    ///
+    /// ingest 批边界调用：保证「已应用」的记录至少离开进程地址空间——
+    /// 进程崩溃（kill -9）时 OS 页缓存仍在，这是 `put_durable`
+    /// 在 Group/None 档下的崩溃不丢语义基础；机器掉电语义仍由
+    /// [`SyncPolicy`] 的 fsync 频率决定。
+    pub fn flush_os(&mut self) -> Result<()> {
+        self.writer.flush()?;
+        Ok(())
     }
 
     /// 按同步策略决定是否刷盘。
@@ -257,6 +354,27 @@ impl Wal {
     /// 立即 flush 缓冲并 `sync_data`（组提交的组边界 / 关闭前调用）。
     pub fn sync_now(&mut self) -> Result<()> {
         self.inner.sync_now()
+    }
+
+    /// v0.6：批量追加（整批一次编码一次写，按策略检查 sync）。语义同逐条 [`Wal::append`]。
+    pub fn append_batch(&mut self, recs: &[Record]) -> Result<()> {
+        self.inner.append_batch_fast(recs)
+    }
+
+    /// v0.6：仅在 sync 到期时刷盘（组提交的批边界调用；fsync 频率由 interval 决定）。
+    pub fn sync_if_due(&mut self) -> Result<()> {
+        self.inner.sync_if_due()
+    }
+
+    /// v0.6 WAL checkpoint：截断 WAL，仅保留 `keep` 中的记录
+    /// （调用方保证其余记录已全部被 segment 覆盖并落盘）。
+    pub fn checkpoint_keep(&mut self, keep: &[Record]) -> Result<()> {
+        self.inner.checkpoint_keep(keep)
+    }
+
+    /// v0.6：flush 用户态缓冲到 OS（不 fsync）；ingest 批边界调用。
+    pub fn flush_os(&mut self) -> Result<()> {
+        self.inner.flush_os()
     }
 
     /// 当前写入偏移（即逻辑文件长度）。
@@ -496,6 +614,111 @@ mod tests {
         w.sync_now().unwrap();
         drop(w);
         assert_eq!(Wal::recover(&p).unwrap().count(), 4);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// v0.6：checkpoint 截断——截断后 offset 归零、旧记录不可恢复、
+    /// 新写入正常追加且恢复只见新记录。
+    #[test]
+    fn checkpoint_truncates_and_recovers_only_new_records() {
+        let d = tmpdir("checkpoint");
+        let p = d.join("wal.log");
+        {
+            let mut w = Wal::open(&p, SyncPolicy::Always).unwrap();
+            for i in 0..10u32 {
+                w.append(&Record::new(i, i as i64, i as f64)).unwrap();
+            }
+            w.sync_now().unwrap();
+            assert_eq!(w.offset(), 10 * FRAME_LEN as u64);
+            w.checkpoint_keep(&[]).unwrap();
+            assert_eq!(w.offset(), 0, "checkpoint 后偏移归零");
+            assert_eq!(std::fs::metadata(&p).unwrap().len(), 0, "checkpoint 后文件为空");
+            // 截断后继续写入
+            for i in 100..105u32 {
+                w.append(&Record::new(i, i as i64, i as f64)).unwrap();
+            }
+            w.sync_now().unwrap();
+        }
+        let recs: Vec<Record> = Wal::recover(&p).unwrap().collect();
+        assert_eq!(recs.len(), 5, "恢复只能看到 checkpoint 之后的记录");
+        assert_eq!(recs[0], Record::new(100, 100, 100.0));
+        assert_eq!(recs[4], Record::new(104, 104, 104.0));
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// v0.6：checkpoint 保留尾巴——seal 点后进入新 MemTable 的记录
+    /// 必须留在 WAL 中，截断只丢弃已被 segment 覆盖的前缀。
+    #[test]
+    fn checkpoint_keep_preserves_uncovered_tail() {
+        let d = tmpdir("checkpoint-keep");
+        let p = d.join("wal.log");
+        let tail: Vec<Record> = (50..53u32).map(|i| Record::new(i, i as i64, i as f64)).collect();
+        {
+            let mut w = Wal::open(&p, SyncPolicy::Always).unwrap();
+            for i in 0..53u32 {
+                w.append(&Record::new(i, i as i64, i as f64)).unwrap();
+            }
+            w.sync_now().unwrap();
+            // 前 50 条已被 segment 覆盖，保留 50..53
+            w.checkpoint_keep(&tail).unwrap();
+            assert_eq!(w.offset(), 3 * FRAME_LEN as u64);
+            // 截断后追加的新记录接在保留尾巴之后
+            w.append(&Record::new(60, 60, 60.0)).unwrap();
+            w.sync_now().unwrap();
+        }
+        let recs: Vec<Record> = Wal::recover(&p).unwrap().collect();
+        assert_eq!(recs.len(), 4, "保留尾巴 3 条 + 新追加 1 条");
+        assert_eq!(recs[0], Record::new(50, 50, 50.0));
+        assert_eq!(recs[3], Record::new(60, 60, 60.0));
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// v0.6：checkpoint 中途崩溃模拟——rename 前留下 wal.tmp，
+    /// 旧 WAL 完好；再次打开时临时文件被清理，数据无损。
+    #[test]
+    fn stale_checkpoint_tmp_is_cleaned_on_open() {
+        let d = tmpdir("checkpoint-stale");
+        let p = d.join("wal.log");
+        {
+            let mut w = Wal::open(&p, SyncPolicy::Always).unwrap();
+            w.append(&Record::new(1, 10, 1.5)).unwrap();
+            w.sync_now().unwrap();
+        }
+        // 模拟 rename 前崩溃：留下非空 wal.tmp
+        std::fs::write(d.join("wal.tmp"), b"garbage").unwrap();
+        {
+            let mut w = Wal::open(&p, SyncPolicy::Always).unwrap();
+            assert!(!d.join("wal.tmp").exists(), "open 必须清理遗留临时文件");
+            w.append(&Record::new(2, 20, 2.5)).unwrap();
+            w.sync_now().unwrap();
+        }
+        let recs: Vec<Record> = Wal::recover(&p).unwrap().collect();
+        assert_eq!(recs.len(), 2, "旧 WAL 不受遗留临时文件影响");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// v0.6：批量追加与逐条追加帧格式逐字节一致。
+    #[test]
+    fn append_batch_matches_per_record_encoding() {
+        let d = tmpdir("batch");
+        let p1 = d.join("a.log");
+        let p2 = d.join("b.log");
+        let recs: Vec<Record> = (0..50u32).map(|i| Record::new(i, i as i64 * 7, i as f64 * 0.5)).collect();
+        {
+            let mut w = Wal::open(&p1, SyncPolicy::None).unwrap();
+            for r in &recs {
+                w.append(r).unwrap();
+            }
+            w.sync_now().unwrap();
+        }
+        {
+            let mut w = Wal::open(&p2, SyncPolicy::None).unwrap();
+            w.append_batch(&recs).unwrap();
+            assert_eq!(w.offset(), 50 * FRAME_LEN as u64);
+            w.sync_now().unwrap();
+        }
+        assert_eq!(std::fs::read(&p1).unwrap(), std::fs::read(&p2).unwrap(), "批量与逐条编码必须一致");
+        assert_eq!(Wal::recover(&p2).unwrap().count(), 50);
         std::fs::remove_dir_all(&d).ok();
     }
 

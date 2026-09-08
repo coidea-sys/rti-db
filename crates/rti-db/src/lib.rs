@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use rti_buffer::SpscRing;
 use rti_core::{Config, Error, Profile, Result, Sample, SeriesId, SyncPolicy, Timestamp};
@@ -38,17 +39,18 @@ pub use rti_mem::alloc_count::{alloc_count, CountingAllocator};
 
 /// ingest ring 默认容量（2 的幂）。
 const RING_CAP: usize = 1 << 16;
-/// ingest 线程单批最大处理条数（组提交粒度）。
-const BATCH: usize = 1024;
+/// ingest 线程单批最大处理条数（v0.6 动态批：单次唤醒尽量 drain
+/// ring，以此上限分批；fsync 频率由 SyncPolicy interval 决定而非批大小）。
+const BATCH_MAX: usize = 8192;
 /// MemTable 序列槽位数上限。
 const MAX_SERIES: usize = 4096;
 
 /// 内部共享状态（ingest 线程与查询线程共享）。
 struct Shared {
     state: Mutex<DbState>,
-    /// 已入队计数（put 成功后 +1）。
+    /// 已入队计数（put 成功后 +1；即下一张水位票据的基数）。
     enqueued: AtomicU64,
-    /// 已被 ingest 线程应用计数。
+    /// 已被 ingest 线程应用计数（= durable 水位，v0.6）。
     acked: AtomicU64,
     /// ingest 线程致命错误（set 后 put/scan 失败）。
     err: Mutex<Option<String>>,
@@ -186,6 +188,7 @@ impl Db {
             let mut state = shared.state.lock().unwrap();
             for rec in Wal::recover(dir.join("wal.log"))? {
                 if state.mem.is_full() {
+                    // 恢复重放期间禁止 checkpoint WAL（重放尚未读完）。
                     seal_memtable(&shared, &mut state)?;
                 }
                 state.mem.insert(rec.series, rec.sample)?;
@@ -233,10 +236,13 @@ impl Db {
     /// 不阻塞、不重试、不影响返回值）。
     pub fn put(&self, series: SeriesId, sample: Sample) -> Result<()> {
         self.check_err()?;
-        // 先占位计数，保证 flush 的 enqueued/acked 比较无竞态
+        // 占位计数与入队在同一临界区：序号（水位票据）与 ring 顺序一致，
+        // 这是 put_durable 等待语义的正确性基础；单写者时锁无竞争。
+        let prod = self.producer.lock().unwrap();
         self.shared.enqueued.fetch_add(1, Ordering::SeqCst);
-        match self.producer.lock().unwrap().push(Record { series, sample }) {
+        match prod.push(Record { series, sample }) {
             Ok(()) => {
+                drop(prod);
                 self.mirror_send(series, &sample);
                 Ok(())
             }
@@ -245,6 +251,55 @@ impl Db {
                 Err(Error::SeriesFull)
             }
         }
+    }
+
+    /// 写入一个采样点并**阻塞等待其持久化**（v0.6，崩溃不丢档）。
+    ///
+    /// 与 [`Db::put`] 同样先入队（低延迟路径不变），随后等待 ingest
+    /// 线程完成「应用 MemTable + WAL append」（是否含 fsync 由当前
+    /// [`SyncPolicy`] 决定：`Always` 含每条刷盘；`Group` 受组提交窗口
+    /// 约束，进程崩溃时 OS 页缓存内的已写数据仍在，但机器掉电语义
+    /// 以 interval 为上界；`None` 不刷盘）。返回时的 durable 水位序号
+    /// （≥ 本记录的序号，单调递增）。
+    ///
+    /// 超时返回 [`Error::Timeout`]，但**数据不丢**：记录仍在 ingest
+    /// 管线中，稍后会持久化；调用方可稍后用 [`Db::durable_watermark`]
+    /// 复查。ring 满返回 [`Error::SeriesFull`]（背压，未入队，可重试）。
+    pub fn put_durable(&self, series: SeriesId, sample: Sample, timeout: Duration) -> Result<u64> {
+        self.check_err()?;
+        let ticket = {
+            let prod = self.producer.lock().unwrap();
+            let t = self.shared.enqueued.fetch_add(1, Ordering::SeqCst) + 1;
+            match prod.push(Record { series, sample }) {
+                Ok(()) => t,
+                Err(_) => {
+                    self.shared.enqueued.fetch_sub(1, Ordering::SeqCst);
+                    return Err(Error::SeriesFull);
+                }
+            }
+        };
+        self.mirror_send(series, &sample);
+        let deadline = Instant::now() + timeout;
+        loop {
+            let wm = self.shared.acked.load(Ordering::SeqCst);
+            if wm >= ticket {
+                return Ok(wm);
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::Timeout);
+            }
+            self.check_err()?;
+            std::thread::yield_now();
+        }
+    }
+
+    /// 当前 durable 水位（v0.6）：已被 ingest 线程「应用 MemTable +
+    /// WAL append」的记录总数（按入队序号），单调递增。
+    ///
+    /// [`Db::put_durable`] 返回的水位 ≥ 其记录序号即表示该记录已持久化
+    /// （fsync 与否取决于 [`SyncPolicy`]，同上）。
+    pub fn durable_watermark(&self) -> u64 {
+        self.shared.acked.load(Ordering::SeqCst)
     }
 
     /// 镜像发送：20 字节小端数据报（series | ts | value bits）。
@@ -409,7 +464,14 @@ impl Db {
             return Ok(());
         }
         let mut state = self.shared.state.lock().unwrap();
-        seal_memtable(&self.shared, &mut state)
+        seal_memtable(&self.shared, &mut state)?;
+        // v0.6：手动 seal 后 MemTable 必为空 ⇒ WAL 中记录全部被
+        // segment 覆盖（WAL 不变式：WAL 恰好保护当前 MemTable 的内容），
+        // 直接截断为空。
+        if let Some(wal) = &mut state.wal {
+            wal.checkpoint_keep(&[])?;
+        }
+        Ok(())
     }
 
     /// 从缓冲池取一个结果缓冲（稳态复用）。
@@ -556,16 +618,17 @@ impl Drop for ScanIter {
     }
 }
 
-/// ingest 线程主循环：批量出队 → 批量 WAL append → 组提交 → MemTable。
+/// ingest 线程主循环：单次唤醒尽量 drain ring（动态批，上限
+/// [`BATCH_MAX`]）→ 整批 WAL append → 到期组提交 → MemTable。
 fn ingest_loop(
     shared: Arc<Shared>,
     consumer: rti_buffer::SpscConsumer<Record>,
     shutdown: Arc<AtomicBool>,
 ) {
-    let mut batch: Vec<Record> = Vec::with_capacity(BATCH);
+    let mut batch: Vec<Record> = Vec::with_capacity(BATCH_MAX);
     loop {
         batch.clear();
-        while batch.len() < BATCH {
+        while batch.len() < BATCH_MAX {
             match consumer.pop() {
                 Some(r) => batch.push(r),
                 None => break,
@@ -593,22 +656,36 @@ fn ingest_loop(
     }
 }
 
-/// 应用一批记录：WAL（含组提交）→ MemTable（满则 seal；
-/// Deterministic 档跳过 WAL，满则 LRU 丢弃）。
+/// 应用一批记录：WAL（整批一次写 + 到期组提交 + 批末 flush 到 OS）→
+/// MemTable（满则 seal）；批内发生过 seal 时，批末对 WAL 做
+/// checkpoint——只截断已被 segment 覆盖的前缀，保留 seal 点后进入
+/// 新 MemTable 的尾巴（`keep`）。Deterministic 档跳过 WAL，满则 LRU 丢弃。
 fn apply_batch(shared: &Shared, batch: &[Record]) -> Result<()> {
     let deterministic = shared.config.profile == Profile::Deterministic;
     let mut state = shared.state.lock().unwrap();
     if let Some(wal) = &mut state.wal {
-        for rec in batch {
-            wal.append(rec)?;
-        }
-        // 组提交边界：Group 策略下由 Wal::append 内部按间隔 sync，
-        // 这里在每批结束再检查一次，确保批间时延有界。
-        if let SyncPolicy::Group { .. } = shared.config.wal_sync {
-            wal.sync_now()?;
+        match shared.config.wal_sync {
+            // Always 保持逐条 append（每条 fsync，v0.1 语义不变）。
+            SyncPolicy::Always => {
+                for rec in batch {
+                    wal.append(rec)?;
+                }
+            }
+            // Group/None：整批一次编码一次写；fsync 频率由 interval
+            // 决定（批边界仅到期才刷），不再每批无条件 fsync；
+            // 批末 flush_os 保证已应用记录至少进入 OS 页缓存
+            // （进程崩溃不丢；机器掉电窗口仍由 interval 决定）。
+            _ => {
+                wal.append_batch(batch)?;
+                wal.sync_if_due()?;
+                wal.flush_os()?;
+            }
         }
     }
-    for rec in batch {
+    // 批内最后一次 seal 对应的 batch 下标：seal 点之后的记录仍需要
+    // WAL 保护（它们只在新 MemTable 中），checkpoint 时必须保留。
+    let mut keep_from: Option<usize> = None;
+    for (j, rec) in batch.iter().enumerate() {
         if deterministic {
             // 纯内存：满则 LRU 丢弃最老序列（内部计数），永不 seal。
             state.mem.insert_lru(rec.series, rec.sample)?;
@@ -616,21 +693,36 @@ fn apply_batch(shared: &Shared, batch: &[Record]) -> Result<()> {
         }
         if state.mem.is_full() {
             seal_memtable(shared, &mut state)?;
+            keep_from = Some(j);
         }
         match state.mem.insert(rec.series, rec.sample) {
             Ok(()) => {}
             Err(Error::SeriesFull) => {
                 // 序列数超池容量：seal 后重试一次
                 seal_memtable(shared, &mut state)?;
+                keep_from = Some(j);
                 state.mem.insert(rec.series, rec.sample)?;
             }
             Err(e) => return Err(e),
+        }
+    }
+    // v0.6 WAL checkpoint：本批发生过 seal ⇒ 最后一次 seal 点之前的
+    // 全部 WAL 记录已被 segment 覆盖（segment 已 fsync 落盘），
+    // 原子截断并保留 seal 点后的尾巴。批内无 seal 则不截断——
+    // 当前 MemTable 的记录仍由 WAL 保护。
+    if let Some(j) = keep_from {
+        if let Some(wal) = &mut state.wal {
+            wal.checkpoint_keep(&batch[j..])?;
         }
     }
     Ok(())
 }
 
 /// 将 MemTable 落盘为一个（按序列分组，每序列一个）segment，并登记 reader。
+///
+/// 本函数**不**截断 WAL：WAL checkpoint 由调用方在确知「被覆盖前缀
+/// 与待保留尾巴」的边界后执行（见 `apply_batch` 的 `keep_from` 与
+/// `Db::seal`）；恢复重放期间调用本函数后同样不得截断（重放未读完）。
 fn seal_memtable(shared: &Shared, state: &mut DbState) -> Result<()> {
     let data: BTreeMap<SeriesId, Vec<Sample>> = state.mem.take();
     if data.is_empty() {
@@ -1124,6 +1216,177 @@ mod tests {
                 assert_eq!(&got, want, "series {s} 重启后 scan 必须一致");
             }
         }
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// v0.6 点名：put_durable 确认的点在模拟崩溃（不执行 Drop、
+    /// 无最终 flush/sync，等价 kill -9）后重启 0 丢失。
+    #[test]
+    fn put_durable_survives_simulated_crash() {
+        let d = tmpdir("durable-crash");
+        let cfg = config(d.clone(), 1 << 16);
+        {
+            let db = Db::open(cfg.clone()).unwrap();
+            for i in 0..500i64 {
+                let wm = db
+                    .put_durable(1, Sample::new(i, i as f64), Duration::from_secs(5))
+                    .unwrap();
+                assert!(wm >= (i + 1) as u64, "返回水位必须 ≥ 本记录序号");
+            }
+            assert_eq!(db.durable_watermark(), 500);
+            // 模拟 kill -9：不执行 Drop（ingest 不再 drain、无最终 sync）。
+            // ingest 批末 flush_os 已保证已确认记录进入 OS 页缓存。
+            std::mem::forget(db);
+        }
+        let db = Db::open(cfg).unwrap();
+        let got: Vec<Sample> = db.scan(1, 0, 499, None, None).unwrap().collect();
+        assert_eq!(got.len(), 500, "put_durable 已确认的点必须 0 丢失");
+        assert_eq!(got[250].value, 250.0);
+        drop(db);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// v0.6 点名：durable_watermark 单调递增，且与 put/put_durable 计数一致。
+    #[test]
+    fn durable_watermark_monotonic_and_matches_puts() {
+        let d = tmpdir("watermark");
+        let db = Db::open(config(d.clone(), 1 << 10)).unwrap();
+        let mut last = 0;
+        for i in 0..200i64 {
+            let wm = db
+                .put_durable(3, Sample::new(i, i as f64), Duration::from_secs(5))
+                .unwrap();
+            assert!(wm >= last, "水位必须单调递增（{wm} < {last}）");
+            last = wm;
+        }
+        assert_eq!(db.durable_watermark(), 200);
+        // 混合异步 put：flush 后水位覆盖全部已入队记录
+        for i in 200..400i64 {
+            db.put(3, Sample::new(i, i as f64)).unwrap();
+        }
+        db.flush().unwrap();
+        assert_eq!(db.durable_watermark(), 400);
+        drop(db);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// v0.6：put_durable 超时返回 Err(Timeout) 但数据不丢（仍在管线中）。
+    #[test]
+    fn put_durable_timeout_keeps_data_in_pipeline() {
+        let d = tmpdir("durable-timeout");
+        let db = Db::open(config(d.clone(), 1 << 10)).unwrap();
+        // 零超时：可能 Ok（恰好已应用）或 Timeout；两种结果都合法
+        let r = db.put_durable(5, Sample::new(1, 42.0), Duration::ZERO);
+        match r {
+            Ok(_) | Err(Error::Timeout) => {}
+            Err(e) => panic!("只允许 Ok 或 Timeout，得到 {e}"),
+        }
+        // 无论是否超时，记录最终必须持久可查
+        db.flush().unwrap();
+        let got: Vec<Sample> = db.scan(5, 0, 10, None, None).unwrap().collect();
+        assert_eq!(got, vec![Sample::new(1, 42.0)], "超时不等于丢数据");
+        assert_eq!(db.durable_watermark(), 1);
+        drop(db);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// v0.6 点名：seal 后 WAL 被 checkpoint 截断，稳态落盘
+    /// ≈ segment + 至多一个 MemTable 的 WAL 尾巴。
+    #[test]
+    fn wal_checkpoint_truncates_after_seal() {
+        let d = tmpdir("wal-checkpoint");
+        let wal = d.join("wal.log");
+        let db = Db::open(config(d.clone(), 1024)).unwrap();
+        for i in 0..10_000i64 {
+            db.put(1, Sample::new(i, i as f64)).unwrap();
+        }
+        db.flush().unwrap();
+        // 自动 seal 约 9 次；WAL 只剩最后一个未满 MemTable 的尾巴
+        let mid = std::fs::metadata(&wal).unwrap().len();
+        assert!(
+            mid <= 1024 * 28,
+            "自动 seal 后 WAL 必须被 checkpoint 截断（实际 {mid} 字节）"
+        );
+        assert!(db.segment_count() >= 9, "10_000 点 / 1024 容量应多次 seal");
+        // 手动 seal 剩余 MemTable 后 WAL 必须为空
+        db.seal().unwrap();
+        let after = std::fs::metadata(&wal).unwrap().len();
+        assert_eq!(after, 0, "手动 seal 后 WAL 必须为空（实际 {after} 字节）");
+        // 数据完整性不受截断影响
+        assert_eq!(db.scan(1, 0, 9999, None, None).unwrap().count(), 10_000);
+        drop(db);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// v0.6 点名：稳态总落盘 ≤ 1.5× segment 大小（WAL 不再与
+    /// segment 并存双份）。
+    #[test]
+    fn steady_state_disk_within_1_5x_segments() {
+        let d = tmpdir("disk-ratio");
+        let db = Db::open(config(d.clone(), 4096)).unwrap();
+        let mut i = 0i64;
+        while i < 100_000 {
+            match db.put((i % 8) as u32, Sample::new(i / 8, i as f64)) {
+                Ok(()) => i += 1,
+                Err(Error::SeriesFull) => std::thread::yield_now(),
+                Err(e) => panic!("put: {e}"),
+            }
+        }
+        db.flush().unwrap();
+        // 不做手动 seal：稳态 = 已 seal 的 segment + WAL 尾巴（≤ 1 个 MemTable）
+        let mut seg_bytes = 0u64;
+        let mut wal_bytes = 0u64;
+        for e in std::fs::read_dir(&d).unwrap() {
+            let e = e.unwrap();
+            let ext = e.path().extension().map(|x| x.to_string_lossy().into_owned());
+            match ext.as_deref() {
+                Some("seg") => seg_bytes += e.metadata().unwrap().len(),
+                _ => {
+                    if e.file_name() == "wal.log" {
+                        wal_bytes += e.metadata().unwrap().len();
+                    }
+                }
+            }
+        }
+        assert!(seg_bytes > 0);
+        assert!(wal_bytes <= 4096 * 28, "WAL 尾巴不得超出一个 MemTable（{wal_bytes}）");
+        let total = seg_bytes + wal_bytes;
+        assert!(
+            total * 2 <= seg_bytes * 3,
+            "稳态总落盘 {total} 必须 ≤ 1.5× segment {seg_bytes}"
+        );
+        drop(db);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// v0.6 点名：截断点前后混合场景——崩溃恢复在 checkpoint 后仍正确
+    /// （segment 中的旧数据 + WAL 尾巴中的新数据，无丢失无重复）。
+    #[test]
+    fn recovery_correct_across_checkpoint_mixed() {
+        let d = tmpdir("ckpt-mixed");
+        let cfg = config(d.clone(), 1024);
+        {
+            let db = Db::open(cfg.clone()).unwrap();
+            // 第一批：触发多次自动 seal + checkpoint
+            for i in 0..5_000i64 {
+                db.put(1, Sample::new(i, i as f64)).unwrap();
+            }
+            db.flush().unwrap();
+            // 第二批：checkpoint 之后进入新 WAL 尾巴（尚未 seal）
+            for i in 5_000..5_700i64 {
+                db.put(1, Sample::new(i, i as f64)).unwrap();
+            }
+            db.flush().unwrap();
+            assert!(std::fs::metadata(d.join("wal.log")).unwrap().len() <= 1024 * 28);
+            // 模拟崩溃：不 Drop（ingest 已 drain 且 flush_os，无最终 sync）
+            std::mem::forget(db);
+        }
+        let db = Db::open(cfg).unwrap();
+        let got: Vec<Sample> = db.scan(1, 0, 5699, None, None).unwrap().collect();
+        assert_eq!(got.len(), 5_700, "截断后恢复必须无丢失无重复");
+        assert!(got.windows(2).all(|w| w[0].ts < w[1].ts));
+        assert_eq!(got[5_650].value, 5_650.0);
+        drop(db);
         std::fs::remove_dir_all(&d).ok();
     }
 

@@ -81,6 +81,10 @@ impl SegmentWriter {
     /// 将 `samples`（按 ts 排序）写入 `path`，返回 zone map。
     ///
     /// 先写临时文件再 rename，保证崩溃时不会出现半个 segment。
+    ///
+    /// v0.6：rename 前对临时文件 `sync_data`、rename 后 fsync 目录——
+    /// rti-db 的 WAL checkpoint 依赖「segment 落盘成功 ⇒ 数据已持久」，
+    /// 否则截断 WAL 后崩溃可能丢数据。
     pub fn write(path: impl AsRef<Path>, series: SeriesId, samples: &[Sample]) -> Result<ZoneMap> {
         let zm = ZoneMap::from_samples(samples).ok_or(Error::Corrupt("empty segment".into()))?;
         let mut ts_col = Vec::new();

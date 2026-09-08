@@ -180,6 +180,9 @@ pub enum Error {
     /// 在途流水深度已满，写入被拒绝（背压信号，调用方可稍后重试；
     /// v0.5 io_uring 在途批流水 `BackpressurePolicy::Error` 下产生）。
     Backpressure,
+    /// 等待持久化确认超时（v0.6 `put_durable`）。**数据未丢失**——
+    /// 记录仍在 ingest 管线中，稍后将持久化；调用方可重查水位或重试等待。
+    Timeout,
 }
 
 impl core::fmt::Display for Error {
@@ -193,6 +196,7 @@ impl core::fmt::Display for Error {
             Error::Protocol(m) => write!(f, "protocol error: {m}"),
             Error::Corrupt(m) => write!(f, "corrupt data: {m}"),
             Error::Backpressure => write!(f, "in-flight pipeline full (backpressure)"),
+            Error::Timeout => write!(f, "timed out waiting for durable watermark (data still in pipeline)"),
         }
     }
 }
