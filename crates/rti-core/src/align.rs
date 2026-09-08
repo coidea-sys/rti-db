@@ -178,7 +178,7 @@ mod tests {
         // MIN 的数学网格点超出 i64 范围 → 饱和到 MIN（不回绕）
         assert_eq!(lo, i64::MIN);
         // MAX 侧网格点在范围内 → 严格对齐
-        assert!(hi <= i64::MAX && hi > i64::MAX - 3);
+        assert!(hi > i64::MAX - 3); // hi is always <= i64::MAX by type
         assert_eq!(hi.rem_euclid(3), 0);
         assert_eq!(b.jitter(i64::MAX) + hi, i64::MAX);
     }

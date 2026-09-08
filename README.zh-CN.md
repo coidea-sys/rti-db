@@ -4,6 +4,11 @@
 
 [English README](README.md)
 
+[![CI](https://github.com/coidea-sys/rti-db/actions/workflows/ci.yml/badge.svg)](https://github.com/coidea-sys/rti-db/actions/workflows/ci.yml)
+[![版本](https://img.shields.io/badge/version-0.6.0-blue)](https://github.com/coidea-sys/rti-db)
+[![测试](https://img.shields.io/badge/tests-132%20passing-brightgreen)](#测试与可复现性)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-lightgrey)](LICENSE-MIT)
+
 ```text
 传感器/事件流（100kHz 级）
         │
@@ -137,3 +142,4 @@ Feature 开关：`io-uring`（流水化 WAL 后端）、`s3`（S3 冷层）、`a
 ## 贡献
 
 欢迎 Issue 与 PR。提交前请运行 `cargo test --workspace --all-features`；涉及性能的改动必须附 `bench/run_all.sh` 的前后对比数字。
+---

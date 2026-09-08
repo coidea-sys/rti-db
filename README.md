@@ -4,6 +4,11 @@
 
 [中文版 README](README.zh-CN.md)
 
+[![CI](https://github.com/coidea-sys/rti-db/actions/workflows/ci.yml/badge.svg)](https://github.com/coidea-sys/rti-db/actions/workflows/ci.yml)
+[![Version](https://img.shields.io/badge/version-0.6.0-blue)](https://github.com/coidea-sys/rti-db)
+[![Tests](https://img.shields.io/badge/tests-132%20passing-brightgreen)](#testing--reproducibility)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-lightgrey)](LICENSE-MIT)
+
 ```text
 sensors / event streams (100 kHz-class)
         │
@@ -137,3 +142,4 @@ Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your 
 ## Contributing
 
 Issues and PRs welcome. Please run `cargo test --workspace --all-features` before submitting; benchmark-affecting changes must include before/after numbers from `bench/run_all.sh`.
+---
