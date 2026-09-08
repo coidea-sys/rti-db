@@ -251,13 +251,19 @@ impl StdWalWriter {
                 self.scratch.extend_from_slice(&frame);
             }
             f.write_all(&self.scratch)?;
-            f.sync_data()?;
+            // SyncPolicy::None（「不刷盘」语义）下跳过 fsync：
+            // 进程崩溃安全由页缓存保证，不为未要求的持久性付费。
+            if self.sync != SyncPolicy::None {
+                f.sync_data()?;
+            }
         }
         std::fs::rename(&tmp, &self.path)?;
-        if let Some(dir) = self.path.parent() {
-            // 保证 rename 的目录项持久（Linux 下目录可以只读打开）。
-            if let Ok(d) = File::open(dir) {
-                let _ = d.sync_data();
+        if self.sync != SyncPolicy::None {
+            if let Some(dir) = self.path.parent() {
+                // 保证 rename 的目录项持久（Linux 下目录可以只读打开）。
+                if let Ok(d) = File::open(dir) {
+                    let _ = d.sync_data();
+                }
             }
         }
         let file = OpenOptions::new().read(true).append(true).open(&self.path)?;

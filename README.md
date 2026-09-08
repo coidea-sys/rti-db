@@ -67,6 +67,64 @@ bash scripts/check-no-std.sh     # no_std 冒烟（rti-core/rti-mem/rti-buffer�
 cargo run --release --example bench -p rti-db   # 吞吐/时延/压缩比/解码对比
 ```
 
+## v0.6 新特性 — 持久性语义分档、WAL checkpoint、组提交优化（Wave 6）
+
+v0.6 修复权威评测（见《rti-db 权威基准评测报告》§四/§五）暴露的三个短板：
+**Group 档 kill -9 丢失 13.2% 在途点、100 万点落盘 38.1MB（0.42× 膨胀）、
+Group 档批量吞吐仅 368k pts/s**。
+
+### 1. 写入语义两档：put = 低延迟尽力持久，put_durable = 崩溃不丢
+
+- `Db::put(series, sample)`：语义不变——无锁 SPSC 入队即返回（p50 亚微秒）。
+  崩溃窗口 = ring 中未出队的点 + 组提交窗口。适用于可丢失最近 N 秒的
+  监控/遥测场景。
+- `Db::put_durable(series, sample, timeout) -> Result<u64>`（新增）：入队后
+  阻塞等待 ingest 线程完成「应用 MemTable + WAL append 并 flush 到 OS」，
+  返回 durable 水位序号。是否含 fsync 由当前 `SyncPolicy` 决定
+  （`Always` 每条刷盘；`Group` 机器掉电窗口 ≤ interval；`None` 不刷盘）。
+  **进程崩溃（kill -9）语义**：ingest 每批结束把 WAL 缓冲 flush 到 OS
+  页缓存（`flush_os`，不 fsync），因此 `put_durable` 返回即保证已确认点
+  在进程崩溃后不丢——新测试 `put_durable_survives_simulated_crash`
+  （跳过 Drop 模拟 kill -9 后重开，500/500 点零丢失）。
+  超时返回 `Error::Timeout`，但**数据不丢**（仍在管线中，随后持久化，
+  可用水位复查）。
+- `Db::durable_watermark() -> u64`（新增）：当前已持久化水位
+  （已被 ingest 应用的入队序号），单调递增。正确性基础：占位计数与
+  入队在同一临界区完成，水位票据与 ring 顺序严格一致。
+
+### 2. WAL checkpoint：segment seal 后截断 WAL 前缀
+
+- MemTable seal 为 segment（临时文件 + fsync + 原子 rename + 目录 fsync，
+  v0.6 补齐）成功后，WAL 中已被 segment 覆盖的前缀被截断：保留 seal 点后
+  进入新 MemTable 的尾巴记录（`Wal::checkpoint_keep`），整体写入
+  `wal.tmp`、fsync、原子 rename、目录 fsync。rename 前崩溃 → 旧 WAL
+  完好（与 segment 重复，恢复按 ts 去重）；rename 后崩溃 → 新 WAL +
+  已落盘 segment。两方向均无丢失。
+- 恢复重放期间**禁止** checkpoint（重放未读完）；重启恢复从截断后的
+  WAL 起点重放，天然兼容。不变式：WAL 恰好保护当前 MemTable 的内容，
+  稳态落盘 ≈ segment + ≤ 1 个 MemTable 的 WAL 尾巴。
+
+### 3. 组提交吞吐优化
+
+- ingest 线程单次唤醒尽量 drain ring（动态批，上限 `BATCH_MAX = 8192`），
+  WAL 整批一次编码一次 `write_all`；
+- fsync 频率由 `SyncPolicy::Group` 的 interval 门控（`sync_if_due`），
+  **不再每批无条件 fsync**（v0.5 每 1024 条一次 fsync 是 368k pts/s
+  的主因）；
+- `SyncPolicy::Always` 语义不变（逐条 append + fsync）。
+
+### v0.5 → v0.6 实测对比（同机同评测台，`bench-harness` 全量复测）
+
+| 指标 | v0.5 | v0.6 | 变化 |
+|---|---|---|---|
+| Group(1ms) 崩溃丢失点（50 万点 kill -9） | 65,824（13.2%） | TBD | TBD |
+| 100 万点落盘 | 38.1MB（0.42× 膨胀） | TBD | TBD |
+| Group(1ms) 批量吞吐 | 368k pts/s | TBD | TBD |
+| Group(1ms) put p999 | 17.9µs | TBD | TBD |
+
+（复测原始数据：`bench-results-v06/rtidb.json`、`bench-results-v06/recovery.json`；
+v0.5 基线：`bench-results/`。）
+
 ## v0.5 新特性（Wave 4 Stream A：rti-raft 增强）
 
 在 v0.4 核心四件事之上补齐三个生产级机制，全部保持

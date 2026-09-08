@@ -739,7 +739,14 @@ fn seal_memtable(shared: &Shared, state: &mut DbState) -> Result<()> {
         *seq += 1;
         drop(seq);
         let path = dir.join(&name);
-        SegmentWriter::write(&path, series, &samples)?;
+        // SyncPolicy::None = 「不刷盘」档：segment 也不 fsync（v0.5 行为），
+        // 避免为未要求的持久性付 fsync 税；Group/Always 走持久化写入，
+        // 这是 WAL checkpoint 截断的崩溃安全前提。
+        if shared.config.wal_sync == SyncPolicy::None {
+            SegmentWriter::write_unsynced(&path, series, &samples)?;
+        } else {
+            SegmentWriter::write(&path, series, &samples)?;
+        }
         state.segments.push(SegEntry::local(name, SegmentReader::open(&path)?));
     }
     Ok(())

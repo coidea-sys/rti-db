@@ -85,7 +85,21 @@ impl SegmentWriter {
     /// v0.6：rename 前对临时文件 `sync_data`、rename 后 fsync 目录——
     /// rti-db 的 WAL checkpoint 依赖「segment 落盘成功 ⇒ 数据已持久」，
     /// 否则截断 WAL 后崩溃可能丢数据。
+    ///
+    /// [`SyncPolicy::None`](rti_core::SyncPolicy) 的调用方应使用
+    /// [`SegmentWriter::write_unsynced`]（v0.5 行为，全程无 fsync）。
     pub fn write(path: impl AsRef<Path>, series: SeriesId, samples: &[Sample]) -> Result<ZoneMap> {
+        Self::write_impl(path, series, samples, true)
+    }
+
+    /// 不 fsync 的 segment 写入（v0.5 行为）：进程崩溃（kill -9）安全
+    /// （页缓存仍在），机器掉电不保证——仅供 `SyncPolicy::None`
+    /// （语义即「不刷盘」）的 seal 路径使用，避免为不要求的持久性付费。
+    pub fn write_unsynced(path: impl AsRef<Path>, series: SeriesId, samples: &[Sample]) -> Result<ZoneMap> {
+        Self::write_impl(path, series, samples, false)
+    }
+
+    fn write_impl(path: impl AsRef<Path>, series: SeriesId, samples: &[Sample], sync: bool) -> Result<ZoneMap> {
         let zm = ZoneMap::from_samples(samples).ok_or(Error::Corrupt("empty segment".into()))?;
         let mut ts_col = Vec::new();
         let mut val_col = Vec::new();
@@ -113,12 +127,16 @@ impl SegmentWriter {
             use std::io::Write;
             let mut f = fs::File::create(&tmp)?;
             f.write_all(&buf)?;
-            f.sync_data()?;
+            if sync {
+                f.sync_data()?;
+            }
         }
         fs::rename(&tmp, path)?;
-        if let Some(dir) = path.parent() {
-            if let Ok(d) = fs::File::open(dir) {
-                let _ = d.sync_data();
+        if sync {
+            if let Some(dir) = path.parent() {
+                if let Ok(d) = fs::File::open(dir) {
+                    let _ = d.sync_data();
+                }
             }
         }
         Ok(zm)
