@@ -6,7 +6,7 @@
 //! - `std`            : StdWalWriter (v0.1 semantics, BufWriter + sync_data)
 //! - `uring-sync`     : IoUringWalWriter (v0.2, blocks after SQE submission until completion)
 //! - `uring-pipeline` : IoUringPipelinedWalWriter (v0.5, multiple batches in flight,
-//!                      CQE reap loop, sync waits only for its own group, depth 64)
+//!   CQE reap loop, sync waits only for its own group, depth 64)
 //!
 //! Scenarios:
 //! - throughput   : write N records with SyncPolicy::None + one final sync (exercises the submit path)

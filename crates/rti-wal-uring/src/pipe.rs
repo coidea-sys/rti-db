@@ -138,7 +138,7 @@ impl UringPipeline {
     pub fn open(path: impl AsRef<Path>, cfg: PipelineConfig) -> io::Result<Self> {
         let path = path.as_ref();
         let start = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        let file = OpenOptions::new().create(true).write(true).open(path)?;
+        let file = OpenOptions::new().create(true).write(true).truncate(false).open(path)?;
         Self::from_file(file, cfg, start)
     }
 
@@ -204,7 +204,7 @@ impl UringPipeline {
         let slot_bytes = self.slot_bytes();
         // Error policy: pre-check, guaranteeing the whole batch is either fully submitted or not submitted at all.
         if self.cfg.backpressure == BackpressurePolicy::Error
-            && (data.len() + slot_bytes - 1) / slot_bytes > self.free.len()
+            && data.len().div_ceil(slot_bytes) > self.free.len()
         {
             return Err(PipeError::Backpressure);
         }

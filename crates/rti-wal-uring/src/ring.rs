@@ -35,7 +35,7 @@ impl UringFile {
     /// the caller should fall back to the std backend (see rti-wal's
     /// `WalWriter::auto`).
     pub fn open(path: impl AsRef<Path>, queue_depth: u32) -> io::Result<Self> {
-        let file = OpenOptions::new().create(true).write(true).open(path)?;
+        let file = OpenOptions::new().create(true).write(true).truncate(false).open(path)?;
         Self::from_file(file, queue_depth)
     }
 
