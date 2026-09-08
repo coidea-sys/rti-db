@@ -42,6 +42,14 @@
 
 ## 基准评测（v0.6，实测——非引用）
 
+![写入延迟](docs/images/bench-write-latency.png)
+
+![吞吐量](docs/images/bench-throughput.png)
+
+![存储与恢复](docs/images/bench-storage-recovery.png)
+
+![v0.5 → v0.6 自我改进](docs/images/bench-v05-v06.png)
+
 完整方法论、原始 JSON 与一键复现评测台（`bench/run_all.sh`，约 35 分钟）见 `bench/`。同机、同工作负载（100 万点 / 8 序列）、同持久化档位、HDR 直方图、3 轮取中位。对手均为默认调优。
 
 | 指标 | rti-db | SQLite (WAL) | Redis 7.2 | ClickHouse 24.8 |

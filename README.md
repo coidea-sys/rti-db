@@ -42,6 +42,14 @@ The design follows TRIZ separation principles: instead of compromising between "
 
 ## Benchmarks (v0.6, measured — not cited)
 
+![Write latency](docs/images/bench-write-latency.png)
+
+![Throughput](docs/images/bench-throughput.png)
+
+![Storage & recovery](docs/images/bench-storage-recovery.png)
+
+![v0.5 → v0.6 self-improvement](docs/images/bench-v05-v06.png)
+
 Full methodology, raw JSON and a one-command reproduction harness (`run_all.sh`, ~35 min) are in `bench/`. Same machine, same workload (1M points, 8 series), same durability tiers, HDR histograms, median of 3 runs. Competitors run with default tuning.
 
 | Metric | rti-db | SQLite (WAL) | Redis 7.2 | ClickHouse 24.8 |
