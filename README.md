@@ -117,10 +117,21 @@ Group 档批量吞吐仅 368k pts/s**。
 
 | 指标 | v0.5 | v0.6 | 变化 |
 |---|---|---|---|
-| Group(1ms) 崩溃丢失点（50 万点 kill -9） | 65,824（13.2%） | TBD | TBD |
-| 100 万点落盘 | 38.1MB（0.42× 膨胀） | TBD | TBD |
-| Group(1ms) 批量吞吐 | 368k pts/s | TBD | TBD |
-| Group(1ms) put p999 | 17.9µs | TBD | TBD |
+| Group(1ms) 批量吞吐 | 368k pts/s | **1.74M pts/s** | **4.7×** |
+| None 批量吞吐 | 3.89M pts/s | **9.04M pts/s** | **2.3×** |
+| Group(1ms) put p999 | 17.9µs | **0.91µs** | 改善 20×（ingest 不再积压，ring 几乎恒空） |
+| 100 万点落盘 | 38.1MB（0.42× 膨胀） | **10.1MB（1.58× 真压缩）** | **3.8×**（WAL checkpoint 不再双份并存） |
+| 崩溃恢复可用时间（50 万点 kill -9） | 141ms（WAL 重放 110ms） | **23.3ms** | **6×**（WAL 已截断，只重放一个 MemTable 尾巴） |
+| Group(1ms) 崩溃丢失点（50 万点 kill -9） | 65,824（13.2%） | 65,654（13.1%） | 见下方诚实说明 |
+
+**关于崩溃丢失率的诚实说明**：异步 `put` 的崩溃窗口 = ring 容量（65,536）
++ 在途批，这是架构语义而非实现缺陷——评测台写入速率（~4M pts/s 入队）
+高于任何持久化引擎的应用速率，ring 必然满载。v0.6 的修复路径是
+**`put_durable`**（已确认点进程崩溃零丢失，见新测试
+`put_durable_survives_simulated_crash`）；评测台协议固定使用异步
+`put`，故该数字不变、如实报告。同时丢失的构成略有改善（BufWriter
+尾巴经批末 `flush_os` 已出进程，丢失 ≈ ring 容量本身），且恢复时间
+因 WAL 截断从 141ms 降到 23.3ms。
 
 （复测原始数据：`bench-results-v06/rtidb.json`、`bench-results-v06/recovery.json`；
 v0.5 基线：`bench-results/`。）
