@@ -109,8 +109,18 @@ impl SegmentWriter {
 
         let path = path.as_ref();
         let tmp = path.with_extension("seg.tmp");
-        fs::write(&tmp, &buf)?;
+        {
+            use std::io::Write;
+            let mut f = fs::File::create(&tmp)?;
+            f.write_all(&buf)?;
+            f.sync_data()?;
+        }
         fs::rename(&tmp, path)?;
+        if let Some(dir) = path.parent() {
+            if let Ok(d) = fs::File::open(dir) {
+                let _ = d.sync_data();
+            }
+        }
         Ok(zm)
     }
 }
