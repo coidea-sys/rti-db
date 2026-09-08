@@ -45,6 +45,31 @@ The design follows TRIZ separation principles: instead of compromising between "
 - **io_uring pipelined WAL** (Linux, feature-gated, graceful fallback), **single-shard Raft replication** (snapshot, membership change, PreVote — all deterministically tested with a virtual clock), **S3 cold tier** (pure-std HTTP client, zero external dependencies), **TSN time alignment** for deterministic networks.
 - **Deterministic everything.** Raft tests run on a virtual clock with an in-memory transport — leader election, failover, log consistency and partition scenarios are 100% reproducible (30/30 runs green).
 
+## rti-db & AI (Strategic position)
+
+**AI models are the demand, not the competition.** Foundation models for the physical
+world (VLA policies, world models, dual-system stacks like Helix S1/S2, GR00T, pi0)
+reason at 10-100 ms; the physical world streams at 1-100 kHz. That three-order-of-magnitude
+gap is where embodied AI lives or dies - and it is a **data-plane problem, not a model
+problem**. rti-db occupies that gap. The full strategic analysis:
+[docs/ai-strategy.md](docs/ai-strategy.md).
+
+Three roles, one position:
+
+| | What AI needs | What rti-db provides |
+|---|---|---|
+| **Inference time** | S1 fast loops need us-level deterministic access to the latest sensor state; S2 slow reasoning needs episodic context windows | The *working memory of embodied AI* - a KV-cache-for-the-physical-world: lock-free rings for the reflex path, columnar history for attention over the recent past |
+| **Training time** | Embodied AI is data-starved; every deployed robot must be a data flywheel | The *flight recorder*: lossless episode logging (zero-loss `put_durable`), compressed cold tier to S3, replay-identical reproduction of any decision window |
+| **Governance** | Safety certification (aerospace, industrial, transport) demands audit | Deterministic replay: what the model saw, when, and what it decided - reproducible to the microsecond |
+
+**Strategic posture: be Switzerland.** rti-db does not train models, does not serve LLMs,
+is not a vector database, and does not compete with NVIDIA Isaac/GR00T, Physical
+Intelligence, Figure, or ROS 2 - it *complements* all of them. In the standards war over
+embodied-AI stacks, the data plane is the layer everyone needs and no model vendor wants
+to build. Open source (MIT OR Apache-2.0) is the commitment device: integrate rti-db
+into your stack without fearing that we enter your layer. Whoever owns the data plane
+owns the feedback loop - we intend to own it openly.
+
 ## Benchmarks (v0.6, measured — not cited)
 
 ![Write latency](docs/images/bench-write-latency.png)
