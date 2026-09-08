@@ -1,0 +1,13 @@
+[package]
+name = "rti-buffer"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "rti-db lock-free SPSC + MPMC ring buffers, cache-line aligned"
+
+[features]
+default = ["std"]
+# 关闭后为 no_std（core + alloc）；SpscRingN 提供零堆分配内联存储版本。
+std = []
+
+[dependencies]

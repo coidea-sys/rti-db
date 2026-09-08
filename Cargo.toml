@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rti-core",
+    "crates/rti-mem",
+    "crates/rti-buffer",
+    "crates/rti-wal",
+    "crates/rti-raft",
+    "crates/rti-wal-uring",
+    "crates/rti-store",
+    "crates/rti-query",
+    "crates/rti-net",
+    "crates/rti-db",
+    "crates/rti-edge",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

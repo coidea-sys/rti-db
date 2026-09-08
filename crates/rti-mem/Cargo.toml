@@ -1,0 +1,15 @@
+[package]
+name = "rti-mem"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "rti-db deterministic memory pools: BumpArena + SlabPool"
+
+[features]
+default = ["std"]
+# 关闭后为 no_std（core + alloc）。
+std = []
+# 计数全局分配器（仅测试用；依赖 std 的 System 分配器）。
+alloc-count = ["std"]
+
+[dependencies]
