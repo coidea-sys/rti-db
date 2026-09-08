@@ -1,8 +1,8 @@
-//! rti-db 基准（std::time 版，离线可运行；SPEC §4.5）。
+//! rti-db benchmarks (std::time version, runs offline; SPEC §4.5).
 //!
-//! 输出：put 吞吐、p50/p99/p999 写入时延、scan 吞吐（1M 点）、压缩比。
+//! Output: put throughput, p50/p99/p999 write latency, scan throughput (1M points), compression ratio.
 //!
-//! 运行：`cargo run --release --example bench -p rti-db`
+//! Run: `cargo run --release --example bench -p rti-db`
 
 use std::time::Instant;
 
@@ -20,14 +20,14 @@ fn main() {
     std::fs::create_dir_all(&dir).unwrap();
     let cfg = Config {
         data_dir: Some(dir.clone()),
-        memtable_max: 1 << 18, // 256K 样本 / MemTable
+        memtable_max: 1 << 18, // 256K samples / MemTable
         wal_sync: SyncPolicy::Group { interval_us: 1_000 },
         pool_bytes: 16 << 20,
         ..Config::default()
     };
     let db = Db::open(cfg).unwrap();
 
-    // ---- 写路径：put 吞吐 + 时延分布 -------------------------------------
+    // ---- write path: put throughput + latency distribution -------------------------------------
     let mut lat = Vec::with_capacity(PUTS);
     let t0 = Instant::now();
     let mut i = 0usize;
@@ -39,7 +39,7 @@ fn main() {
                 lat.push(start.elapsed().as_nanos() as u64);
                 i += 1;
             }
-            Err(rti_core::Error::SeriesFull) => std::thread::yield_now(), // 背压
+            Err(rti_core::Error::SeriesFull) => std::thread::yield_now(), // backpressure
             Err(e) => panic!("put failed: {e}"),
         }
     }
@@ -57,7 +57,7 @@ fn main() {
         enqueue_wall
     );
     println!(
-        "put durable : {:>12.0} ops/s   (含 flush+组提交, {:?})",
+        "put durable : {:>12.0} ops/s   (incl. flush+group commit, {:?})",
         PUTS as f64 / durable_wall.as_secs_f64(),
         durable_wall
     );
@@ -69,7 +69,7 @@ fn main() {
         lat[lat.len() - 1]
     );
 
-    // ---- 压缩比 -----------------------------------------------------------
+    // ---- compression ratio -----------------------------------------------------------
     db.seal().unwrap();
     let mut seg_bytes = 0u64;
     let mut seg_count = 0u64;
@@ -89,7 +89,7 @@ fn main() {
         raw_bytes as f64 / seg_bytes as f64
     );
 
-    // ---- 读路径：scan 吞吐（1M 点，含谓词与聚合） -------------------------
+    // ---- read path: scan throughput (1M points, with predicate and aggregation) -------------------------
     let t1 = Instant::now();
     let mut scanned = 0usize;
     for s in 0..SERIES {
@@ -128,17 +128,17 @@ fn main() {
     }
     println!("agg (avg)   : {:?} for {} series (sum of avgs = {avgs:.3})", t3.elapsed(), SERIES);
 
-    // ---- v0.2：标量流式解码 vs 8 路展开块解码 ---------------------------
+    // ---- v0.2: scalar streaming decode vs 8-way unrolled block decode ---------------------------
     decode_bench();
 
     drop(db);
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// v0.2 解码微基准：标量流式解码器 vs 8 路展开块解码（同一压缩列）。
+/// v0.2 decode micro-benchmark: scalar streaming decoder vs 8-way unrolled block decode (same compressed column).
 ///
-/// 取多轮最好成绩，减少调度噪声；`std::hint::black_box` 防止优化掉
-/// 解码结果消费。
+/// Takes the best of several rounds to reduce scheduling noise; `std::hint::black_box` prevents
+/// the decoded results from being optimized away.
 fn decode_bench() {
     const N: usize = 1_000_000;
     const ROUNDS: usize = 5;
@@ -156,7 +156,7 @@ fn decode_bench() {
         val_col.len()
     );
 
-    // --- 时间戳列 ---
+    // --- timestamp column ---
     let mut scalar_ts = f64::MAX;
     let mut acc = 0i64;
     for _ in 0..ROUNDS {
@@ -190,15 +190,15 @@ fn decode_bench() {
         scalar_ts / block_ts
     );
 
-    // --- 值列 ---
+    // --- value column ---
     let mut scalar_val = f64::MAX;
     let mut facc = 0.0f64;
     for _ in 0..ROUNDS {
         let t = Instant::now();
         let mut dec = ValDecoder::new(&val_col).unwrap().unwrap();
         let mut n = 0usize;
-        // 值列位流末字节有零填充：流式解码器不知点数（由调用方持有点数，
-        // 与 SegmentReader 的 DecodeIter 相同），按 N 精确读取。
+        // the value column's bitstream has zero padding in the last byte: the streaming decoder does not
+        // know the point count (held by the caller, same as SegmentReader's DecodeIter) and reads exactly N.
         while n < N {
             facc += std::hint::black_box(dec.next_val().unwrap());
             n += 1;

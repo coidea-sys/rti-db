@@ -1,49 +1,49 @@
-//! MemTable：内存中的可写表，满则 seal 为 segment。
+//! MemTable: the in-memory writable table, sealed into a segment when full.
 //!
-//! 每序列的样本缓冲（`Vec<Sample>`，创建时预保留容量）存放在
-//! [`rti_mem::SlabPool`] 中——序列槽位 O(1) 分配/回收，无系统调用；
-//! 稳态写入路径只发生 `Vec::push`（摊还 O(1)，容量预保留）。
+//! Per-series sample buffers (`Vec<Sample>`, capacity reserved at creation) live in a
+//! [`rti_mem::SlabPool`] — series slots allocate/recycle in O(1) with no syscalls;
+//! the steady-state write path only performs `Vec::push` (amortized O(1), capacity pre-reserved).
 
 use std::collections::BTreeMap;
 
 use rti_core::{Error, Result, Sample, SeriesId, Timestamp};
 use rti_mem::SlabPool;
 
-/// 每个序列缓冲的初始保留容量。
+/// Initial reserved capacity of each series buffer.
 const SERIES_BUF_CAP: usize = 256;
 
-/// 索引条目：slab 槽位 + 最近使用序号（LRU 时钟）。
+/// Index entry: slab slot + last-used sequence number (LRU clock).
 #[derive(Clone, Copy, Debug)]
 struct SeriesEntry {
     slot: usize,
     last_used: u64,
 }
 
-/// 内存表：`SeriesId → 按 ts 排序的 Sample 序列`。
+/// In-memory table: `SeriesId → ts-ordered Sample sequence`.
 ///
-/// 达到 `max_samples` 后 `insert` 返回 [`Error::SeriesFull`]，
-/// 调用方应 `take()` 取走数据 seal 落盘并复用本表。
+/// Once `max_samples` is reached, `insert` returns [`Error::SeriesFull`];
+/// the caller should `take()` the data, seal it to disk, and reuse this table.
 ///
-/// v0.3：新增 [`MemTable::insert_lru`]——满时不报错，而是按 LRU
-/// （写入触达时钟）丢弃最老序列并计数，供 rti-db 确定性档使用；
-/// 被丢弃序列的缓冲经 spare 池复用，稳态无堆分配。
+/// v0.3: adds [`MemTable::insert_lru`] — instead of erroring when full, it evicts the
+/// oldest series by LRU (write-touch clock) and counts it, for rti-db's deterministic profile;
+/// evicted series buffers are recycled through the spare pool — no heap allocation in steady state.
 pub struct MemTable {
-    /// series → 索引条目。
+    /// series → index entry.
     index: BTreeMap<SeriesId, SeriesEntry>,
-    /// 序列样本缓冲池（预分配槽位）。
+    /// Series sample buffer pool (pre-allocated slots).
     pool: SlabPool<Vec<Sample>>,
     max_samples: usize,
     len: usize,
-    /// LRU 逻辑时钟（每次插入触达 +1）。
+    /// LRU logical clock (+1 on every insert touch).
     tick: u64,
-    /// 被 LRU 丢弃的序列数（累计）。
+    /// Number of series evicted by LRU (cumulative).
     evicted: u64,
-    /// 丢弃序列留下的缓冲（复用，避免稳态反复 malloc/free）。
+    /// Buffers left behind by evicted series (reused, avoiding steady-state malloc/free churn).
     spare: Vec<Vec<Sample>>,
 }
 
 impl MemTable {
-    /// 创建容量为 `max_samples` 个采样点、最多 `max_series` 条序列的表。
+    /// Create a table holding `max_samples` samples across at most `max_series` series.
     pub fn new(max_samples: usize, max_series: usize) -> Self {
         Self {
             index: BTreeMap::new(),
@@ -56,15 +56,15 @@ impl MemTable {
         }
     }
 
-    /// 取一个序列缓冲（spare 复用优先，否则新建）。
+    /// Take a series buffer (spare reuse first, otherwise create a new one).
     fn take_buf(&mut self) -> Vec<Sample> {
         self.spare.pop().unwrap_or_else(|| Vec::with_capacity(SERIES_BUF_CAP))
     }
 
-    /// 插入一个采样点（O(1) 摊还）。
+    /// Insert one sample (amortized O(1)).
     ///
-    /// 假定同一序列的 ts 大体递增（seal 时会排序兜底）。
-    /// 表满返回 [`Error::SeriesFull`]；序列数超出池容量同样返回满。
+    /// Assumes ts of the same series is roughly increasing (sealing sorts as a fallback).
+    /// Returns [`Error::SeriesFull`] when the table is full; exceeding the pool's series capacity also returns full.
     pub fn insert(&mut self, series: SeriesId, sample: Sample) -> Result<()> {
         if self.len >= self.max_samples {
             return Err(Error::SeriesFull);
@@ -91,27 +91,27 @@ impl MemTable {
         Ok(())
     }
 
-    /// 插入一个采样点；表满时按 LRU 丢弃最老序列（计数）再插入。
+    /// Insert one sample; when the table is full, evict the oldest series by LRU (counted) first.
     ///
-    /// 返回是否发生了丢弃。永不返回 [`Error::SeriesFull`]
-    /// （`max_samples == 0` 的退化配置除外）——这是 rti-db 确定性档
-    /// 「满则丢弃最老序列」语义的实现。
+    /// Returns whether an eviction happened. Never returns [`Error::SeriesFull`]
+    /// (except for the degenerate `max_samples == 0` configuration) — this implements the
+    /// deterministic profile's 'evict the oldest series when full' semantics for rti-db.
     ///
-    /// 丢弃粒度为整条序列：被丢弃序列的全部样本从表中移除，
-    /// 其缓冲进 spare 池复用。LRU 时钟按**写入**触达更新。
+    /// Eviction granularity is a whole series: all samples of the evicted series are removed
+    /// from the table and its buffer goes to the spare pool for reuse. The LRU clock is updated on **write** touches.
     pub fn insert_lru(&mut self, series: SeriesId, sample: Sample) -> Result<bool> {
         let mut evicted_now = false;
         if self.len >= self.max_samples {
             self.evict_lru()?;
             evicted_now = true;
         }
-        // 丢弃已腾出样本空间与槽位；这里复用 insert 的常规路径
-        // （此时不可能再 SeriesFull，除非 max_samples == 0）。
+        // the eviction freed sample space and a slot; reuse insert's regular path here
+        // (SeriesFull is impossible at this point, unless max_samples == 0).
         self.insert(series, sample)?;
         Ok(evicted_now)
     }
 
-    /// 丢弃 last_used 最小的序列（O(#series) 有界扫描）。
+    /// Evict the series with the smallest last_used (bounded O(#series) scan).
     fn evict_lru(&mut self) -> Result<()> {
         let (&victim, _) = self
             .index
@@ -133,32 +133,32 @@ impl MemTable {
         Ok(())
     }
 
-    /// 被 LRU 丢弃的序列总数（v0.3）。
+    /// Total number of series evicted by LRU (v0.3).
     pub fn lru_evictions(&self) -> u64 {
         self.evicted
     }
 
-    /// 当前采样点总数。
+    /// Current total number of samples.
     pub fn len(&self) -> usize {
         self.len
     }
 
-    /// 是否为空。
+    /// Whether the table is empty.
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
-    /// 是否已满（应 seal）。
+    /// Whether the table is full (should seal).
     pub fn is_full(&self) -> bool {
         self.len >= self.max_samples
     }
 
-    /// 表中的序列 id 列表。
+    /// List of series ids in the table.
     pub fn series_ids(&self) -> Vec<SeriesId> {
         self.index.keys().copied().collect()
     }
 
-    /// 迭代某序列 `[t0, t1]` 闭区间内的样本（二分定位 + 切片，零拷贝）。
+    /// Iterate a series' samples in the closed range `[t0, t1]` (binary search + slice, zero-copy).
     pub fn range(&self, series: SeriesId, t0: Timestamp, t1: Timestamp) -> impl Iterator<Item = Sample> + '_ {
         let slice = self
             .index
@@ -171,7 +171,7 @@ impl MemTable {
         slice[lo..hi.max(lo)].iter().copied()
     }
 
-    /// 取走全部数据（用于 seal）：返回按序列分组的有序样本，表复位为空。
+    /// Take all data (for sealing): returns ordered samples grouped by series; the table resets to empty.
     pub fn take(&mut self) -> BTreeMap<SeriesId, Vec<Sample>> {
         let mut out = BTreeMap::new();
         let index = std::mem::take(&mut self.index);
@@ -181,7 +181,7 @@ impl MemTable {
                 buf.dedup_by_key(|s| s.ts);
                 out.insert(series, buf);
             }
-            // 槽位已清空（Vec 被 take 走），释放复用
+            // the slot is empty now (the Vec was taken away); free it for reuse
             let _ = self.pool.free(entry.slot);
         }
         self.len = 0;
@@ -204,7 +204,7 @@ mod tests {
         assert_eq!(got.len(), 4); // ts = 20,30,40,50
         assert_eq!(got[0].ts, 20);
         assert_eq!(got[3].value, 5.0);
-        assert_eq!(mt.range(9, 0, 100).count(), 0); // 未知序列
+        assert_eq!(mt.range(9, 0, 100).count(), 0); // unknown series
     }
 
     #[test]
@@ -218,7 +218,7 @@ mod tests {
         let data = mt.take();
         assert_eq!(data.get(&1).unwrap().len(), 4);
         assert!(mt.is_empty());
-        // 复位后可继续写入
+        // writable again after reset
         mt.insert(1, Sample::new(100, 1.0)).unwrap();
         assert_eq!(mt.len(), 1);
     }
@@ -229,70 +229,70 @@ mod tests {
         mt.insert(1, Sample::new(30, 3.0)).unwrap();
         mt.insert(1, Sample::new(10, 1.0)).unwrap();
         mt.insert(1, Sample::new(20, 2.0)).unwrap();
-        mt.insert(1, Sample::new(20, 2.5)).unwrap(); // 重复 ts
+        mt.insert(1, Sample::new(20, 2.5)).unwrap(); // duplicate ts
         let data = mt.take();
         let v = data.get(&1).unwrap();
         assert_eq!(v.iter().map(|s| s.ts).collect::<Vec<_>>(), vec![10, 20, 30]);
     }
 
-    /// v0.3：LRU 丢弃最久未写的序列，其余序列数据无损，计数正确。
+    /// v0.3: LRU evicts the least-recently-written series; other series' data is intact, counts are correct.
     #[test]
     fn insert_lru_evicts_least_recently_written_series() {
-        let mut mt = MemTable::new(4, 4); // 容量 4 样本
+        let mut mt = MemTable::new(4, 4); // capacity 4 samples
         mt.insert_lru(1, Sample::new(1, 1.0)).unwrap(); // tick 1
         mt.insert_lru(2, Sample::new(1, 2.0)).unwrap(); // tick 2
-        mt.insert_lru(1, Sample::new(2, 1.5)).unwrap(); // tick 3 → 序列 1 变新
-        mt.insert_lru(3, Sample::new(1, 3.0)).unwrap(); // tick 4，表满
+        mt.insert_lru(1, Sample::new(2, 1.5)).unwrap(); // tick 3 -> series 1 becomes newer
+        mt.insert_lru(3, Sample::new(1, 3.0)).unwrap(); // tick 4, table full
         assert!(mt.is_full());
         assert_eq!(mt.lru_evictions(), 0);
 
-        // 第 5 个样本 → 丢弃 last_used 最小的序列 2
+        // the 5th sample -> evicts series 2, which has the smallest last_used
         let evicted = mt.insert_lru(3, Sample::new(2, 3.5)).unwrap();
         assert!(evicted);
         assert_eq!(mt.lru_evictions(), 1);
-        assert_eq!(mt.len(), 4, "丢弃 1 个样本再插入 1 个，仍为满表 4");
-        assert_eq!(mt.range(2, 0, 100).count(), 0, "序列 2 已被整体丢弃");
-        assert_eq!(mt.range(1, 0, 100).count(), 2, "序列 1 数据无损");
+        assert_eq!(mt.len(), 4, "evict 1 sample then insert 1; still a full table of 4");
+        assert_eq!(mt.range(2, 0, 100).count(), 0, "series 2 has been evicted as a whole");
+        assert_eq!(mt.range(1, 0, 100).count(), 2, "series 1 data is intact");
         assert_eq!(mt.range(3, 0, 100).count(), 2);
     }
 
-    /// v0.3：持续写入永不 SeriesFull；spare 池复用使容量有界。
+    /// v0.3: continuous writes never hit SeriesFull; spare-pool reuse keeps capacity bounded.
     #[test]
     fn insert_lru_never_full_and_reuses_buffers() {
-        let mut mt = MemTable::new(8, 2); // 小表 + 2 序列槽
+        let mut mt = MemTable::new(8, 2); // small table + 2 series slots
         let mut evictions = 0u64;
         for i in 0..1000i64 {
             if mt.insert_lru((i % 2) as u32, Sample::new(i, i as f64)).unwrap() {
                 evictions += 1;
             }
         }
-        assert!(evictions > 0, "小表必须发生丢弃");
+        assert!(evictions > 0, "a small table must see evictions");
         assert_eq!(mt.lru_evictions(), evictions);
         assert!(mt.len() <= 8);
-        // 丢弃-复用循环后表仍可用
+        // the table is still usable after evict-reuse cycles
         let recent: Vec<Sample> = mt.range(1, 0, 1000).collect();
         assert!(!recent.is_empty());
         assert!(recent.iter().all(|s| s.ts % 2 == 1));
     }
 
-    /// v0.3：take 复位后 LRU 计数保留（累计语义），spare 不清空。
+    /// v0.3: after take resets the table, the LRU count is preserved (cumulative semantics); spares are not cleared.
     #[test]
     fn take_preserves_eviction_counter() {
         let mut mt = MemTable::new(2, 2);
         mt.insert_lru(1, Sample::new(1, 0.0)).unwrap();
-        mt.insert_lru(1, Sample::new(2, 0.0)).unwrap(); // 满（2 样本）
-        mt.insert_lru(2, Sample::new(1, 0.0)).unwrap(); // 丢弃序列 1
+        mt.insert_lru(1, Sample::new(2, 0.0)).unwrap(); // full (2 samples)
+        mt.insert_lru(2, Sample::new(1, 0.0)).unwrap(); // evict series 1
         assert_eq!(mt.lru_evictions(), 1);
         let data = mt.take();
         assert_eq!(data.len(), 1);
-        assert_eq!(mt.lru_evictions(), 1, "take 不清计数");
-        mt.insert_lru(9, Sample::new(1, 0.0)).unwrap(); // spare 复用路径
+        assert_eq!(mt.lru_evictions(), 1, "take does not clear the count");
+        mt.insert_lru(9, Sample::new(1, 0.0)).unwrap(); // spare reuse path
         assert_eq!(mt.len(), 1);
     }
 
     #[test]
     fn series_slot_pool_exhaustion_is_full() {
-        let mut mt = MemTable::new(100, 2); // 池仅 2 槽
+        let mut mt = MemTable::new(100, 2); // pool has only 2 slots
         mt.insert(1, Sample::new(0, 0.0)).unwrap();
         mt.insert(2, Sample::new(0, 0.0)).unwrap();
         assert!(matches!(mt.insert(3, Sample::new(0, 0.0)), Err(Error::SeriesFull)));

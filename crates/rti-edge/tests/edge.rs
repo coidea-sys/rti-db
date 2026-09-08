@@ -1,5 +1,5 @@
-//! rti-edge 集成测试：三档预设 open → ingest → scan → health 往返，
-//! 以及 safety_island 档的「全程不落盘」验证（复用 v0.3 机制）。
+//! rti-edge integration tests: open → ingest → scan → health round-trips for the three presets,
+//! plus the safety_island preset's \"never touches disk\" verification (reusing the v0.3 machinery).
 
 use std::net::UdpSocket;
 use std::path::PathBuf;
@@ -9,7 +9,7 @@ use rti_core::{Mirror, Profile, Sample};
 use rti_edge::{ColdTierConfig, EdgeConfig, EdgeNode};
 use rti_raft::Role;
 
-/// 唯一临时目录（进程 id + 原子序号 + 标签），Drop 时清理。
+/// Unique temp directory (process id + atomic counter + label), cleaned up on Drop.
 struct TmpDir(PathBuf);
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -22,7 +22,7 @@ impl TmpDir {
         Self(p)
     }
 
-    /// 一个**不存在**的子路径（用于验证 Deterministic 档不建目录）。
+    /// A **nonexistent** sub-path (used to verify the Deterministic profile creates no directories).
     fn absent(&self, name: &str) -> PathBuf {
         self.0.join(name)
     }
@@ -43,25 +43,25 @@ fn samples(node: &mut EdgeNode, series: u32, tags: std::ops::Range<i64>) -> usiz
     n
 }
 
-/// 场景 1：安全岛档——Deterministic + 镜像；全程不触碰文件系统。
+/// Scenario 1: safety-island preset — Deterministic + mirror; never touches the file system.
 #[test]
 fn safety_island_roundtrip_and_no_disk_io() {
     let tmp = TmpDir::new("safety");
     let ghost = tmp.absent("must-not-be-created");
 
-    // 镜像接收端（loopback）
+    // mirror receiver (loopback)
     let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
     let rx_addr = rx.local_addr().unwrap();
 
     let mut cfg = EdgeConfig::safety_island();
     assert_eq!(cfg.profile, Profile::Deterministic);
-    // 故意给一个 data_dir：Deterministic 档也必须绝不触碰
+    // deliberately provide a data_dir: the Deterministic profile must still never touch it
     cfg.data_dir = Some(ghost.clone());
     cfg.mirror = Some(Mirror::new(rx_addr));
 
     let mut node = EdgeNode::open(cfg).unwrap();
     const N: usize = 2_000;
-    // 分批发送并即时排空接收端（UDP 接收缓冲有限，攒到最后读会溢出）
+    // send in batches and drain the receiver promptly (the UDP receive buffer is limited; reading only at the end would overflow)
     rx.set_nonblocking(true).unwrap();
     let mut received = 0u64;
     let mut pkt = [0u8; 64];
@@ -73,32 +73,32 @@ fn safety_island_roundtrip_and_no_disk_io() {
     }
     node.flush().unwrap();
 
-    // scan 往返
+    // scan round-trip
     let out: Vec<Sample> = node.scan(7, 0, N as i64, None, None).unwrap().collect();
     assert_eq!(out.len(), N);
     assert_eq!(out[123], Sample::new(123, 123.0));
 
-    // health：Deterministic、镜像计数、无 raft、无 segment
+    // health: Deterministic, mirror counters, no raft, no segments
     let h = node.health();
     assert_eq!(h.profile, Profile::Deterministic);
-    let ms = h.mirror_stats.expect("安全岛档必须有镜像统计");
+    let ms = h.mirror_stats.expect("the safety-island preset must have mirror statistics");
     assert_eq!(ms.sent, N as u64);
-    assert_eq!(ms.failed, 0, "loopback 接收端在线，不允许发送失败");
+    assert_eq!(ms.failed, 0, "the loopback receiver is online; send failures are not allowed");
     assert_eq!(h.raft_role, None);
-    assert_eq!(h.segment_count, 0, "纯内存运行不得产生 segment");
+    assert_eq!(h.segment_count, 0, "pure in-memory operation must not produce segments");
     assert!(h.alloc_ok);
 
-    // 不落盘：数据目录从未被创建
-    assert!(!ghost.exists(), "Deterministic 档绝不触碰文件系统");
+    // no persistence: the data directory was never created
+    assert!(!ghost.exists(), "the Deterministic profile never touches the file system");
 
-    // 镜像接收端确实收到 >99% 数据报（残余部分最后排空一次）
+    // the mirror receiver did receive >99% of datagrams (drain the remainder one last time)
     while rx.recv(&mut pkt).is_ok() {
         received += 1;
     }
-    assert!(received * 100 > N as u64 * 99, "镜像接收率必须 >99%（实收 {received}/{N}）");
+    assert!(received * 100 > N as u64 * 99, "mirror receive rate must be >99% (got {received}/{N})");
 }
 
-/// 场景 1b（feature alloc-count）：安全岛档稳态热路径零分配。
+/// Scenario 1b (feature alloc-count): zero allocations on the safety-island steady-state hot path.
 #[cfg(feature = "alloc-count")]
 #[test]
 fn safety_island_steady_state_zero_alloc() {
@@ -107,18 +107,18 @@ fn safety_island_steady_state_zero_alloc() {
     cfg.data_dir = Some(tmp.absent("ghost"));
     let mut node = EdgeNode::open(cfg).unwrap();
 
-    // 预热（路径上的惰性初始化允许分配）
+    // warmup (lazy initialization on the path may allocate)
     samples(&mut node, 1, 0..1_000);
     node.flush().unwrap();
     node.reset_alloc_baseline();
 
-    // 稳态：再来 1000 次 ingest，分配计数必须零增长
+    // steady state: 1000 more ingests; the allocation count must not grow
     samples(&mut node, 1, 1_000..2_000);
     node.flush().unwrap();
-    assert!(node.health().alloc_ok, "Deterministic 稳态热路径必须零分配");
+    assert!(node.health().alloc_ok, "the Deterministic steady-state hot path must allocate zero");
 }
 
-/// 场景 2：认知层档——Balanced + 3 节点内存 Raft；ingest 经多数派 durable。
+/// Scenario 2: cognition preset — Balanced + 3-node in-memory Raft; ingest is majority-durable.
 #[test]
 fn cognition_roundtrip_with_raft_replication() {
     let tmp = TmpDir::new("cognition");
@@ -126,7 +126,7 @@ fn cognition_roundtrip_with_raft_replication() {
     cfg.data_dir = Some(tmp.0.join("data"));
 
     let mut node = EdgeNode::open(cfg).unwrap();
-    // open 即完成选主
+    // open completes leader election
     assert_eq!(node.health().raft_role, Some(Role::Leader));
     assert_eq!(node.raft_durable_index(), Some(0));
 
@@ -134,7 +134,7 @@ fn cognition_roundtrip_with_raft_replication() {
     samples(&mut node, 3, 0..N as i64);
     node.flush().unwrap();
 
-    // 每条 ingest = 一个日志条目，全部多数派 durable
+    // each ingest = one log entry, all majority-durable
     assert_eq!(node.raft_durable_index(), Some(N as u64));
 
     let out: Vec<Sample> = node.scan(3, 0, N as i64, None, None).unwrap().collect();
@@ -146,31 +146,31 @@ fn cognition_roundtrip_with_raft_replication() {
     assert_eq!(h.mirror_stats, None);
 }
 
-/// 场景 3：规划层档——Balanced + 冷分层；归档后 scan 透明读回一致。
+/// Scenario 3: planning preset — Balanced + cold tiering; scan reads back transparently and identically after archiving.
 #[test]
 fn planning_roundtrip_with_cold_tier_archive() {
     let tmp = TmpDir::new("planning");
     let mut cfg = EdgeConfig::planning();
     cfg.data_dir = Some(tmp.0.join("data"));
     cfg.cold_tier = Some(ColdTierConfig::LocalFs { dir: tmp.0.join("cold") });
-    cfg.memtable_max = 256; // 小表加速 seal
+    cfg.memtable_max = 256; // small table to speed up sealing
 
     let mut node = EdgeNode::open(cfg).unwrap();
     const N: i64 = 1_000;
     samples(&mut node, 5, 0..N);
     node.flush().unwrap();
-    assert!(node.health().segment_count >= 2, "小 memtable 必须 seal 出多个 segment");
+    assert!(node.health().segment_count >= 2, "a small memtable must seal out multiple segments");
 
-    // 归档前基线
+    // baseline before archiving
     let before: Vec<Sample> = node.scan(5, 0, N, None, None).unwrap().collect();
     assert_eq!(before.len(), N as usize);
 
-    // 全部时间段归档 → 本地删除、冷层可读回
+    // archive all time ranges -> local files deleted, cold tier readable back
     let archived = node.archive_older_than(N + 1).unwrap();
     assert!(archived >= 1);
     assert_eq!(node.archived_segment_count(), archived);
 
-    // 透明读回：结果与归档前逐点一致
+    // transparent read-back: results point-for-point identical to before archiving
     let after: Vec<Sample> = node.scan(5, 0, N, None, None).unwrap().collect();
     assert_eq!(after, before);
 
@@ -180,7 +180,7 @@ fn planning_roundtrip_with_cold_tier_archive() {
     assert!(h.segment_count >= archived);
 }
 
-/// TSN 网格对齐：ingest 时间戳先向下取整到网格。
+/// TSN grid alignment: ingest timestamps are first floored to the grid.
 #[test]
 fn tsn_align_applies_on_ingest() {
     let tmp = TmpDir::new("tsn");
@@ -195,10 +195,10 @@ fn tsn_align_applies_on_ingest() {
     node.ingest(9, Sample::new(3_000, 3.0)).unwrap();
     let out: Vec<Sample> = node.scan(9, 0, 10_000, None, None).unwrap().collect();
     let ts: Vec<i64> = out.iter().map(|s| s.ts).collect();
-    assert_eq!(ts, vec![1_000, 2_000, 3_000], "时间戳必须向下取整到网格");
+    assert_eq!(ts, vec![1_000, 2_000, 3_000], "timestamps must be floored to the grid");
     assert_eq!(out[0].value, 1.0);
 
-    // 非法网格在 open 时即报错
+    // an illegal grid is rejected at open
     let mut bad = EdgeConfig::planning();
     bad.tsn_align_ns = Some(0);
     assert!(EdgeNode::open(bad).is_err());

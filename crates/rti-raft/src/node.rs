@@ -1,85 +1,85 @@
-//! Raft 协议状态机：选主（PreVote）/ 心跳 / 日志复制 / 多数派提交 /
-//! 快照与日志压缩 / 单步成员变更。
+//! Raft protocol state machine: leader election (PreVote) / heartbeats / log replication /
+//! majority commit / snapshots & log compaction / single-step membership changes.
 //!
-//! 设计要点：
-//! - **逻辑时钟注入**：[`Node::tick`] 由调用方传入 `now`（建议毫秒），
-//!   测试用虚拟时钟实现完全确定性；
-//! - 选举超时"随机化"用确定性哈希 `hash(seed, term)`——同种子同任期
-//!   结果一致（测试可复现），不同节点/任期错开（活性保证）；
-//! - **PreVote**：超时后先以 `term+1` 发起预投票，不抬任期；只有拿到
-//!   多数派预投票才进入正式选主。分区节点因此无法抬高集群任期
-//!   （收方仅在"自己的 Leader 租约已过期"（`>= election_min`）且
-//!   候选人在配置内、日志不落后时才投预投票）；
-//! - 日志索引对外 1 起且**绝对化**：快照压缩后 `log[0]` 对应绝对索引
-//!   `snap_index + 1`，`prev_log_index == snap_index` 表示以快照点为前缀；
-//! - **快照**：`take_snapshot` 丢弃已提交前缀并留存状态字节；Leader 发现
-//!   跟随者的 `next_index <= snap_index`（所需前缀已压缩）时改发
-//!   `InstallSnapshot` RPC 而非 AppendEntries；
-//! - **单步成员变更**：一次只变一个节点，新配置编码为日志条目
-//!   （哨兵 series = `u32::MAX` 的 [`Record`]，对用户数据透明）经多数派
-//!   **提交后**生效；被移除的节点降级为非投票成员（不再发起选举、
-//!   不参与投票与多数派计数）；
-//! - 提交规则遵循 Raft 论文：Leader 只按计数推进**当前任期**的条目，
-//!   旧任期条目随之间接提交。
+//! Design highlights:
+//! - **Logical clock injection**: [`Node::tick`] takes `now` from the caller (milliseconds recommended),
+//!   so tests can use a virtual clock for full determinism;
+//! - election-timeout 'randomization' uses a deterministic hash `hash(seed, term)` — same seed and
+//!   term give the same result (reproducible in tests), while different nodes/terms stagger (liveness);
+//! - **PreVote**: after a timeout, a node first runs a pre-vote with `term+1` without raising its term;
+//!   it enters a real election only after winning a majority of pre-votes. Partitioned nodes therefore
+//!   cannot inflate the cluster term (a receiver grants a pre-vote only when 'its own Leader lease has
+//!   expired' (`>= election_min`) and the candidate is in the configuration with a non-lagging log);
+//! - log indices are externally 1-based and **absolute**: after snapshot compaction, `log[0]` corresponds
+//!   to absolute index `snap_index + 1`, and `prev_log_index == snap_index` means the snapshot point is the prefix;
+//! - **snapshots**: `take_snapshot` discards the committed prefix and keeps the state bytes; when the Leader
+//!   finds a follower's `next_index <= snap_index` (the needed prefix is compacted away), it sends an
+//!   `InstallSnapshot` RPC instead of AppendEntries;
+//! - **single-step membership changes**: only one node changes at a time; the new configuration is encoded
+//!   as a log entry (a sentinel [`Record`] with series = `u32::MAX`, transparent to user data) and takes
+//!   effect once **committed** by a majority; a removed node is demoted to non-voting member (it no longer
+//!   starts elections and is excluded from voting and majority counting);
+//! - the commit rule follows the Raft paper: the Leader only advances **current-term** entries by counting;
+//!   older-term entries are committed indirectly as a consequence.
 
 use std::collections::BTreeMap;
 
 use rti_core::{Error, Result};
 use rti_wal::Record;
 
-/// 集群节点标识。
+/// Cluster node identifier.
 pub type NodeId = u64;
 
-/// 成员变更日志条目的哨兵 series id（保留，用户数据不得使用）。
+/// Sentinel series id for membership-change log entries (reserved; user data must not use it).
 ///
-/// 简化取舍（诚实声明）：单服务器变更把新配置编码为一条普通日志
-/// 条目内的哨兵 [`Record`]，复用既有复制/编解码路径，零线格式变更；
-/// 代价是 `u32::MAX` 从用户 series 命名空间中保留。
+/// Simplifying trade-off (honest disclosure): a single-server change encodes the new configuration as a
+/// sentinel [`Record`] inside an ordinary log entry, reusing the existing replication/codec paths with zero
+/// wire-format changes; the cost is reserving `u32::MAX` from the user series namespace.
 pub const CONF_SERIES: u32 = u32::MAX;
 
-/// 节点角色。
+/// Node role.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
-    /// 跟随者。
+    /// Follower.
     Follower,
-    /// 预投票候选人（尚未抬高任期）。
+    /// Pre-vote candidate (term not yet raised).
     PreCandidate,
-    /// 候选人（正式选主，任期已 +1）。
+    /// Candidate (real election, term already +1).
     Candidate,
-    /// 领导者。
+    /// Leader.
     Leader,
 }
 
-/// 一条复制日志条目 = 一个 WAL Record 批次 + 写入时的任期。
+/// One replicated log entry = one WAL Record batch + the term at write time.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Entry {
-    /// 条目被 Leader 追加时的任期。
+    /// Term when the entry was appended by the Leader.
     pub term: u64,
-    /// 本批 WAL 记录（成员变更条目内含 [`CONF_SERIES`] 哨兵记录）。
+    /// WAL records of this batch (membership-change entries contain a [`CONF_SERIES`] sentinel record).
     pub records: Vec<Record>,
 }
 
-/// 快照：已压缩日志前缀的替代物 + 上层状态机字节。
+/// Snapshot: a replacement for the compacted log prefix + upper-layer state-machine bytes.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Snapshot {
-    /// 快照覆盖的最大日志索引（含）。
+    /// Maximum log index covered by the snapshot (inclusive).
     pub last_included_index: u64,
-    /// 该索引处条目的任期。
+    /// Term of the entry at that index.
     pub last_included_term: u64,
-    /// 上层状态机字节（语义由调用方定义，协议层不透明转发）。
+    /// Upper-layer state-machine bytes (semantics caller-defined; forwarded opaquely by the protocol layer).
     pub state: Vec<u8>,
 }
 
-/// 单步成员变更操作。
+/// Single-step membership-change operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConfChange {
-    /// 加入一个投票成员。
+    /// Add a voting member.
     AddPeer(NodeId),
-    /// 移除一个投票成员（被移除者降级为非投票成员）。
+    /// Remove a voting member (the removed one is demoted to a non-voting member).
     RemovePeer(NodeId),
 }
 
-/// 把成员变更编码为哨兵记录（`value` 位模式：1=Add，2=Remove）。
+/// Encode a membership change as a sentinel record (`value` bit pattern: 1=Add, 2=Remove).
 pub(crate) fn encode_conf(cc: ConfChange) -> Record {
     let (id, tag) = match cc {
         ConfChange::AddPeer(id) => (id, 1u64),
@@ -88,7 +88,7 @@ pub(crate) fn encode_conf(cc: ConfChange) -> Record {
     Record::new(CONF_SERIES, id as i64, f64::from_bits(tag))
 }
 
-/// 从记录解码成员变更；非哨兵记录返回 `None`。
+/// Decode a membership change from a record; non-sentinel records return `None`.
 pub(crate) fn decode_conf(r: &Record) -> Option<ConfChange> {
     if r.series != CONF_SERIES {
         return None;
@@ -101,141 +101,141 @@ pub(crate) fn decode_conf(r: &Record) -> Option<ConfChange> {
     }
 }
 
-/// 协议消息。
+/// Protocol message.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Msg {
-    /// 预投票请求（`term` 为候选人*将要*使用的任期 = 其当前任期 + 1，
-    /// 收方不因此抬高自己的任期）。
+    /// Pre-vote request (`term` is the term the candidate *will* use = its current term + 1;
+    /// the receiver does not raise its own term because of it).
     PreVote {
-        /// 候选人预备任期。
+        /// Candidate's prospective term.
         term: u64,
-        /// 候选人 id。
+        /// Candidate id.
         candidate: NodeId,
-        /// 候选人最后日志索引。
+        /// Candidate's last log index.
         last_log_index: u64,
-        /// 候选人最后日志条目的任期。
+        /// Term of the candidate's last log entry.
         last_log_term: u64,
     },
-    /// 预投票应答。
+    /// Pre-vote response.
     PreVoteResponse {
-        /// 投票人任期。
+        /// Voter's term.
         term: u64,
-        /// 是否投赞成票。
+        /// Whether the vote is granted.
         granted: bool,
     },
-    /// 选主请求。
+    /// Election request.
     RequestVote {
-        /// 候选人任期。
+        /// Candidate's term.
         term: u64,
-        /// 候选人 id。
+        /// Candidate id.
         candidate: NodeId,
-        /// 候选人最后日志索引。
+        /// Candidate's last log index.
         last_log_index: u64,
-        /// 候选人最后日志条目的任期。
+        /// Term of the candidate's last log entry.
         last_log_term: u64,
     },
-    /// 选主应答。
+    /// Election response.
     VoteResponse {
-        /// 投票人任期。
+        /// Voter's term.
         term: u64,
-        /// 是否投赞成票。
+        /// Whether the vote is granted.
         granted: bool,
     },
-    /// 日志复制 / 心跳。
+    /// Log replication / heartbeat.
     AppendEntries {
-        /// Leader 任期。
+        /// Leader's term.
         term: u64,
-        /// Leader id。
+        /// Leader id.
         leader: NodeId,
-        /// 新条目之前一条的索引（0 = 日志头；`snap_index` = 快照点）。
+        /// Index of the entry just before the new ones (0 = log head; `snap_index` = snapshot point).
         prev_log_index: u64,
-        /// 前一条目的任期。
+        /// Term of the previous entry.
         prev_log_term: u64,
-        /// 新条目（空 = 心跳）。
+        /// New entries (empty = heartbeat).
         entries: Vec<Entry>,
-        /// Leader 的 commit 水位。
+        /// Leader's commit watermark.
         leader_commit: u64,
     },
-    /// 复制应答（亦作 InstallSnapshot 的应答，`match_index` =
-    /// 快照的 `last_included_index`）。
+    /// Replication response (also used as the InstallSnapshot response, with `match_index` =
+    /// the snapshot's `last_included_index`).
     AppendResponse {
-        /// 应答者任期。
+        /// Responder's term.
         term: u64,
-        /// 是否复制成功。
+        /// Whether replication succeeded.
         success: bool,
-        /// 已确认复制的最大索引（供 Leader 推进 commit）。
+        /// Maximum index confirmed replicated (for the Leader to advance commit).
         match_index: u64,
     },
-    /// 快照安装：跟随者落后超过 Leader 日志起点时替代 AppendEntries。
+    /// Snapshot installation: replaces AppendEntries when a follower lags beyond the Leader's log start.
     InstallSnapshot {
-        /// Leader 任期。
+        /// Leader's term.
         term: u64,
-        /// Leader id。
+        /// Leader id.
         leader: NodeId,
-        /// 快照本体。
+        /// The snapshot itself.
         snapshot: Snapshot,
     },
 }
 
-/// 传输抽象：消息允许丢失/延迟/乱序（Raft 全部容忍），
-/// 故 `send` 不返回错误——失败即丢包，由协议层重试。
+/// Transport abstraction: messages may be lost/delayed/reordered (Raft tolerates all),
+/// so `send` returns no error — a failure is just a dropped packet, retried by the protocol layer.
 pub trait Transport {
-    /// 向 `to` 发送一条消息（best-effort）。
+    /// Send one message to `to` (best-effort).
     fn send(&mut self, to: NodeId, msg: Msg);
-    /// 非阻塞收取一条消息。
+    /// Non-blocking receive of one message.
     fn recv(&mut self) -> Option<(NodeId, Msg)>;
 }
 
-/// 单分片 Raft 节点。
+/// Single-shard Raft node.
 pub struct Node<T: Transport> {
     id: NodeId,
-    /// 其余投票成员（不含自己）。
+    /// Other voting members (excluding self).
     peers: Vec<NodeId>,
-    /// 自己是否为投票成员（被 remove_peer 移除后为 false：
-    /// 不发起选举、不投票、不计入多数派，仍以 Follower 身份追日志）。
+    /// Whether self is a voting member (false after being removed by remove_peer:
+    /// does not start elections, does not vote, is not counted in majorities, but still follows the log).
     voter: bool,
     transport: T,
     role: Role,
     current_term: u64,
     voted_for: Option<NodeId>,
     log: Vec<Entry>,
-    /// 快照压缩点：`log[i]` 的绝对索引 = `snap_index + 1 + i`。
+    /// Snapshot compaction point: absolute index of `log[i]` = `snap_index + 1 + i`.
     snap_index: u64,
-    /// 快照点处条目任期。
+    /// Term of the entry at the snapshot point.
     snap_term: u64,
-    /// 最近一次快照（Leader 发 InstallSnapshot 需要状态字节，故留存）。
+    /// Most recent snapshot (kept because the Leader needs the state bytes for InstallSnapshot).
     snapshot: Option<Snapshot>,
     commit_index: u64,
-    /// 已交付给上层（take_committed）的水位。
+    /// Watermark already delivered upward (take_committed).
     applied_up_to: u64,
-    /// candidate：已获票数（含自投）。
+    /// candidate: votes received (including self-vote).
     votes_received: usize,
-    /// pre-candidate：已获预投票数（含自投）。
+    /// pre-candidate: pre-votes received (including self-vote).
     pre_votes: usize,
-    /// leader：是否有未提交的本任期成员变更（一次只变一个）。
+    /// leader: whether there is an uncommitted current-term membership change (one at a time).
     pending_conf: bool,
-    /// leader：每个跟随者的复制进度。
+    /// leader: replication progress of each follower.
     next_index: BTreeMap<NodeId, u64>,
     match_index: BTreeMap<NodeId, u64>,
     leader_id: Option<NodeId>,
     now: u64,
-    /// 上次"选举计时重置"（收到合法心跳/投票/开始选举）。
+    /// Last 'election timer reset' (received a legitimate heartbeat/vote, or started an election).
     last_progress: u64,
     last_heartbeat_sent: u64,
     election_min: u64,
     election_span: u64,
     heartbeat_interval: u64,
-    /// 预竞选轮数（混入超时哈希，见 [`Node::election_timeout`]）。
+    /// Pre-campaign round number (mixed into the timeout hash, see [`Node::election_timeout`]).
     campaign: u64,
     seed: u64,
 }
 
 impl<T: Transport> Node<T> {
-    /// 创建节点（初始为 Follower，任期 0，投票成员）。
+    /// Create a node (initially a Follower, term 0, voting member).
     ///
-    /// - `peers`：其余节点 id（不含自己）；集群 = peers ∪ {id}；
-    /// - `election_timeout ∈ [min, min+span)` 由 `hash(seed, term)` 决定；
-    /// - `heartbeat_interval` 必须显著小于 `min`（建议 ≤ min/3）。
+    /// - `peers`: the other node ids (excluding self); cluster = peers ∪ {id};
+    /// - `election_timeout ∈ [min, min+span)` derived from `hash(seed, term)`;
+    /// - `heartbeat_interval` must be significantly smaller than `min` (recommended <= min/3).
     pub fn new(
         id: NodeId,
         peers: Vec<NodeId>,
@@ -276,59 +276,59 @@ impl<T: Transport> Node<T> {
         }
     }
 
-    // ------------------------------------------------------------ 观测
+    // ------------------------------------------------------------ observation
 
-    /// 本节点 id。
+    /// This node's id.
     pub fn id(&self) -> NodeId {
         self.id
     }
 
-    /// 当前角色。
+    /// Current role.
     pub fn role(&self) -> Role {
         self.role
     }
 
-    /// 是否为 Leader。
+    /// Whether this node is the Leader.
     pub fn is_leader(&self) -> bool {
         self.role == Role::Leader
     }
 
-    /// 当前任期。
+    /// Current term.
     pub fn term(&self) -> u64 {
         self.current_term
     }
 
-    /// 已知的 Leader（未知为 None）。
+    /// Known Leader (`None` when unknown).
     pub fn leader_id(&self) -> Option<NodeId> {
         self.leader_id
     }
 
-    /// 多数派 commit 水位。
+    /// Majority commit watermark.
     pub fn commit_index(&self) -> u64 {
         self.commit_index
     }
 
-    /// 最大日志索引（绝对；含快照点前缀）。
+    /// Maximum log index (absolute; including the snapshot-point prefix).
     pub fn log_len(&self) -> u64 {
         self.last_log_index()
     }
 
-    /// 日志内容（未压缩后缀，测试/诊断）。
+    /// Log contents (uncompacted suffix; for tests/diagnostics).
     pub fn log_entries(&self) -> &[Entry] {
         &self.log
     }
 
-    /// 快照压缩点：绝对索引 ≤ 此值的条目已被丢弃（0 = 无快照）。
+    /// Snapshot compaction point: entries with absolute index <= this value have been discarded (0 = no snapshot).
     pub fn compacted_index(&self) -> u64 {
         self.snap_index
     }
 
-    /// 最近一次快照（若有）。
+    /// Most recent snapshot (if any).
     pub fn snapshot(&self) -> Option<&Snapshot> {
         self.snapshot.as_ref()
     }
 
-    /// 当前生效配置（投票成员全集，含自己若在配置内；升序）。
+    /// Currently effective configuration (full set of voting members, including self if in the configuration; ascending).
     pub fn membership(&self) -> Vec<NodeId> {
         let mut m = self.peers.clone();
         if self.voter {
@@ -338,26 +338,26 @@ impl<T: Transport> Node<T> {
         m
     }
 
-    /// 自己是否为投票成员。
+    /// Whether self is a voting member.
     pub fn is_voter(&self) -> bool {
         self.voter
     }
 
-    /// 传输层引用（驱动消息泵）。
+    /// Transport-layer reference (drives the message pump).
     pub fn transport_mut(&mut self) -> &mut T {
         &mut self.transport
     }
 
-    // ------------------------------------------------------------ 时钟
+    // ------------------------------------------------------------ clock
 
-    /// 本轮竞选的选举超时（确定性"随机"）。
+    /// Election timeout for this campaign round (deterministically 'random').
     ///
-    /// 哈希混入 `(seed, current_term, campaign)`：预投票不抬任期，
-    /// 若超时只随任期变化，同刻超时的节点会每轮同步重试、互相
-    /// 拒绝预投票而活锁；竞选轮数使每次重试的退避错开，
-    /// 同一事件序列下结果恒定（确定性不受影响）。
+    /// The hash mixes `(seed, current_term, campaign)`: pre-votes do not raise the term,
+    /// so if the timeout depended only on the term, nodes timing out at the same moment would
+    /// retry in lockstep every round and reject each other's pre-votes — a livelock; the campaign
+    /// round staggers each retry's backoff, and results stay constant for the same event sequence (determinism unaffected).
     fn election_timeout(&self) -> u64 {
-        // SplitMix64 最终混淆。
+        // SplitMix64 finalizer.
         let mut z = self
             .seed
             .wrapping_mul(0x9E37_79B9_7F4A_7C15)
@@ -369,8 +369,8 @@ impl<T: Transport> Node<T> {
         self.election_min + z % self.election_span
     }
 
-    /// 推进逻辑时钟：Leader 到点发心跳；投票成员的
-    /// Follower/PreCandidate/Candidate 到点发起（预）选举。
+    /// Advance the logical clock: the Leader sends heartbeats when due; voting-member
+    /// Followers/PreCandidates/Candidates start (pre-)elections when due.
     pub fn tick(&mut self, now: u64) {
         self.now = now;
         match self.role {
@@ -382,7 +382,7 @@ impl<T: Transport> Node<T> {
             }
             Role::Follower | Role::PreCandidate | Role::Candidate => {
                 if !self.voter {
-                    return; // 非投票成员永不开票
+                    return; // non-voting members never start an election
                 }
                 if now.saturating_sub(self.last_progress) >= self.election_timeout() {
                     self.start_pre_vote();
@@ -391,9 +391,9 @@ impl<T: Transport> Node<T> {
         }
     }
 
-    // ------------------------------------------------------------ 上层接口
+    // ------------------------------------------------------------ upper-layer interface
 
-    /// 提议一批 WAL 记录（仅 Leader）。返回条目索引（1 起，绝对）。
+    /// Propose a batch of WAL records (Leader only). Returns the entry index (1-based, absolute).
     pub fn propose(&mut self, records: Vec<Record>) -> Result<u64> {
         if !self.is_leader() {
             return Err(crate::not_leader_err());
@@ -405,10 +405,10 @@ impl<T: Transport> Node<T> {
         Ok(idx)
     }
 
-    /// 提议一次单步成员变更（仅 Leader，且无上一条未提交的变更）。
+    /// Propose a single-step membership change (Leader only, and only with no previous uncommitted change).
     ///
-    /// 新配置编码为日志条目，**多数派提交后**才在本地生效；生效前
-    /// 多数派仍按旧配置计算，保证一次只变一个的安全性。
+    /// The new configuration is encoded as a log entry and takes effect locally only after **majority
+    /// commit**; until then, majorities are still computed per the old configuration — the safety basis of one-at-a-time changes.
     pub fn change_membership(&mut self, cc: ConfChange) -> Result<u64> {
         if !self.is_leader() {
             return Err(crate::not_leader_err());
@@ -432,21 +432,21 @@ impl<T: Transport> Node<T> {
         self.propose(vec![encode_conf(cc)])
     }
 
-    /// 加入一个投票成员（[`ConfChange::AddPeer`] 的便捷封装）。
+    /// Add a voting member (convenience wrapper for [`ConfChange::AddPeer`]).
     pub fn add_peer(&mut self, id: NodeId) -> Result<u64> {
         self.change_membership(ConfChange::AddPeer(id))
     }
 
-    /// 移除一个投票成员（[`ConfChange::RemovePeer`] 的便捷封装）。
-    /// 允许移除自己（Leader 将在变更提交后退位）。
+    /// Remove a voting member (convenience wrapper for [`ConfChange::RemovePeer`]).
+    /// Removing self is allowed (the Leader steps down once the change is committed).
     pub fn remove_peer(&mut self, id: NodeId) -> Result<u64> {
         self.change_membership(ConfChange::RemovePeer(id))
     }
 
-    /// 取走 `(applied, commit_index]` 的已提交条目（多数派确认 durable）。
+    /// Take committed entries in `(applied, commit_index]` (majority-confirmed durable).
     ///
-    /// 成员变更条目也会原样返回（内含 [`CONF_SERIES`] 哨兵记录），
-    /// 由上层（如 `ReplicatedWal`）过滤。
+    /// Membership-change entries are also returned as-is (containing a [`CONF_SERIES`] sentinel record);
+    /// filtering is up to the upper layer (e.g. `ReplicatedWal`).
     pub fn take_committed(&mut self) -> Vec<Entry> {
         let hi = self.commit_index.min(self.last_log_index());
         let lo = self.applied_up_to.max(self.snap_index);
@@ -459,15 +459,15 @@ impl<T: Transport> Node<T> {
         out
     }
 
-    // ------------------------------------------------------------ 快照
+    // ------------------------------------------------------------ snapshots
 
-    /// 拍摄快照并压缩日志：丢弃 `compact_upto`（含）之前的已提交前缀。
+    /// Take a snapshot and compact the log: discard the committed prefix up to and including `compact_upto`.
     ///
-    /// - 要求 `snap_index < compact_upto <= commit_index`（只能压缩
-    ///   已提交且尚未压缩的条目），否则返回 `Err`；
-    /// - `state` 为上层状态机字节，协议层不透明保存/转发；
-    /// - 返回的 [`Snapshot`] 同时留存在节点内，供 Leader 向落后的
-    ///   跟随者发送 `InstallSnapshot`。
+    /// - requires `snap_index < compact_upto <= commit_index` (only committed, not-yet-compacted entries
+    ///   may be compacted), otherwise returns `Err`;
+    /// - `state` holds upper-layer state-machine bytes, saved/forwarded opaquely by the protocol layer;
+    /// - the returned [`Snapshot`] is also retained inside the node so the Leader can send
+    ///   `InstallSnapshot` to lagging followers.
     pub fn take_snapshot(&mut self, compact_upto: u64, state: Vec<u8>) -> Result<Snapshot> {
         if compact_upto <= self.snap_index || compact_upto > self.commit_index {
             return Err(Error::Corrupt(format!(
@@ -475,9 +475,9 @@ impl<T: Transport> Node<T> {
                 self.snap_index, self.commit_index
             )));
         }
-        let term = self.term_at(compact_upto).expect("compact_upto 在日志范围内");
+        let term = self.term_at(compact_upto).expect("compact_upto is within the log range");
         let snap = Snapshot { last_included_index: compact_upto, last_included_term: term, state };
-        // 丢弃前缀
+        // discard the prefix
         let drop = (compact_upto - self.snap_index) as usize;
         self.log.drain(..drop);
         self.snap_index = compact_upto;
@@ -486,29 +486,29 @@ impl<T: Transport> Node<T> {
         Ok(snap)
     }
 
-    /// 本地安装一份快照（例如重启恢复；等价于收到 InstallSnapshot
-    /// 但不涉及任期/角色仲裁）。
+    /// Install a snapshot locally (e.g. restart recovery; equivalent to receiving an InstallSnapshot
+    /// but without term/role arbitration).
     ///
-    /// 快照点 ≤ 当前压缩点时为空操作。安装后日志只保留快照点之后
-    /// 且任期连续的后缀（快照点处任期不匹配则整段丢弃）；
-    /// `commit_index` / `applied` 水位抬升到至少快照点——被跳过的
-    /// 条目视为已包含在快照状态内，不再经 `take_committed` 交付。
+    /// No-op when the snapshot point is <= the current compaction point. After installation the log keeps
+    /// only the suffix after the snapshot point with continuous terms (the whole log is discarded on a term
+    /// mismatch at the snapshot point); `commit_index` / `applied` watermarks are raised to at least the
+    /// snapshot point — skipped entries are considered included in the snapshot state and are no longer delivered via `take_committed`.
     pub fn install_snapshot(&mut self, snap: Snapshot) -> Result<()> {
         if snap.last_included_index <= self.snap_index {
-            return Ok(()); // 陈旧快照
+            return Ok(()); // stale snapshot
         }
         self.apply_snapshot(snap);
         Ok(())
     }
 
-    /// 快照落地的公共部分。
+    /// Common part of snapshot installation.
     fn apply_snapshot(&mut self, snap: Snapshot) {
         let idx = snap.last_included_index;
         let keep_from = if self.term_at(idx) == Some(snap.last_included_term) {
-            // 快照点恰好在本地日志中且任期一致：保留其后后缀
+            // the snapshot point is exactly in the local log with a matching term: keep the suffix after it
             (idx - self.snap_index) as usize
         } else {
-            // 快照点超出本地日志或任期冲突：整段丢弃
+            // the snapshot point is beyond the local log or terms conflict: discard the whole log
             self.log.len()
         };
         self.log.drain(..keep_from.min(self.log.len()));
@@ -519,9 +519,9 @@ impl<T: Transport> Node<T> {
         self.snapshot = Some(snap);
     }
 
-    // ------------------------------------------------------------ 消息处理
+    // ------------------------------------------------------------ message handling
 
-    /// 处理一条收到的协议消息。
+    /// Handle one received protocol message.
     pub fn handle(&mut self, from: NodeId, msg: Msg) {
         match msg {
             Msg::PreVote { term, candidate, last_log_index, last_log_term } => {
@@ -548,7 +548,7 @@ impl<T: Transport> Node<T> {
         }
     }
 
-    /// 见到更高任期：退回 Follower 并更新任期。
+    /// Seeing a higher term: step back to Follower and update the term.
     fn step_down_if_stale(&mut self, term: u64) {
         if term > self.current_term {
             self.current_term = term;
@@ -560,17 +560,17 @@ impl<T: Transport> Node<T> {
         }
     }
 
-    /// 日志"新鲜度"比较：候选人的 (last_log_term, last_log_index)
-    /// 是否不落后于本地。
+    /// Log 'freshness' comparison: whether the candidate's (last_log_term, last_log_index)
+    /// is not behind the local one.
     fn log_up_to_date(&self, last_log_index: u64, last_log_term: u64) -> bool {
         let my_last_term = self.last_log_term();
         last_log_term > my_last_term
             || (last_log_term == my_last_term && last_log_index >= self.last_log_index())
     }
 
-    /// 预投票收方逻辑：不抬任期、不改角色。仅在
-    /// 「候选人是投票成员 + 预备任期更高 + 日志不落后 + 自己的
-    /// Leader 租约已过期（>= election_min）」时投赞成。
+    /// Pre-vote receiver logic: no term raise, no role change. Grants the vote only when
+    /// 'the candidate is a voting member + prospective term is higher + log not behind + own
+    /// Leader lease has expired (>= election_min)'.
     fn handle_pre_vote(&mut self, candidate: NodeId, term: u64, last_log_index: u64, last_log_term: u64) {
         let lease_expired = self.now.saturating_sub(self.last_progress) >= self.election_min;
         let granted = self.voter
@@ -640,11 +640,11 @@ impl<T: Transport> Node<T> {
         self.leader_id = Some(leader);
         self.last_progress = self.now;
 
-        // 前缀已被本地快照压缩：跳过被覆盖的条目，从快照点对齐。
+        // the prefix has been compacted by the local snapshot: skip covered entries and align at the snapshot point.
         if prev_log_index < self.snap_index {
             let skip = (self.snap_index - prev_log_index) as usize;
             if entries.len() <= skip {
-                // 全部条目都已被快照覆盖：只需推进 commit
+                // all entries are covered by the snapshot: only commit needs advancing
                 if leader_commit > self.commit_index {
                     self.commit_index = leader_commit.min(self.last_log_index());
                 }
@@ -660,7 +660,7 @@ impl<T: Transport> Node<T> {
             prev_log_term = self.snap_term;
         }
 
-        // prev 一致性检查
+        // prev consistency check
         let prev_ok = if prev_log_index == 0 {
             true
         } else {
@@ -674,12 +674,12 @@ impl<T: Transport> Node<T> {
             });
             return;
         }
-        // 冲突截断 + 追加（逐条目对齐；快照点前的条目跳过）
+        // conflict truncation + append (aligned entry by entry; entries before the snapshot point are skipped)
         let mut idx = prev_log_index;
         for e in entries {
             idx += 1;
             if idx <= self.snap_index {
-                continue; // 已被快照覆盖
+                continue; // already covered by the snapshot
             }
             let slot = (idx - self.snap_index - 1) as usize;
             if let Some(existing) = self.log.get(slot) {
@@ -691,7 +691,7 @@ impl<T: Transport> Node<T> {
                 self.log.push(e);
             }
         }
-        // 推进本地 commit（不超过本地最后索引），并应用新提交的配置
+        // advance the local commit (not beyond the local last index) and apply newly committed configurations
         if leader_commit > self.commit_index {
             let new_commit = leader_commit.min(self.last_log_index());
             self.apply_committed_confs(self.commit_index + 1, new_commit);
@@ -704,7 +704,7 @@ impl<T: Transport> Node<T> {
         });
     }
 
-    /// 安装来自 Leader 的快照（跟随者落后超过 Leader 日志起点）。
+    /// Install a snapshot from the Leader (follower lagging beyond the Leader's log start).
     fn handle_install_snapshot(&mut self, leader: NodeId, term: u64, snapshot: Snapshot) {
         self.step_down_if_stale(term);
         if term < self.current_term {
@@ -740,8 +740,8 @@ impl<T: Transport> Node<T> {
             self.next_index.insert(from, m + 1);
             self.advance_commit();
         } else {
-            // 回退一格并立即补发（若已退到快照点之下，
-            // send_append 会自动改发 InstallSnapshot）
+            // step back one slot and resend immediately (once stepped below the snapshot point,
+            // send_append automatically switches to InstallSnapshot)
             let next = self.next_index.get(&from).copied().unwrap_or(self.last_log_index() + 1);
             let next = next.saturating_sub(1).max(1);
             self.next_index.insert(from, next);
@@ -749,10 +749,10 @@ impl<T: Transport> Node<T> {
         }
     }
 
-    // ------------------------------------------------------------ 内部
+    // ------------------------------------------------------------ internals
 
-    /// 绝对索引 `idx` 处条目的任期；`idx == 0`（空日志头）返回
-    /// `Some(0)`，已被压缩的前缀（`idx < snap_index`）返回 `None`。
+    /// Term of the entry at absolute index `idx`; `idx == 0` (empty log head) returns
+    /// `Some(0)`; an already-compacted prefix (`idx < snap_index`) returns `None`.
     fn term_at(&self, idx: u64) -> Option<u64> {
         if idx == 0 {
             return Some(0);
@@ -761,7 +761,7 @@ impl<T: Transport> Node<T> {
             return Some(self.snap_term);
         }
         if idx < self.snap_index {
-            return None; // 已压缩，不可考
+            return None; // compacted away; unknowable
         }
         self.log.get((idx - self.snap_index - 1) as usize).map(|e| e.term)
     }
@@ -774,17 +774,17 @@ impl<T: Transport> Node<T> {
         self.log.last().map(|e| e.term).unwrap_or(self.snap_term)
     }
 
-    /// 当前配置的多数派人数。
+    /// Majority size of the current configuration.
     fn majority(&self) -> usize {
         let cluster = self.peers.len() + usize::from(self.voter);
         cluster / 2 + 1
     }
 
-    /// 选举超时后的第一步：预投票（不抬任期）。
+    /// First step after an election timeout: pre-vote (does not raise the term).
     fn start_pre_vote(&mut self) {
-        self.campaign += 1; // 新一轮退避（见 election_timeout）
+        self.campaign += 1; // a new backoff round (see election_timeout)
         self.role = Role::PreCandidate;
-        self.pre_votes = 1; // 自投
+        self.pre_votes = 1; // self-vote
         self.votes_received = 0;
         self.leader_id = None;
         self.last_progress = self.now;
@@ -803,7 +803,7 @@ impl<T: Transport> Node<T> {
         }
     }
 
-    /// 预投票获多数后进入正式选主（任期 +1）。
+    /// Enter the real election (term +1) after the pre-vote wins a majority.
     fn start_election(&mut self) {
         self.current_term += 1;
         self.role = Role::Candidate;
@@ -840,13 +840,13 @@ impl<T: Transport> Node<T> {
         self.broadcast_append();
     }
 
-    /// 向某跟随者按其 next_index 发送 AppendEntries；所需前缀已被
-    /// 压缩（`next <= snap_index`）时改发 InstallSnapshot。
+    /// Send AppendEntries to a follower per its next_index; when the needed prefix has been
+    /// compacted (`next <= snap_index`), send InstallSnapshot instead.
     fn send_append(&mut self, to: NodeId) {
         let next = self.next_index.get(&to).copied().unwrap_or(self.last_log_index() + 1);
         if next <= self.snap_index {
-            // 跟随者落后超过日志起点：走 InstallSnapshot 而非 AppendEntries。
-            // snapshot 自 take_snapshot/install_snapshot 起留存，必为 Some。
+            // the follower lags beyond the log start: use InstallSnapshot instead of AppendEntries.
+            // snapshot is retained since take_snapshot/install_snapshot, so it must be Some.
             if let Some(snap) = self.snapshot.clone() {
                 self.transport.send(to, Msg::InstallSnapshot {
                     term: self.current_term,
@@ -857,7 +857,7 @@ impl<T: Transport> Node<T> {
             return;
         }
         let prev_log_index = next - 1;
-        let prev_log_term = self.term_at(prev_log_index).expect("prev 在快照点之后，必可查");
+        let prev_log_term = self.term_at(prev_log_index).expect("prev is after the snapshot point, so it must be queryable");
         let first = (next - self.snap_index - 1) as usize;
         let entries: Vec<Entry> = self.log[first.min(self.log.len())..].to_vec();
         self.transport.send(to, Msg::AppendEntries {
@@ -877,10 +877,10 @@ impl<T: Transport> Node<T> {
         }
     }
 
-    /// Leader 按多数派 match_index 推进 commit（仅当前任期条目可直接
-    /// 推进，旧任期条目随之间接提交；只计数当前配置内的投票成员）。
-    /// 条目提交后立即应用其中的成员变更（单步协议：变更条目本身
-    /// 仍按旧配置计票）。
+    /// The Leader advances commit by majority match_index (only current-term entries can be advanced
+    /// directly; older-term entries commit indirectly; only voting members in the current configuration are counted).
+    /// Membership changes are applied immediately once their entries commit (single-step protocol: the
+    /// change entry itself is still counted under the old configuration).
     fn advance_commit(&mut self) {
         let mut newly = self.commit_index;
         for n in (self.commit_index + 1)..=self.last_log_index() {
@@ -903,8 +903,8 @@ impl<T: Transport> Node<T> {
         }
     }
 
-    /// 应用 `(from, to]`（含两端、绝对索引）区间内新提交条目中的
-    /// 成员变更。逐条扫描，哨兵记录之外的用户数据不受影响。
+    /// Apply membership changes from newly committed entries in `(from, to]` (both ends inclusive,
+    /// absolute indices). Scans entry by entry; user data outside sentinel records is unaffected.
     fn apply_committed_confs(&mut self, from: u64, to: u64) {
         let mut ccs = Vec::new();
         for idx in from..=to {
@@ -920,7 +920,7 @@ impl<T: Transport> Node<T> {
         }
     }
 
-    /// 应用一条已提交的单步成员变更。
+    /// Apply one committed single-step membership change.
     fn apply_conf(&mut self, cc: ConfChange) {
         self.pending_conf = false;
         match cc {
@@ -937,7 +937,7 @@ impl<T: Transport> Node<T> {
             }
             ConfChange::RemovePeer(id) => {
                 if id == self.id {
-                    // 被移出配置：退位并降级为非投票成员
+                    // removed from the configuration: step down and demote to non-voting member
                     self.voter = false;
                     self.role = Role::Follower;
                     self.leader_id = None;

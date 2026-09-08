@@ -1,0 +1,92 @@
+[
+  {
+    "latency_ns": {
+      "max": 388607,
+      "p50": 6483,
+      "p99": 21663,
+      "p999": 71935
+    },
+    "notes": "prepared INSERT 逐行 autocommit（每行一个隐式事务）",
+    "system": "sqlite",
+    "throughput_ops": 133793.41463514947,
+    "variant": "synchronous=OFF,WAL",
+    "workload": {
+      "n": 200000,
+      "series": 8
+    }
+  },
+  {
+    "avg_agg_pts_s": 3018734.945266954,
+    "disk_bytes": 27009024,
+    "notes": "10k 点/事务批量提交; 压缩比 vs 16B/点原始 = 0.59x（无索引，SQLite 行存含页头/rowid 开销）",
+    "rss_bytes": 32423936,
+    "scan_pts_s": 1956298.4867724064,
+    "system": "sqlite",
+    "throughput_ops": 2220259.9959091265,
+    "variant": "synchronous=OFF,WAL",
+    "workload": {
+      "n": 1000000,
+      "series": 8
+    }
+  },
+  {
+    "latency_ns": {
+      "max": 29081599,
+      "p50": 7499,
+      "p99": 23071,
+      "p999": 15327231
+    },
+    "notes": "prepared INSERT 逐行 autocommit（每行一个隐式事务）；p999≈15ms 尖峰为 WAL auto-checkpoint（默认 1000 页）阻塞，默认调优下如实记录",
+    "system": "sqlite",
+    "throughput_ops": 30476.60301677702,
+    "variant": "synchronous=NORMAL,WAL",
+    "workload": {
+      "n": 200000,
+      "series": 8
+    }
+  },
+  {
+    "avg_agg_pts_s": 3052611.8134465404,
+    "disk_bytes": 27009024,
+    "notes": "10k 点/事务批量提交; 压缩比 vs 16B/点原始 = 0.59x（无索引，SQLite 行存含页头/rowid 开销）",
+    "rss_bytes": 44331008,
+    "scan_pts_s": 2017763.5101989007,
+    "system": "sqlite",
+    "throughput_ops": 2497564.2629403886,
+    "variant": "synchronous=NORMAL,WAL",
+    "workload": {
+      "n": 1000000,
+      "series": 8
+    }
+  },
+  {
+    "latency_ns": {
+      "max": 14843903,
+      "p50": 1043455,
+      "p99": 2729983,
+      "p999": 4167679
+    },
+    "notes": "prepared INSERT 逐行 autocommit（每行一个隐式事务）; FULL 档 fsync 受限，延迟测量缩减为 20000 点/轮（铁律3）",
+    "system": "sqlite",
+    "throughput_ops": 896.3550936604613,
+    "variant": "synchronous=FULL,WAL",
+    "workload": {
+      "n": 20000,
+      "series": 8
+    }
+  },
+  {
+    "avg_agg_pts_s": 2927084.5129179014,
+    "disk_bytes": 27009024,
+    "notes": "10k 点/事务批量提交; 压缩比 vs 16B/点原始 = 0.59x（无索引，SQLite 行存含页头/rowid 开销）",
+    "rss_bytes": 44331008,
+    "scan_pts_s": 1942229.8303680744,
+    "system": "sqlite",
+    "throughput_ops": 1688865.9083028226,
+    "variant": "synchronous=FULL,WAL",
+    "workload": {
+      "n": 1000000,
+      "series": 8
+    }
+  }
+]

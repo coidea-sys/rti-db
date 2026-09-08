@@ -1,0 +1,32 @@
+[
+  {
+    "latency_ns": {
+      "max": 326893567,
+      "p50": 2164735,
+      "p99": 8519679,
+      "p999": 55050239
+    },
+    "notes": "HTTP JSONEachRow 单行 INSERT，每请求新建 TCP 连接；仅 1 万点采样（SPEC A）",
+    "system": "clickhouse",
+    "throughput_ops": 362.1783621303305,
+    "variant": "default",
+    "workload": {
+      "n": 10000,
+      "series": 8
+    }
+  },
+  {
+    "avg_agg_pts_s": 25762255.54936374,
+    "disk_bytes": 13070238,
+    "notes": "10k 行/请求 JSONEachRow 批量 INSERT; 压缩比 vs 16B/点原始 = 1.22x（system.parts bytes_on_disk，MergeTree 列存 + LZ4）",
+    "rss_bytes": 925990912,
+    "scan_pts_s": 2125749.1546570538,
+    "system": "clickhouse",
+    "throughput_ops": 1041302.8994303463,
+    "variant": "default",
+    "workload": {
+      "n": 1000000,
+      "series": 8
+    }
+  }
+]

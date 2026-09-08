@@ -13,10 +13,17 @@ members = [
     "crates/rti-db",
     "crates/rti-edge",
 ]
+exclude = ["bench"]
 
 [workspace.package]
+version = "0.6.0"
 edition = "2021"
-license = "MIT"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/coidea-sys/rti-db"
+homepage = "https://github.com/coidea-sys/rti-db"
+description = "A hard-real-time embedded time-series data engine in Rust"
+keywords = ["time-series", "real-time", "embedded", "edge", "database"]
+categories = ["database", "embedded", "no-std"]
 
 [profile.release]
 opt-level = 3

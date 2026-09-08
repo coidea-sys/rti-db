@@ -1,14 +1,14 @@
-//! rti-net：TCP 行协议 server。
+//! rti-net: TCP line-protocol server.
 //!
-//! 协议（每行一条命令，UTF-8 文本）：
+//! Protocol (one command per line, UTF-8 text):
 //!
 //! ```text
 //! put  <series> <ts> <value>          → "OK" | "ERR <msg>"
-//! scan <series> <t0> <t1> [agg]       → 若干行 "<ts> <value>"，以 "END" 结束
+//! scan <series> <t0> <t1> [agg]       → several "<ts> <value>" lines, terminated by "END"
 //! ```
 //!
-//! 其中 `agg ∈ {min,max,sum,avg,count}`。server 每连接一个线程，
-//! `Db` 本身 `Send + Sync`，可无锁共享。
+//! where `agg ∈ {min,max,sum,avg,count}`. The server runs one thread per connection;
+//! `Db` itself is `Send + Sync` and can be shared lock-free.
 
 #![forbid(unsafe_code)]
 
@@ -20,30 +20,30 @@ use rti_core::{Error, Result, Sample, SeriesId, Timestamp};
 use rti_db::Db;
 use rti_query::{Agg, Pred};
 
-/// 解析后的命令。
+/// Parsed command.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Command {
-    /// 写入采样点。
+    /// Write a sample point.
     Put {
-        /// 序列 id。
+        /// Series id.
         series: SeriesId,
-        /// 采样点。
+        /// Sample point.
         sample: Sample,
     },
-    /// 区间扫描（可选聚合）。
+    /// Range scan (optional aggregation).
     Scan {
-        /// 序列 id。
+        /// Series id.
         series: SeriesId,
-        /// 起始时间（闭区间）。
+        /// Start time (inclusive).
         t0: Timestamp,
-        /// 结束时间（闭区间）。
+        /// End time (inclusive).
         t1: Timestamp,
-        /// 可选聚合。
+        /// Optional aggregation.
         agg: Option<Agg>,
     },
 }
 
-/// 解析一行命令；空行返回 `Ok(None)`。
+/// Parse one command line; an empty line returns `Ok(None)`.
 pub fn parse_command(line: &str) -> Result<Option<Command>> {
     let toks: Vec<&str> = line.split_whitespace().collect();
     match toks.as_slice() {
@@ -84,7 +84,7 @@ fn parse_agg(a: &str) -> Result<Agg> {
     }
 }
 
-/// 执行一条命令并渲染响应文本（以 `\n` 结尾）。
+/// Execute one command and render the response text (terminated by `\n`).
 pub fn handle(db: &Db, cmd: Command) -> String {
     match cmd {
         Command::Put { series, sample } => match db.put(series, sample) {
@@ -107,7 +107,7 @@ pub fn handle(db: &Db, cmd: Command) -> String {
     }
 }
 
-/// 处理一行输入（解析 + 执行）；协议错误返回 `ERR ...` 文本。
+/// Handle one input line (parse + execute); protocol errors return `ERR ...` text.
 pub fn handle_line(db: &Db, line: &str) -> String {
     match parse_command(line) {
         Ok(Some(cmd)) => handle(db, cmd),
@@ -116,7 +116,7 @@ pub fn handle_line(db: &Db, line: &str) -> String {
     }
 }
 
-/// 启动 TCP server（阻塞当前线程，每连接一线程）。
+/// Start the TCP server (blocks the current thread, one thread per connection).
 pub fn serve(addr: &str, db: Arc<Db>) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr)?;
     for stream in listener.incoming() {
@@ -133,7 +133,7 @@ pub fn serve(addr: &str, db: Arc<Db>) -> std::io::Result<()> {
     Ok(())
 }
 
-/// 单连接循环：逐行读取命令，写回响应。
+/// Single-connection loop: read commands line by line, write back responses.
 pub fn handle_conn(stream: TcpStream, db: Arc<Db>) -> std::io::Result<()> {
     let mut writer = stream.try_clone()?;
     let reader = BufReader::new(stream);
@@ -247,8 +247,8 @@ mod tests {
         reader.read_line(&mut resp).unwrap();
         assert_eq!(resp, "END\n");
 
-        // 注意：必须先 drop reader（持有同一 socket 的克隆 fd），
-        // 否则服务端永远读不到 EOF，join 会挂起。
+        // note: the reader must be dropped first (it holds a cloned fd of the same socket),
+        // otherwise the server never reads EOF and join hangs.
         drop(reader);
         drop(client);
         srv.join().unwrap();

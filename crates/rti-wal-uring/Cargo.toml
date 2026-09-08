@@ -1,8 +1,9 @@
 [package]
 name = "rti-wal-uring"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "rti-db WAL io_uring submission backend: minimal unsafe glue, Linux only"
 
 [target.'cfg(target_os = "linux")'.dependencies]

@@ -1,8 +1,8 @@
-//! Raft 集群集成测试：MemoryTransport + 虚拟时钟，完全确定性。
+//! Raft cluster integration tests: MemoryTransport + virtual clock, fully deterministic.
 //!
-//! 覆盖 SPEC-evolution Wave 3 点名的四个场景：
-//! 3 节点选主收敛 / Leader 宕机重选 / 日志一致性（不丢已提交条目）/
-//! 网络分区少数派不可提交。
+//! Covers the four scenarios named by SPEC-evolution Wave 3:
+//! 3-node election convergence / Leader crash and re-election / log consistency
+//! (no committed entry is lost) / a minority under network partition cannot commit.
 
 use rti_raft::{MemoryNetwork, MemoryTransport, Msg, Node, NodeId, ReplicatedWal, Role, Transport};
 use rti_wal::Record;
@@ -12,7 +12,7 @@ const ELECTION_SPAN: u64 = 150;
 const HEARTBEAT: u64 = 40;
 const STEP_MS: u64 = 10;
 
-/// 测试集群驱动：每步推进逻辑时钟并泵空全部消息。
+/// Test cluster driver: each step advances the logical clock and pumps all messages dry.
 struct Cluster {
     nodes: Vec<Node<MemoryTransport>>,
     net: MemoryNetwork,
@@ -20,7 +20,7 @@ struct Cluster {
 }
 
 impl Cluster {
-    /// ids 与 seeds 一一对应；固定种子 ⇒ 选举超时序列确定。
+    /// ids correspond to seeds one-to-one; fixed seeds => deterministic election-timeout sequences.
     fn new(ids: &[NodeId], seeds: &[u64]) -> Self {
         let net = MemoryNetwork::new();
         let nodes = ids
@@ -46,7 +46,7 @@ impl Cluster {
         Self::new(&[1, 2, 3], &[11, 22, 33])
     }
 
-    /// 推进一个逻辑步：全部节点 tick，然后泵消息直到队列清空。
+    /// Advance one logical step: all nodes tick, then pump messages until the queues are empty.
     fn step(&mut self) {
         self.now += STEP_MS;
         for n in &mut self.nodes {
@@ -72,7 +72,7 @@ impl Cluster {
         }
     }
 
-    /// 当前唯一 Leader 的 nodes 下标（无或多于一个返回 None）。
+    /// Index in `nodes` of the single current Leader (`None` if zero or more than one).
     fn leader(&self) -> Option<usize> {
         let ls: Vec<usize> = self
             .nodes
@@ -88,12 +88,12 @@ impl Cluster {
         }
     }
 
-    /// 步进直到出现唯一 Leader（最多 max_steps），返回其下标。
+    /// Step until a single Leader emerges (at most max_steps), returning its index.
     fn elect(&mut self, max_steps: usize) -> usize {
         for _ in 0..max_steps {
             self.step();
             if let Some(l) = self.leader() {
-                // 再稳几步，确认不翻转
+                // hold steady for a few more steps to confirm it does not flip
                 let term = self.nodes[l].term();
                 self.step_n(3);
                 if self.leader() == Some(l) {
@@ -117,7 +117,7 @@ fn committed_records(n: &mut Node<MemoryTransport>) -> Vec<Record> {
         .collect()
 }
 
-/// 场景 1：3 节点选主收敛——恰好一个 Leader，其余 Follower，任期一致。
+/// Scenario 1: 3-node election convergence — exactly one Leader, the rest Followers, terms agree.
 #[test]
 fn three_node_election_converges() {
     let mut c = Cluster::three();
@@ -132,29 +132,29 @@ fn three_node_election_converges() {
             assert_eq!(n.role(), Role::Follower, "node {} must follow", n.id());
             assert_eq!(n.leader_id(), Some(c.nodes[l].id()), "node {} must know leader", n.id());
         }
-        assert_eq!(n.term(), term, "任期必须收敛一致");
+        assert_eq!(n.term(), term, "terms must converge");
     }
 }
 
-/// 场景 2：Leader 宕机后其余节点重选出新 Leader（任期递增）。
+/// Scenario 2: after the Leader crashes, the remaining nodes elect a new Leader (term increases).
 #[test]
 fn leader_crash_triggers_reelection() {
     let mut c = Cluster::three();
     let l = c.elect(500);
     let old_id = c.nodes[l].id();
     let old_term = c.nodes[l].term();
-    // 宕机：直接移除节点（其传输端点随之消失）
+    // crash: simply remove the node (its transport endpoint disappears with it)
     c.nodes.remove(l);
     let l2 = c.elect(500);
     let new_id = c.nodes[l2].id();
-    assert_ne!(new_id, old_id, "必须另选新 Leader");
-    assert!(c.nodes[l2].term() > old_term, "新任期必须递增");
-    // 存活的另一个节点跟随新 Leader
+    assert_ne!(new_id, old_id, "a new Leader must be elected");
+    assert!(c.nodes[l2].term() > old_term, "the new term must increase");
+    // the other surviving node follows the new Leader
     let other = c.nodes.iter().find(|n| n.id() != new_id).unwrap();
     assert_eq!(other.leader_id(), Some(new_id));
 }
 
-/// 场景 3：日志一致性——多数派提交后 Leader 宕机，新 Leader 不丢已提交条目。
+/// Scenario 3: log consistency — after a majority commit, the Leader crashes; the new Leader must not lose committed entries.
 #[test]
 fn committed_entries_survive_leader_crash() {
     let mut c = Cluster::three();
@@ -163,34 +163,34 @@ fn committed_entries_survive_leader_crash() {
     c.step_n(5);
     c.nodes[l].propose(rec(200)).unwrap();
     c.step_n(5);
-    // 全体节点 commit 水位应到 2
+    // every node's commit watermark should reach 2
     for n in &c.nodes {
-        assert_eq!(n.commit_index(), 2, "node {} 必须已提交两条", n.id());
+        assert_eq!(n.commit_index(), 2, "node {} must have committed both entries", n.id());
     }
-    // 杀掉 Leader，重选
+    // kill the Leader and re-elect
     c.nodes.remove(l);
     let l2 = c.elect(500);
-    // 新 Leader 日志必须包含全部已提交条目
+    // the new Leader's log must contain all committed entries
     let log = c.nodes[l2].log_entries();
-    assert!(log.len() >= 2, "新 Leader 必须携带已提交日志");
+    assert!(log.len() >= 2, "the new Leader must carry the committed log");
     assert_eq!(log[0].records, rec(100));
     assert_eq!(log[1].records, rec(200));
-    // 新 Leader 继续提议，已提交序列线性延伸
+    // the new Leader keeps proposing; the committed sequence extends linearly
     c.nodes[l2].propose(rec(300)).unwrap();
     c.step_n(5);
     let log = c.nodes[l2].log_entries();
     assert_eq!(log.len(), 3);
     assert_eq!(log[2].records, rec(300));
     assert_eq!(c.nodes[l2].commit_index(), 3);
-    // 存活跟随者取走全部已提交记录，顺序与内容一致
+    // a surviving follower takes all committed records, in order and with identical content
     let other_idx = if l2 == 0 { 1 } else { 0 };
     let got = committed_records(&mut c.nodes[other_idx]);
     let want: Vec<Record> = [rec(100), rec(200), rec(300)].concat();
-    assert_eq!(got, want, "已提交记录序列不允许丢失/乱序");
+    assert_eq!(got, want, "the committed record sequence must not be lost or reordered");
 }
 
-/// 场景 4：网络分区时少数派（含旧 Leader）不可提交；
-/// 愈合后少数派条目被多数派覆盖，已提交历史不受影响。
+/// Scenario 4: under a network partition the minority (including the old Leader) cannot commit;
+/// after healing, minority entries are overwritten by the majority; committed history is unaffected.
 #[test]
 fn partitioned_minority_cannot_commit() {
     let mut c = Cluster::three();
@@ -200,7 +200,7 @@ fn partitioned_minority_cannot_commit() {
     c.step_n(5);
     assert_eq!(c.nodes[l].commit_index(), 1);
 
-    // 分区：旧 Leader 单独一侧（少数派），另两个节点一侧
+    // partition: the old Leader alone on one side (minority), the other two nodes on the other side
     let majority_ids: Vec<NodeId> = c
         .nodes
         .iter()
@@ -209,17 +209,17 @@ fn partitioned_minority_cannot_commit() {
         .collect();
     c.net.partition(&[leader_id], &majority_ids);
 
-    // 旧 Leader 在分区中提议——永远凑不齐多数派
+    // the old Leader proposes inside the partition — it can never assemble a majority
     c.nodes[l].propose(rec(2)).unwrap();
     c.step_n(30);
     assert_eq!(
         c.nodes[l].commit_index(),
         1,
-        "少数派侧不得推进 commit（丢包即不可用，不可用即安全）"
+        "the minority side must not advance commit (packet loss means unavailability, unavailability means safety)"
     );
 
-    // 多数派侧选出新 Leader（旧 Leader 分区中仍自以为是 Leader，
-    // 故 elect() 的唯一 Leader 判定不适用，直接在多数派侧找）
+    // the majority side elects a new Leader (the old Leader still believes itself Leader inside the
+    // partition, so elect()'s single-Leader check does not apply — search directly on the majority side)
     let old_term = c.nodes[l].term();
     let mut l2 = None;
     for _ in 0..500 {
@@ -233,26 +233,26 @@ fn partitioned_minority_cannot_commit() {
             break;
         }
     }
-    let l2 = l2.expect("多数派侧必须选出新 Leader");
+    let l2 = l2.expect("the majority side must elect a new Leader");
     c.nodes[l2].propose(rec(3)).unwrap();
     c.step_n(5);
     assert_eq!(c.nodes[l2].commit_index(), 2);
 
-    // 愈合：旧 Leader 退位，少数派条目被覆盖，历史保留
+    // heal: the old Leader steps down, minority entries are overwritten, history is preserved
     c.net.heal();
     c.step_n(30);
     let old = c.nodes.iter_mut().find(|n| n.id() == leader_id).unwrap();
-    assert_eq!(old.role(), Role::Follower, "旧 Leader 必须退位");
-    assert_eq!(old.commit_index(), 2, "愈合后必须追平多数派历史");
+    assert_eq!(old.role(), Role::Follower, "the old Leader must step down");
+    assert_eq!(old.commit_index(), 2, "after healing it must catch up with the majority history");
     let log = old.log_entries();
-    assert_eq!(log.len(), 2, "少数派未提交条目必须被截断覆盖");
-    assert_eq!(log[0].records, rec(1), "已提交历史不允许改变");
-    assert_eq!(log[1].records, rec(3), "愈合后必须复制多数派的新条目");
+    assert_eq!(log.len(), 2, "uncommitted minority entries must be truncated and overwritten");
+    assert_eq!(log[0].records, rec(1), "committed history must not change");
+    assert_eq!(log[1].records, rec(3), "after healing it must replicate the majority's new entries");
     let got = committed_records(old);
-    assert_eq!(got, [rec(1), rec(3)].concat(), "少数派条目永不出现在已提交流中");
+    assert_eq!(got, [rec(1), rec(3)].concat(), "minority entries must never appear in the committed stream");
 }
 
-/// ReplicatedWal 集成：多数派确认前不可见 durable，确认后按序取回。
+/// ReplicatedWal integration: not visible as durable before majority acknowledgment; taken back in order afterwards.
 #[test]
 fn replicated_wal_durable_only_after_majority() {
     let net = MemoryNetwork::new();
@@ -297,7 +297,7 @@ fn replicated_wal_durable_only_after_majority() {
         }
     };
 
-    // 选出 Leader
+    // elect a Leader
     let mut leader = None;
     for _ in 0..500 {
         pump(&mut wals, &mut now, 1);
@@ -314,25 +314,25 @@ fn replicated_wal_durable_only_after_majority() {
     }
     let l = leader.expect("election must converge");
 
-    // 非 Leader 提议被拒绝
+    // proposals to a non-Leader are rejected
     let follower = (l + 1) % 3;
     assert!(wals[follower].append_batch(rec(9)).is_err());
 
-    // 提议但消息未泵：未达多数派，durable 水位不动
+    // proposed but messages not pumped: no majority, so the durable watermark does not move
     let idx = wals[l].append_batch(rec(42)).unwrap();
     assert_eq!(idx, 1);
-    // （消息已发送但跟随者尚未处理——把泵停了语义等价于复制未完成）
-    assert!(wals[l].take_durable().is_empty(), "多数派确认前不得交付");
+    // (messages sent but not yet processed by followers — stopping the pump is semantically equivalent to incomplete replication)
+    assert!(wals[l].take_durable().is_empty(), "must not deliver before majority acknowledgment");
 
-    // 泵消息完成复制：durable 推进，按序交付
+    // pump messages to complete replication: durable advances, delivered in order
     pump(&mut wals, &mut now, 5);
     assert_eq!(wals[l].durable_index(), 1);
-    assert_eq!(wals[l].take_durable(), rec(42), "确认后按原批次交付");
-    // 再无可交付记录
+    assert_eq!(wals[l].take_durable(), rec(42), "delivered in the original batches after acknowledgment");
+    // no more records to deliver
     assert!(wals[l].take_durable().is_empty());
 }
 
-/// TCP 传输 loopback 双向收发。
+/// TCP transport loopback bidirectional send/receive.
 #[test]
 fn tcp_transport_loopback_roundtrip() {
     use rti_raft::{TcpTransport, Transport};
@@ -371,6 +371,6 @@ fn tcp_transport_loopback_roundtrip() {
         }
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
-    assert_eq!(got1, Some((2, m2)), "t1 必须收到 t2 的消息且发送者 id 正确");
+    assert_eq!(got1, Some((2, m2)), "t1 must receive t2's message with the correct sender id");
     assert_eq!(got2, Some((1, m1)));
 }

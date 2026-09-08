@@ -1,0 +1,92 @@
+[
+  {
+    "latency_ns": {
+      "max": 1228799,
+      "p50": 23855,
+      "p99": 57215,
+      "p999": 95231
+    },
+    "notes": "ZADD 单命令 RTT（同机 loopback）；score 为 f64，ts≈1.7e18 超出 2^53 精度，member 含完整 ts 故不丢点",
+    "system": "redis",
+    "throughput_ops": 37468.34246820827,
+    "variant": "no-aof",
+    "workload": {
+      "n": 200000,
+      "series": 8
+    }
+  },
+  {
+    "avg_agg_pts_s": 1400481.5950900528,
+    "disk_bytes": 0,
+    "notes": "10k 点/批 pipeline（非事务）; 无持久化档位：落盘 0 字节（数据仅在内存）",
+    "rss_bytes": 156274688,
+    "scan_pts_s": 864709.9940896552,
+    "system": "redis",
+    "throughput_ops": 246538.24761855157,
+    "variant": "no-aof",
+    "workload": {
+      "n": 1000000,
+      "series": 8
+    }
+  },
+  {
+    "latency_ns": {
+      "max": 1891327,
+      "p50": 25375,
+      "p99": 63679,
+      "p999": 115903
+    },
+    "notes": "ZADD 单命令 RTT（同机 loopback）；score 为 f64，ts≈1.7e18 超出 2^53 精度，member 含完整 ts 故不丢点",
+    "system": "redis",
+    "throughput_ops": 34746.605290541054,
+    "variant": "aof-everysec",
+    "workload": {
+      "n": 200000,
+      "series": 8
+    }
+  },
+  {
+    "avg_agg_pts_s": 1333360.5801123343,
+    "disk_bytes": 59843080,
+    "notes": "10k 点/批 pipeline（非事务）; 磁盘/原始16B = 3.74x（AOF 为文本协议回放日志，预期膨胀）; AOF 触发的是全量文本重写前增量；含 RDB 若生成",
+    "rss_bytes": 150724608,
+    "scan_pts_s": 928128.6588281932,
+    "system": "redis",
+    "throughput_ops": 176228.90223797446,
+    "variant": "aof-everysec",
+    "workload": {
+      "n": 1000000,
+      "series": 8
+    }
+  },
+  {
+    "latency_ns": {
+      "max": 228982783,
+      "p50": 1244159,
+      "p99": 3186687,
+      "p999": 6373375
+    },
+    "notes": "ZADD 单命令 RTT（同机 loopback）；score 为 f64，ts≈1.7e18 超出 2^53 精度，member 含完整 ts 故不丢点；appendfsync=always 每事件循环 fsync，p50≈1.2ms 为 fsync 受限；压测期间触发 Redis 默认 auto-AOF-rewrite（默认调优，如实记录）",
+    "system": "redis",
+    "throughput_ops": 741.5700709302085,
+    "variant": "aof-always",
+    "workload": {
+      "n": 200000,
+      "series": 8
+    }
+  },
+  {
+    "avg_agg_pts_s": 1545606.0095041106,
+    "disk_bytes": 52409431,
+    "notes": "10k 点/批 pipeline（非事务）; 磁盘/原始16B = 3.28x（AOF 为文本协议回放日志，预期膨胀）; AOF 触发的是全量文本重写前增量；含 RDB 若生成",
+    "rss_bytes": 166260736,
+    "scan_pts_s": 1029518.707324204,
+    "system": "redis",
+    "throughput_ops": 75988.60457408428,
+    "variant": "aof-always",
+    "workload": {
+      "n": 1000000,
+      "series": 8
+    }
+  }
+]

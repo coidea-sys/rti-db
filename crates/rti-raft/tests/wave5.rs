@@ -1,7 +1,7 @@
-//! Wave 5（v0.5）集成测试：快照 / 日志压缩 / 单步成员变更 / PreVote。
+//! Wave 5 (v0.5) integration tests: snapshots / log compaction / single-step membership changes / PreVote.
 //!
-//! 与 cluster.rs 相同的确定性框架：MemoryTransport + 虚拟时钟，
-//! 固定种子 ⇒ 全部时序可复现。
+//! Same deterministic framework as cluster.rs: MemoryTransport + virtual clock,
+//! fixed seeds => all timing is reproducible.
 
 use rti_raft::{
     MemoryNetwork, MemoryTransport, Msg, Node, NodeId, ReplicatedWal, Role, Transport, CONF_SERIES,
@@ -13,7 +13,7 @@ const ELECTION_SPAN: u64 = 150;
 const HEARTBEAT: u64 = 40;
 const STEP_MS: u64 = 10;
 
-/// 确定性测试集群（支持运行中加节点/移除节点模拟宕机）。
+/// Deterministic test cluster (supports adding/removing nodes at runtime to simulate crashes).
 struct Cluster {
     nodes: Vec<Node<MemoryTransport>>,
     net: MemoryNetwork,
@@ -38,7 +38,7 @@ impl Cluster {
         Self::new(&[1, 2, 3], &[11, 22, 33])
     }
 
-    /// 运行中补注册一个节点（初始配置 = 参数给定 peers）。
+    /// Register an additional node at runtime (initial configuration = the given peers).
     fn join(&mut self, id: NodeId, peers: &[NodeId], seed: u64) {
         let t = self.net.transport(id);
         self.nodes.push(Node::new(
@@ -114,12 +114,12 @@ fn rec(tag: u64) -> Vec<Record> {
     vec![Record::new(tag as u32, tag as i64, tag as f64)]
 }
 
-// ---------------------------------------------------------------- 快照
+// ---------------------------------------------------------------- snapshots
 
-/// 点名场景 1：快照安装后落后 Follower 追平。
+/// Named scenario 1: a lagging Follower catches up after snapshot installation.
 ///
-/// 分区一个 Follower → Leader 继续提交 6 条并压缩全部前缀 →
-/// 愈合后 Follower 经 InstallSnapshot 跳到快照点，随后正常追赶新条目。
+/// Partition one Follower → the Leader commits 6 more entries and compacts the whole prefix →
+/// after healing, the Follower jumps to the snapshot point via InstallSnapshot, then catches up with new entries normally.
 #[test]
 fn snapshot_install_catches_up_lagging_follower() {
     let mut c = Cluster::three();
@@ -128,7 +128,7 @@ fn snapshot_install_catches_up_lagging_follower() {
     let lag_id = [1u64, 2, 3].into_iter().find(|&id| id != leader_id).unwrap();
     let rest: Vec<NodeId> = [1, 2, 3].into_iter().filter(|&id| id != lag_id).collect();
 
-    // 分区落后者，Leader 与另一节点（仍是多数派）继续提交
+    // partition the laggard; the Leader and the other node (still a majority) keep committing
     c.net.partition(&[lag_id], &rest);
     for tag in 1..=6u64 {
         let l = c.idx(leader_id);
@@ -136,27 +136,27 @@ fn snapshot_install_catches_up_lagging_follower() {
         c.step_n(3);
     }
     let l = c.idx(leader_id);
-    assert_eq!(c.nodes[l].commit_index(), 6, "多数派在线，6 条必须提交");
+    assert_eq!(c.nodes[l].commit_index(), 6, "with the majority online, all 6 entries must commit");
 
-    // 压缩全部已提交前缀
+    // compact the entire committed prefix
     let snap = c.nodes[l].take_snapshot(6, b"snap-state-v1".to_vec()).unwrap();
     assert_eq!(snap.last_included_index, 6);
     assert_eq!(c.nodes[l].compacted_index(), 6);
-    assert!(c.nodes[l].log_entries().is_empty(), "前缀必须被丢弃");
+    assert!(c.nodes[l].log_entries().is_empty(), "the prefix must be discarded");
 
-    // 愈合：落后者经 InstallSnapshot 追平
+    // heal: the laggard catches up via InstallSnapshot
     c.net.heal();
     c.step_n(30);
     let f = c.idx(lag_id);
-    assert_eq!(c.nodes[f].compacted_index(), 6, "Follower 必须安装快照");
+    assert_eq!(c.nodes[f].compacted_index(), 6, "the Follower must install the snapshot");
     assert_eq!(c.nodes[f].commit_index(), 6);
     assert_eq!(
         c.nodes[f].snapshot().map(|s| s.state.as_slice()),
         Some(b"snap-state-v1".as_slice()),
-        "快照状态字节必须不透明送达"
+        "snapshot state bytes must arrive opaquely"
     );
 
-    // 快照后继续复制新条目：Follower 正常追平并交付
+    // keep replicating new entries after the snapshot: the Follower catches up and delivers normally
     let l = c.idx(leader_id);
     c.nodes[l].propose(rec(7)).unwrap();
     c.step_n(10);
@@ -167,14 +167,14 @@ fn snapshot_install_catches_up_lagging_follower() {
         .into_iter()
         .flat_map(|e| e.records)
         .collect();
-    assert_eq!(got, rec(7), "快照点前的条目不重复交付，快照后的按序交付");
+    assert_eq!(got, rec(7), "entries before the snapshot point are not redelivered; entries after it are delivered in order");
 }
 
-/// 点名场景 2：压缩后旧索引请求被拒并触发快照。
+/// Named scenario 2: after compaction, old-index requests are rejected and trigger a snapshot.
 ///
-/// 直接观测线路上发给落后 Follower 的第一条消息是 InstallSnapshot
-/// 而非 AppendEntries（所需前缀已压缩，AppendEntries 无从对齐）；
-/// 附带校验 take_snapshot 的边界拒绝。
+/// Directly observe that the first message sent to the lagging Follower on the wire is an
+/// InstallSnapshot rather than AppendEntries (the needed prefix is compacted, so AppendEntries
+/// cannot align); also verifies take_snapshot's boundary rejections.
 #[test]
 fn compacted_prefix_triggers_install_snapshot() {
     let mut c = Cluster::three();
@@ -183,18 +183,18 @@ fn compacted_prefix_triggers_install_snapshot() {
     let lag_id = [1u64, 2, 3].into_iter().find(|&id| id != leader_id).unwrap();
     let rest: Vec<NodeId> = [1, 2, 3].into_iter().filter(|&id| id != lag_id).collect();
 
-    // 边界：超过 commit / 不超过已压缩点都必须拒绝
+    // boundaries: beyond commit / not beyond the compacted point must both be rejected
     let l = c.idx(leader_id);
     c.nodes[l].propose(rec(1)).unwrap();
     c.step_n(3);
     let l = c.idx(leader_id);
     assert_eq!(c.nodes[l].commit_index(), 1);
-    assert!(c.nodes[l].take_snapshot(2, vec![]).is_err(), "不得压缩未提交条目");
+    assert!(c.nodes[l].take_snapshot(2, vec![]).is_err(), "must not compact uncommitted entries");
     let snap = c.nodes[l].take_snapshot(1, b"v1".to_vec()).unwrap();
-    assert!(c.nodes[l].take_snapshot(1, vec![]).is_err(), "不得重复压缩同一点");
+    assert!(c.nodes[l].take_snapshot(1, vec![]).is_err(), "must not compact the same point twice");
     assert!(c.nodes[l].take_snapshot(0, vec![]).is_err());
 
-    // 分区落后者再提交两条并压缩 → 其 next_index(=2) 落在已压缩区
+    // partition the laggard, commit two more entries and compact -> its next_index(=2) falls in the compacted region
     c.net.partition(&[lag_id], &rest);
     let l = c.idx(leader_id);
     c.nodes[l].propose(rec(2)).unwrap();
@@ -205,7 +205,7 @@ fn compacted_prefix_triggers_install_snapshot() {
     c.nodes[l].take_snapshot(3, b"v3".to_vec()).unwrap();
     assert_eq!(c.nodes[l].compacted_index(), 3);
 
-    // 愈合并让 Leader 到点发心跳：落后者的第一条消息必须是 InstallSnapshot
+    // heal and let the Leader's heartbeat come due: the laggard's first message must be an InstallSnapshot
     c.net.heal();
     c.now += HEARTBEAT;
     let l = c.idx(leader_id);
@@ -214,7 +214,7 @@ fn compacted_prefix_triggers_install_snapshot() {
     let (from, msg) = c.nodes[f]
         .transport_mut()
         .recv()
-        .expect("愈合后 Leader 必须立即联系落后者");
+        .expect("after healing the Leader must contact the laggard immediately");
     assert_eq!(from, leader_id);
     match msg {
         Msg::InstallSnapshot { term, leader, snapshot } => {
@@ -222,68 +222,68 @@ fn compacted_prefix_triggers_install_snapshot() {
             assert_eq!(term, c.nodes[l].term());
             assert_eq!(snapshot.last_included_index, 3);
             assert_eq!(snapshot.state, b"v3".to_vec());
-            // 应用之，随后泵消息收敛
+            // apply it, then pump messages to converge
             c.nodes[f].handle(from, Msg::InstallSnapshot { term, leader, snapshot });
         }
-        other => panic!("压缩后旧索引请求必须触发 InstallSnapshot，实得 {other:?}"),
+        other => panic!("an old-index request after compaction must trigger InstallSnapshot, got {other:?}"),
     }
     c.step_n(20);
     let f = c.idx(lag_id);
     assert_eq!(c.nodes[f].compacted_index(), 3);
-    assert_eq!(c.nodes[f].commit_index(), 3, "快照装好后 commit 必须追平");
+    assert_eq!(c.nodes[f].commit_index(), 3, "commit must catch up once the snapshot is installed");
 
-    // 陈旧快照的本地安装是幂等空操作
+    // locally installing a stale snapshot is an idempotent no-op
     let f = c.idx(lag_id);
     c.nodes[f].install_snapshot(snap.clone()).unwrap();
-    assert_eq!(c.nodes[f].compacted_index(), 3, "旧快照不得回退压缩点");
+    assert_eq!(c.nodes[f].compacted_index(), 3, "an old snapshot must not move the compaction point backwards");
 }
 
-// ---------------------------------------------------------------- 成员变更
+// ---------------------------------------------------------------- membership changes
 
-/// 点名场景 3：add_peer 后 4 节点选主与提交。
+/// Named scenario 3: 4-node election and commit after add_peer.
 ///
-/// 新节点在加入配置前的预投票被在位成员拒绝（防扰乱）；变更提交后
-/// 全配置 {1,2,3,4}；杀掉旧 Leader 后 4 节点（需 3 票）重选并提交。
+/// The new node's pre-votes are rejected by incumbent members before it joins the configuration
+/// (anti-disruption); after the change commits, the configuration is {1,2,3,4}; killing the old Leader re-elects among 4 nodes (3 votes needed) and commits.
 #[test]
 fn add_peer_then_four_node_election_and_commit() {
     let mut c = Cluster::three();
-    // 新节点自带"我属于 4 节点集群"的视图加入（追赶中的常见形态）
+    // the new node joins with its own 'I belong to a 4-node cluster' view (a common shape while catching up)
     c.join(4, &[1, 2, 3], 44);
     let l = c.elect(500);
     let leader_id = c.nodes[l].id();
 
-    // 未加入配置前：节点 4 的预投票被在位成员拒绝（无法成为
-    // Candidate/Leader）；它至多经应答*跟随*集群任期，绝不能超出
+    // before joining the configuration: node 4's pre-votes are rejected by incumbents (it cannot become
+    // Candidate/Leader); at most it *follows* the cluster term via responses — it must never exceed it
     let f4 = c.idx(4);
     let cluster_term = c.nodes[l].term();
-    assert!(c.nodes[f4].term() <= cluster_term, "非配置成员不得把任期抬过集群");
+    assert!(c.nodes[f4].term() <= cluster_term, "a non-configuration member must not raise the term above the cluster's");
     assert_ne!(c.nodes[f4].role(), Role::Candidate);
     assert!(!c.nodes[f4].is_leader());
 
-    // 一次只变一个：pending 期间的第二次变更被拒
+    // one at a time: a second change during a pending one is rejected
     let l = c.idx(leader_id);
     let conf_idx = c.nodes[l].add_peer(4).unwrap();
-    assert!(c.nodes[l].add_peer(5).is_err(), "前一变更未提交时必须拒绝新变更");
+    assert!(c.nodes[l].add_peer(5).is_err(), "a new change must be rejected while the previous one is uncommitted");
     c.step_n(10);
 
-    // 变更经多数派提交后在全员生效
+    // the change takes effect on everyone once majority-committed
     let l = c.idx(leader_id);
-    assert!(c.nodes[l].commit_index() >= conf_idx, "变更条目必须已提交");
+    assert!(c.nodes[l].commit_index() >= conf_idx, "the change entry must be committed");
     for n in &c.nodes {
-        assert_eq!(n.membership(), vec![1, 2, 3, 4], "node {} 配置必须收敛", n.id());
+        assert_eq!(n.membership(), vec![1, 2, 3, 4], "node {} configuration must converge", n.id());
     }
-    // 变更条目确实经过日志（哨兵对用户接口透明，协议层可见）
+    // the change entry does travel through the log (the sentinel is transparent to the user interface, visible at the protocol layer)
     let committed: Vec<_> = c.nodes[l].take_committed();
     assert!(
         committed.iter().flat_map(|e| e.records.iter()).any(|r| r.series == CONF_SERIES),
-        "配置必须以日志条目形式复制提交"
+        "the configuration must be replicated and committed as a log entry"
     );
 
-    // 新节点追平日志（含变更条目本身）
+    // the new node catches up on the log (including the change entry itself)
     let f4 = c.idx(4);
     assert_eq!(c.nodes[f4].commit_index(), c.nodes[l].commit_index());
 
-    // 杀掉旧 Leader：4 节点配置（多数派 = 3）重选
+    // kill the old Leader: re-election under the 4-node configuration (majority = 3)
     let dead = c.idx(leader_id);
     c.nodes.remove(dead);
     let l2 = c.elect(1000);
@@ -291,20 +291,20 @@ fn add_peer_then_four_node_election_and_commit() {
     assert_ne!(new_id, leader_id);
     assert_eq!(c.nodes[l2].membership(), vec![1, 2, 3, 4]);
 
-    // 新 Leader 提交：3 存活节点恰为 4 节点配置的多数派
+    // the new Leader commits: the 3 surviving nodes are exactly a majority of the 4-node configuration
     c.nodes[l2].propose(rec(100)).unwrap();
     c.step_n(10);
     for n in &c.nodes {
         assert_eq!(n.commit_index(), c.nodes[l2].commit_index());
-        assert!(n.commit_index() > conf_idx, "node {} 必须提交新条目", n.id());
+        assert!(n.commit_index() > conf_idx, "node {} must commit the new entries", n.id());
     }
 }
 
-/// 点名场景 4：remove_peer 后旧节点不再参与多数派。
+/// Named scenario 4: after remove_peer the old node no longer participates in majorities.
 ///
-/// Leader 移除自己：变更提交后退位降级为非投票成员；剩余 {2,3}
-/// 两人配置自行完成选主与提交，旧节点全程静默（不选举、不投票、
-/// 任期不再变化）。
+/// The Leader removes itself: it steps down and is demoted to non-voting member once the change commits;
+/// the remaining {2,3} two-node configuration elects and commits on its own, while the old node stays
+/// silent throughout (no elections, no votes, term never changes).
 #[test]
 fn remove_peer_excludes_old_node_from_quorum() {
     let mut c = Cluster::three();
@@ -313,19 +313,19 @@ fn remove_peer_excludes_old_node_from_quorum() {
     let old_term = c.nodes[l].term();
 
     c.nodes[l].remove_peer(old_id).unwrap();
-    // 移除不存在的成员必须报错（且前一变更 pending，99 本就不在配置）
+    // removing a nonexistent member must error (and the previous change is pending; 99 is not in the configuration anyway)
     assert!(c.nodes[l].remove_peer(99).is_err());
     c.step_n(10);
 
-    // 变更条目已在旧 Leader 处提交：它退位并降级为非投票成员
+    // the change entry is committed at the old Leader: it steps down and is demoted to non-voting member
     let want: Vec<NodeId> = [1, 2, 3].into_iter().filter(|&id| id != old_id).collect();
     let old = c.idx(old_id);
-    assert_eq!(c.nodes[old].membership(), want, "旧 Leader 本地配置必须先生效");
-    assert_eq!(c.nodes[old].role(), Role::Follower, "被移除的 Leader 必须退位");
-    assert!(!c.nodes[old].is_voter(), "被移除者必须降级为非投票成员");
+    assert_eq!(c.nodes[old].membership(), want, "the old Leader's local configuration must take effect first");
+    assert_eq!(c.nodes[old].role(), Role::Follower, "the removed Leader must step down");
+    assert!(!c.nodes[old].is_voter(), "the removed node must be demoted to non-voting member");
 
-    // 剩余节点先按旧配置 {1,2,3}（多数派 2，旧节点不投票）重选；
-    // 新 Leader 复制新任期条目后间接提交变更，配置收敛为 {2,3}
+    // the remaining nodes first re-elect under the old configuration {1,2,3} (majority 2, the old node does not vote);
+    // after the new Leader replicates a new-term entry, the change commits indirectly and the configuration converges to {2,3}
     let mut l2 = None;
     for _ in 0..1000 {
         c.step();
@@ -334,37 +334,37 @@ fn remove_peer_excludes_old_node_from_quorum() {
             break;
         }
     }
-    let l2 = l2.expect("剩余两人必须选出 Leader");
-    assert!(want.contains(&c.nodes[l2].id()), "Leader 必须来自新配置");
+    let l2 = l2.expect("the remaining two must elect a Leader");
+    assert!(want.contains(&c.nodes[l2].id()), "the Leader must come from the new configuration");
     assert!(c.nodes[l2].term() > old_term);
 
-    // 新 Leader 提交新条目（旧节点完全不参与多数派计数）
+    // the new Leader commits new entries (the old node plays no part in majority counting at all)
     c.nodes[l2].propose(rec(50)).unwrap();
     c.step_n(20);
     let new_commit = c.nodes[l2].commit_index();
     for n in &c.nodes {
-        assert_eq!(n.membership(), want, "node {} 配置必须收敛", n.id());
+        assert_eq!(n.membership(), want, "node {} configuration must converge", n.id());
     }
     let other = c.nodes.iter().find(|n| want.contains(&n.id()) && n.id() != c.nodes[l2].id()).unwrap();
     assert_eq!(other.commit_index(), new_commit);
 
-    // 旧节点隔离运行：永不发起选举（非投票成员），任期冻结
+    // the old node runs in isolation: never starts an election (non-voting member), term frozen
     c.net.partition(&[old_id], &want);
     let frozen_term = c.nodes[c.idx(old_id)].term();
     c.step_n(100);
     let old = c.idx(old_id);
     assert_eq!(c.nodes[old].role(), Role::Follower);
-    assert_eq!(c.nodes[old].term(), frozen_term, "非投票成员不得预投票抬任期");
+    assert_eq!(c.nodes[old].term(), frozen_term, "a non-voting member must not raise its term via pre-votes");
 }
 
 // ---------------------------------------------------------------- PreVote
 
-/// 点名场景 5：PreVote 下分区节点无法抬高任期。
+/// Named scenario 5: under PreVote a partitioned node cannot inflate the term.
 ///
-/// 分区一个 Follower：它反复预投票（角色停在 PreCandidate）但
-/// 任期原地不动；集群侧 Leader 与任期均不受扰；愈合后它直接
-/// 以原任期回归 Follower——对比无 PreVote 时分区节点的
-/// RequestVote(term+k) 会迫使全集群抬任期。
+/// Partition one Follower: it keeps pre-voting (role stuck at PreCandidate) but its term never
+/// moves; the cluster-side Leader and term are undisturbed; after healing it rejoins directly as a
+/// Follower with its original term — in contrast, without PreVote a partitioned node's
+/// RequestVote(term+k) would force the whole cluster to raise its term.
 #[test]
 fn prevote_partitioned_node_cannot_inflate_term() {
     let mut c = Cluster::three();
@@ -375,29 +375,29 @@ fn prevote_partitioned_node_cannot_inflate_term() {
     let rest: Vec<NodeId> = [1, 2, 3].into_iter().filter(|&id| id != iso_id).collect();
 
     c.net.partition(&[iso_id], &rest);
-    c.step_n(100); // 1000ms：远超选举超时，足够多轮预投票
+    c.step_n(100); // 1000ms: far beyond the election timeout, enough for many pre-vote rounds
 
     let iso = c.idx(iso_id);
-    assert_eq!(c.nodes[iso].role(), Role::PreCandidate, "分区节点应停在预投票阶段");
-    assert_eq!(c.nodes[iso].term(), term, "预投票不得抬高自身任期");
+    assert_eq!(c.nodes[iso].role(), Role::PreCandidate, "the partitioned node should stay in the pre-vote stage");
+    assert_eq!(c.nodes[iso].term(), term, "pre-votes must not raise one's own term");
     let l = c.idx(leader_id);
-    assert!(c.nodes[l].is_leader(), "在位 Leader 不得被分区节点扰乱");
-    assert_eq!(c.nodes[l].term(), term, "集群任期不得被抬");
+    assert!(c.nodes[l].is_leader(), "the incumbent Leader must not be disrupted by the partitioned node");
+    assert_eq!(c.nodes[l].term(), term, "the cluster term must not be raised");
 
-    // 愈合：分区节点直接回归，全集群任期零扰动
+    // heal: the partitioned node rejoins directly; zero term disturbance cluster-wide
     c.net.heal();
     c.step_n(20);
     for n in &c.nodes {
-        assert_eq!(n.term(), term, "node {} 任期必须原样收敛", n.id());
+        assert_eq!(n.term(), term, "node {} term must converge unchanged", n.id());
     }
     let iso = c.idx(iso_id);
     assert_eq!(c.nodes[iso].role(), Role::Follower);
     assert_eq!(c.nodes[iso].leader_id(), Some(leader_id));
 }
 
-// ---------------------------------------------------------------- ReplicatedWal 集成
+// ---------------------------------------------------------------- ReplicatedWal integration
 
-/// 成员变更哨兵对 ReplicatedWal 的用户数据流透明。
+/// Membership-change sentinels are transparent to ReplicatedWal's user data stream.
 #[test]
 fn replicated_wal_filters_membership_sentinel() {
     let net = MemoryNetwork::new();
@@ -453,14 +453,14 @@ fn replicated_wal_filters_membership_sentinel() {
     }
     let l = leader.expect("election must converge");
 
-    // 变更条目提交后：durable 流为空（哨兵被过滤），但 durable 水位推进
+    // after the change entry commits: the durable stream is empty (the sentinel is filtered), but the durable watermark advances
     let before = wals[l].durable_index();
     wals[l].node_mut().add_peer(99).unwrap();
     pump(&mut wals, &mut now, 10);
-    assert!(wals[l].durable_index() > before, "变更条目必须推进 durable 水位");
-    assert!(wals[l].take_durable().is_empty(), "哨兵记录不得出现在用户数据流");
+    assert!(wals[l].durable_index() > before, "the change entry must advance the durable watermark");
+    assert!(wals[l].take_durable().is_empty(), "sentinel records must not appear in the user data stream");
 
-    // 用户数据照常按序交付（新配置 {1,2,3,99} 下 3 真实节点仍够多数派）
+    // user data is still delivered in order (under the new configuration {1,2,3,99}, the 3 real nodes still form a majority)
     wals[l].append_batch(rec(7)).unwrap();
     pump(&mut wals, &mut now, 10);
     assert_eq!(wals[l].take_durable(), rec(7));

@@ -1,41 +1,41 @@
-//! 冷分层（v0.4）：老 segment 下沉到低成本存储，scan 透明读回。
+//! Cold tiering (v0.4): old segments sink to low-cost storage; scan reads back transparently.
 //!
-//! - [`ColdTier`]：按名字存取 segment 字节的极简对象存储抽象；
-//! - [`LocalFsColdTier`]：完整实现（本地目录模拟，tmp + rename 原子写）；
-//! - [`S3ColdTier`]（feature `s3`，v0.5 补全）：真实 S3 HTTP 传输层——
-//!   纯 std 最小 HTTP/1.1 客户端（**零新增依赖**，仅明文 HTTP endpoint，
-//!   见 [`S3Config`] 文档）+ 完整 SigV4 请求签名（纯 safe 自实现
-//!   SHA-256/HMAC，测试含 RFC 4231 / AWS 文档已知向量）。凭证与
-//!   endpoint/region/bucket 从环境变量（[`S3Config::from_env`]）或显式
-//!   配置读取；无凭证优雅 `Err`。测试用内嵌 [`MockS3Server`] 完成
-//!   put/get/list 往返（无需真实 S3）。
+//! - [`ColdTier`]: a minimal object-store abstraction for storing segment bytes by name;
+//! - [`LocalFsColdTier`]: full implementation (local-directory simulation, tmp + rename atomic writes);
+//! - [`S3ColdTier`] (feature `s3`, completed in v0.5): a real S3 HTTP transport —
+//!   a pure-std minimal HTTP/1.1 client (**zero new dependencies**, plaintext HTTP endpoints only,
+//!   see the [`S3Config`] docs) + full SigV4 request signing (pure-safe in-house
+//!   SHA-256/HMAC, tested against known vectors from RFC 4231 / AWS docs). Credentials and
+//!   endpoint/region/bucket are read from environment variables ([`S3Config::from_env`]) or explicit
+//!   configuration; missing credentials yield a graceful `Err`. Tests use the embedded [`MockS3Server`]
+//!   for put/get/list round-trips (no real S3 needed).
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use rti_core::{Error, Result};
 
-/// 冷层对象存储抽象（按 segment 名字存取完整字节）。
+/// Cold-tier object-store abstraction (stores complete segment bytes by segment name).
 ///
-/// 实现必须是 `Send + Sync`（挂在 `Db` 上跨线程共享）。
+/// Implementations must be `Send + Sync` (attached to `Db` and shared across threads).
 pub trait ColdTier: Send + Sync {
-    /// 写入一个 segment（同名单覆盖）。
+    /// Write one segment (same name overwrites).
     fn put_segment(&self, name: &str, data: &[u8]) -> Result<()>;
-    /// 读出一个 segment 的完整字节。
+    /// Read the complete bytes of one segment.
     fn get_segment(&self, name: &str) -> Result<Vec<u8>>;
-    /// 列出冷层中全部 segment 名字。
+    /// List all segment names in the cold tier.
     fn list(&self) -> Result<Vec<String>>;
 }
 
-/// 本地目录冷层（完整实现；语义上等价于一个单桶对象存储）。
+/// Local-directory cold tier (full implementation; semantically equivalent to a single-bucket object store).
 ///
-/// 写入为 tmp + rename，崩溃后只可能留下 `.tmp` 残文件（list 忽略之）。
+/// Writes are tmp + rename; a crash can only leave a `.tmp` remnant (ignored by list).
 pub struct LocalFsColdTier {
     dir: PathBuf,
 }
 
 impl LocalFsColdTier {
-    /// 以 `dir` 为冷层根目录（不存在则创建）。
+    /// Use `dir` as the cold-tier root (created if missing).
     pub fn new(dir: impl AsRef<Path>) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
@@ -43,7 +43,7 @@ impl LocalFsColdTier {
     }
 
     fn path(&self, name: &str) -> Result<PathBuf> {
-        // 防路径穿越：segment 名只允许简单文件名
+        // path-traversal guard: segment names may only be simple file names
         validate_segment_name(name)?;
         Ok(self.dir.join(name))
     }
@@ -80,37 +80,37 @@ impl ColdTier for LocalFsColdTier {
     }
 }
 
-// ------------------------------------------------------------- S3（v0.5 完整实现）
+// ------------------------------------------------------------- S3 (full implementation, v0.5)
 
 #[cfg(feature = "s3")]
 use std::io::{Read, Write};
 #[cfg(feature = "s3")]
 use std::time::SystemTime;
 
-/// S3 连接配置（endpoint / region / bucket / 凭证）。
+/// S3 connection configuration (endpoint / region / bucket / credentials).
 ///
-/// `endpoint` 接受 `http://host[:port]` 或裸 `host[:port]`（缺省 80）。
-/// **仅支持明文 HTTP**：TLS（rustls/openssl）依赖链超出本 crate 的
-/// 依赖预算（见 README「依赖决策」）；生产 HTTPS 可在前面挂反向代理，
-/// 或直连本地/内网 MinIO。`https://` 前缀会在使用时明确报错。
+/// `endpoint` accepts `http://host[:port]` or a bare `host[:port]` (default 80).
+/// **Plaintext HTTP only**: the TLS (rustls/openssl) dependency chain exceeds this crate's
+/// dependency budget (see 'dependency decisions' in the README); for production HTTPS put a reverse
+/// proxy in front, or talk directly to a local/Intranet MinIO. An `https://` prefix is an explicit error at use time.
 #[cfg(feature = "s3")]
 #[derive(Clone)]
 pub struct S3Config {
-    /// S3 endpoint（`http://host[:port]` 或 `host[:port]`）。
+    /// S3 endpoint (`http://host[:port]` or `host[:port]`).
     pub endpoint: String,
-    /// AWS region（SigV4 scope 组成部分）。
+    /// AWS region (part of the SigV4 scope).
     pub region: String,
-    /// 桶名（path-style 寻址：`/{bucket}/{key}`）。
+    /// Bucket name (path-style addressing: `/{bucket}/{key}`).
     pub bucket: String,
-    /// Access Key ID。
+    /// Access Key ID.
     pub access_key: String,
-    /// Secret Access Key（Debug/Display 一律脱敏）。
+    /// Secret Access Key (always redacted in Debug/Display).
     pub secret_key: String,
 }
 
 #[cfg(feature = "s3")]
 impl S3Config {
-    /// 显式构造（不发起任何网络请求）。
+    /// Explicit constructor (performs no network requests).
     pub fn new(
         endpoint: impl Into<String>,
         region: impl Into<String>,
@@ -127,20 +127,20 @@ impl S3Config {
         }
     }
 
-    /// 从进程环境读取配置；缺项时返回**优雅 Err**（列出缺失变量）。
+    /// Read configuration from the process environment; returns a **graceful Err** listing missing variables when incomplete.
     ///
-    /// 变量优先级（前者优先）：
-    /// - endpoint：`RTI_S3_ENDPOINT` / `S3_ENDPOINT` / `AWS_ENDPOINT_URL`
-    /// - region：`RTI_S3_REGION` / `AWS_REGION` / `AWS_DEFAULT_REGION`
-    ///   （缺省 `us-east-1`）
-    /// - bucket：`RTI_S3_BUCKET` / `S3_BUCKET`
-    /// - access key：`RTI_S3_ACCESS_KEY` / `AWS_ACCESS_KEY_ID`
-    /// - secret key：`RTI_S3_SECRET_KEY` / `AWS_SECRET_ACCESS_KEY`
+    /// Variable precedence (earlier wins):
+    /// - endpoint: `RTI_S3_ENDPOINT` / `S3_ENDPOINT` / `AWS_ENDPOINT_URL`
+    /// - region: `RTI_S3_REGION` / `AWS_REGION` / `AWS_DEFAULT_REGION`
+    ///   (default `us-east-1`)
+    /// - bucket: `RTI_S3_BUCKET` / `S3_BUCKET`
+    /// - access key: `RTI_S3_ACCESS_KEY` / `AWS_ACCESS_KEY_ID`
+    /// - secret key: `RTI_S3_SECRET_KEY` / `AWS_SECRET_ACCESS_KEY`
     pub fn from_env() -> Result<Self> {
         Self::from_env_with(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
     }
 
-    /// 可注入的环境读取器版本（测试用，避免改动真实环境变量）。
+    /// Version with an injectable environment reader (for tests, avoids touching real environment variables).
     pub fn from_env_with(get: impl Fn(&str) -> Option<String>) -> Result<Self> {
         let pick = |keys: &[&str]| keys.iter().find_map(|k| get(k));
         let endpoint = pick(&["RTI_S3_ENDPOINT", "S3_ENDPOINT", "AWS_ENDPOINT_URL"]);
@@ -191,22 +191,22 @@ impl std::fmt::Debug for S3Config {
     }
 }
 
-/// S3 冷层（feature `s3`，v0.5 起为**完整实现**）。
+/// S3 cold tier (feature `s3`, **full implementation** since v0.5).
 ///
-/// - 传输：纯 std 最小 HTTP/1.1 客户端（`TcpStream`，连接级超时，
-///   `Connection: close`），**零新增依赖**；仅明文 HTTP（见
-///   [`S3Config`] 文档）。
-/// - 寻址：path-style `PUT/GET /{bucket}/{key}`；list 走
-///   ListObjectsV2（`?list-type=2&prefix=`，支持 continuation 翻页）。
-/// - 认证：每个请求完整 SigV4 签名（`Authorization` 头 +
-///   `x-amz-date` + `x-amz-content-sha256` 载荷哈希），签名原语为
-///   本文件内纯 safe 自实现 SHA-256/HMAC（含 AWS 文档已知向量测试）。
-/// - 构造：[`S3ColdTier::from_env`]（环境变量）或
-///   [`S3ColdTier::from_config`]（显式 [`S3Config`]）；无凭证时
-///   优雅 `Err`，不 panic、不发起网络请求。
+/// - transport: pure-std minimal HTTP/1.1 client (`TcpStream`, connection-level timeouts,
+///   `Connection: close`), **zero new dependencies**; plaintext HTTP only (see the
+///   [`S3Config`] docs).
+/// - addressing: path-style `PUT/GET /{bucket}/{key}`; list goes through
+///   ListObjectsV2 (`?list-type=2&prefix=`, with continuation pagination).
+/// - authentication: every request carries a full SigV4 signature (`Authorization` header +
+///   `x-amz-date` + `x-amz-content-sha256` payload hash); the signing primitives are
+///   pure-safe in-house SHA-256/HMAC in this file (tested against AWS-documented known vectors).
+/// - construction: [`S3ColdTier::from_env`] (environment variables) or
+///   [`S3ColdTier::from_config`] (explicit [`S3Config`]); without credentials it fails
+///   gracefully with `Err` — no panic, no network request.
 ///
-/// 单段上传（segment 通常 ≤ 数 MB）；无重试/分段上传——归档路径本就
-/// 允许失败重来（`archive_older_than` 幂等），见 README 已知限制。
+/// Single-shot uploads (segments are usually <= a few MB); no retries/multipart — the archive
+/// path tolerates failure-and-redo anyway (`archive_older_than` is idempotent); see known limitations in the README.
 #[cfg(feature = "s3")]
 pub struct S3ColdTier {
     config: S3Config,
@@ -214,7 +214,7 @@ pub struct S3ColdTier {
 
 #[cfg(feature = "s3")]
 impl S3ColdTier {
-    /// 显式构造（不发起任何网络请求）。
+    /// Explicit constructor (performs no network requests).
     pub fn new(
         endpoint: impl Into<String>,
         region: impl Into<String>,
@@ -225,33 +225,33 @@ impl S3ColdTier {
         Self { config: S3Config::new(endpoint, region, bucket, access_key, secret_key) }
     }
 
-    /// 从 [`S3Config`] 构造；endpoint 非法（空 / https）立即报错。
+    /// Construct from an [`S3Config`]; an invalid endpoint (empty / https) errors immediately.
     pub fn from_config(config: S3Config) -> Result<Self> {
         parse_endpoint(&config.endpoint)?;
         Ok(Self { config })
     }
 
-    /// 从环境变量构造（见 [`S3Config::from_env`]）；无凭证优雅 `Err`。
+    /// Construct from environment variables (see [`S3Config::from_env`]); missing credentials yield a graceful `Err`.
     pub fn from_env() -> Result<Self> {
         Self::from_config(S3Config::from_env()?)
     }
 
-    /// SigV4 签名密钥派生：kDate→kRegion→kService→kSigning。
+    /// SigV4 signing-key derivation: kDate→kRegion→kService→kSigning.
     pub fn signing_key(&self, date: &str) -> [u8; 32] {
         signing_key(&self.config.secret_key, date, &self.config.region, "s3")
     }
 
-    /// SigV4 请求签名：`hex(HMAC(kSigning, string_to_sign))`。
+    /// SigV4 request signing: `hex(HMAC(kSigning, string_to_sign))`.
     pub fn sign(&self, string_to_sign: &str, date: &str) -> String {
         hex(&hmac_sha256(&self.signing_key(date), string_to_sign.as_bytes()))
     }
 
-    /// 凭证 scope（`date/region/s3/aws4_request`）。
+    /// Credential scope (`date/region/s3/aws4_request`).
     pub fn credential_scope(&self, date: &str) -> String {
         format!("{}/{}/s3/aws4_request", date, self.config.region)
     }
 
-    /// 对一个请求做完整 SigV4 签名，返回应附加的头集合。
+    /// Fully SigV4-sign one request, returning the set of headers to attach.
     fn signed_headers(
         &self,
         method: &str,
@@ -287,13 +287,13 @@ impl S3ColdTier {
         ]
     }
 
-    /// 组装 path-style URI（canonical 与实际请求相同：key 已校验无 `/`）。
+    /// Assemble a path-style URI (canonical and actual request are identical: the key is validated to contain no `/`).
     fn object_uri(&self, name: &str) -> Result<String> {
         validate_segment_name(name)?;
         Ok(format!("/{}/{}", uri_encode(&self.config.bucket), uri_encode(name)))
     }
 
-    /// 发起一次签名请求并返回响应。
+    /// Issue one signed request and return the response.
     fn request(
         &self,
         method: &str,
@@ -353,7 +353,7 @@ impl ColdTier for S3ColdTier {
         let mut out = Vec::new();
         let mut token: Option<String> = None;
         loop {
-            // canonical query：键按字典序排序、值 percent-encode
+            // canonical query: keys sorted lexicographically, values percent-encoded
             let mut pairs: Vec<(&str, String)> = vec![("list-type", "2".to_string()), ("prefix", String::new())];
             if let Some(t) = &token {
                 pairs.push(("continuation-token", t.clone()));
@@ -374,7 +374,7 @@ impl ColdTier for S3ColdTier {
             }
             let text = String::from_utf8_lossy(&resp.body);
             for k in xml_tags(&text, "Key") {
-                // 与 LocalFsColdTier 对齐：只认 segment 对象
+                // aligned with LocalFsColdTier: only segment objects are recognized
                 if k.ends_with(".seg") {
                     out.push(k);
                 }
@@ -398,9 +398,9 @@ impl ColdTier for S3ColdTier {
     }
 }
 
-// ------------------------------------------- S3 内部：endpoint / HTTP / 工具
+// ------------------------------------------- S3 internals: endpoint / HTTP / utilities
 
-/// segment 名校验（LocalFs 与 S3 共用）：只允许简单文件名。
+/// Segment-name validation (shared by LocalFs and S3): only simple file names allowed.
 fn validate_segment_name(name: &str) -> Result<()> {
     if name.is_empty() || name.contains('/') || name.contains('\\') || name.starts_with('.') {
         return Err(Error::Corrupt(format!("invalid segment name: {name:?}")));
@@ -408,15 +408,15 @@ fn validate_segment_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// 解析后的 endpoint：TCP 连接地址与 Host 头。
+/// Parsed endpoint: TCP connect address and Host header.
 #[cfg(feature = "s3")]
 struct Endpoint {
     connect: String,
     host: String,
 }
 
-/// 解析 endpoint：`http://host[:port][/...]` 或裸 `host[:port]`。
-/// `https://` 明确拒绝（TLS 不在依赖预算内，见 [`S3Config`] 文档）。
+/// Parse an endpoint: `http://host[:port][/...]` or a bare `host[:port]`.
+/// `https://` is explicitly rejected (TLS is outside the dependency budget; see the [`S3Config`] docs).
 #[cfg(feature = "s3")]
 fn parse_endpoint(ep: &str) -> Result<Endpoint> {
     let ep = ep.trim();
@@ -437,7 +437,7 @@ fn parse_endpoint(ep: &str) -> Result<Endpoint> {
     Ok(Endpoint { connect: hp.clone(), host: hp })
 }
 
-/// SigV4 派生密钥（service 可注入，便于用 AWS 官方 iam 示例做已知答案测试）。
+/// SigV4 derived key (service is injectable, enabling known-answer tests with AWS's official iam example).
 #[cfg(feature = "s3")]
 fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> [u8; 32] {
     let k_date = hmac_sha256(format!("AWS4{secret}").as_bytes(), date.as_bytes());
@@ -446,7 +446,7 @@ fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> [u8; 32
     hmac_sha256(&k_service, b"aws4_request")
 }
 
-/// SigV4 URI 编码：unreserved（A-Za-z0-9-._~）保留，其余 %XX 大写。
+/// SigV4 URI encoding: unreserved characters (A-Za-z0-9-._~) kept, everything else %XX uppercase.
 #[cfg(feature = "s3")]
 fn uri_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -461,10 +461,10 @@ fn uri_encode(s: &str) -> String {
     out
 }
 
-/// 提取 XML 文本中所有 `<tag>...</tag>` 的内容（最小解析，含实体反转义）。
+/// Extract the contents of all `<tag>...</tag>` in XML text (minimal parsing, with entity unescaping).
 ///
-/// 仅用于 ListObjectsV2 响应（Key / IsTruncated / NextContinuationToken），
-/// 不是通用 XML 解析器。
+/// Only used for ListObjectsV2 responses (Key / IsTruncated / NextContinuationToken);
+/// not a general-purpose XML parser.
 #[cfg(feature = "s3")]
 fn xml_tags(text: &str, tag: &str) -> Vec<String> {
     let open = format!("<{tag}>");
@@ -484,7 +484,7 @@ fn xml_tags(text: &str, tag: &str) -> Vec<String> {
     out
 }
 
-/// XML 实体反转义（&amp; 必须最先处理，避免 "&amp;lt;" 双重反转义）。
+/// XML entity unescape (&amp; must be handled first to avoid double-unescaping "&amp;lt;").
 #[cfg(feature = "s3")]
 fn xml_unescape(s: &str) -> String {
     s.replace("&amp;", "&")
@@ -494,7 +494,7 @@ fn xml_unescape(s: &str) -> String {
         .replace("&apos;", "'")
 }
 
-/// 实体转义（mock server 构造 XML 用）。
+/// Entity escaping (used by the mock server to build XML).
 #[cfg(feature = "s3")]
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -504,9 +504,9 @@ fn xml_escape(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-/// 当前 UTC 时间的 SigV4 两种格式：`(YYYYMMDD, YYYYMMDD'T'HHMMSS'Z')`。
+/// Current UTC time in the two SigV4 formats: `(YYYYMMDD, YYYYMMDD'T'HHMMSS'Z')`.
 ///
-/// 可注入 `SystemTime` 以便测试（Howard Hinnant civil-from-days 算法）。
+/// `SystemTime` is injectable for testing (Howard Hinnant's civil-from-days algorithm).
 #[cfg(feature = "s3")]
 fn amz_dates(t: SystemTime) -> (String, String) {
     let secs = t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
@@ -531,7 +531,7 @@ fn amz_dates(t: SystemTime) -> (String, String) {
     )
 }
 
-/// HTTP/1.1 响应（最小表示）。
+/// HTTP/1.1 response (minimal representation).
 #[cfg(feature = "s3")]
 struct HttpResponse {
     status: u16,
@@ -540,21 +540,21 @@ struct HttpResponse {
 
 #[cfg(feature = "s3")]
 impl HttpResponse {
-    /// 错误消息用的 body 摘要（截断，UTF-8 宽容）。
+    /// Body excerpt for error messages (truncated, UTF-8 tolerant).
     fn body_snippet(&self) -> String {
         let s = String::from_utf8_lossy(&self.body);
         s.chars().take(160).collect()
     }
 }
 
-/// HTTP 请求/响应超时（归档不在热路径，超时保守取值）。
+/// HTTP request/response timeout (archiving is off the hot path, so the timeout is conservative).
 #[cfg(feature = "s3")]
 const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// 纯 std 最小 HTTP/1.1 客户端：单个请求-响应（`Connection: close`）。
+/// Pure-std minimal HTTP/1.1 client: a single request-response (`Connection: close`).
 ///
-/// 支持 `Content-Length` 与 `Transfer-Encoding: chunked` 响应体；
-/// 无重定向、无 keep-alive、无 TLS（见 [`S3Config`] 文档）。
+/// Supports `Content-Length` and `Transfer-Encoding: chunked` response bodies;
+/// no redirects, no keep-alive, no TLS (see the [`S3Config`] docs).
 #[cfg(feature = "s3")]
 fn http_exchange(
     connect: &str,
@@ -601,12 +601,12 @@ fn http_exchange(
     read_http_response(&mut stream)
 }
 
-/// 读取并解析一个 HTTP/1.1 响应（状态行 + 头 + body）。
+/// Read and parse one HTTP/1.1 response (status line + headers + body).
 #[cfg(feature = "s3")]
 fn read_http_response(stream: &mut std::net::TcpStream) -> Result<HttpResponse> {
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
     let mut chunk = [0u8; 8192];
-    // 读到头部分界为止
+    // read until the header terminator
     let head_end = loop {
         if let Some(p) = find_subslice(&buf, b"\r\n\r\n") {
             break p;
@@ -654,7 +654,7 @@ fn read_http_response(stream: &mut std::net::TcpStream) -> Result<HttpResponse> 
         }
         body.truncate(len);
     } else {
-        // 无长度声明：依赖 Connection: close，读到 EOF
+        // no length declared: rely on Connection: close and read to EOF
         loop {
             let n = stream.read(&mut chunk).map_err(Error::Io)?;
             if n == 0 {
@@ -666,7 +666,7 @@ fn read_http_response(stream: &mut std::net::TcpStream) -> Result<HttpResponse> 
     Ok(HttpResponse { status, body })
 }
 
-/// 解析 chunked 编码 body（`body` 起始为已读字节，可能不完整）。
+/// Parse a chunked-encoded body (`body` starts with the bytes already read, possibly incomplete).
 #[cfg(feature = "s3")]
 fn read_chunked(stream: &mut std::net::TcpStream, body: &mut Vec<u8>) -> Result<()> {
     let mut chunk = [0u8; 8192];
@@ -674,7 +674,7 @@ fn read_chunked(stream: &mut std::net::TcpStream, body: &mut Vec<u8>) -> Result<
     let mut out: Vec<u8> = Vec::new();
     let mut pos = 0usize;
     loop {
-        // 确保有一行（size line）
+        // ensure there is one line (size line)
         while find_subslice(&raw[pos..], b"\r\n").is_none() {
             let n = stream.read(&mut chunk).map_err(Error::Io)?;
             if n == 0 {
@@ -688,7 +688,7 @@ fn read_chunked(stream: &mut std::net::TcpStream, body: &mut Vec<u8>) -> Result<
             .map_err(|_| Error::Corrupt(format!("s3: bad chunk size {size_str:?}")))?;
         pos = nl + 2;
         if size == 0 {
-            // 末尾 trailer（本实现忽略）+ 终止 CRLF：读到 "\r\n" 即可
+            // trailing trailers (ignored by this implementation) + terminating CRLF: reading to "\r\n" is enough
             break;
         }
         while raw.len() < pos + size + 2 {
@@ -699,13 +699,13 @@ fn read_chunked(stream: &mut std::net::TcpStream, body: &mut Vec<u8>) -> Result<
             raw.extend_from_slice(&chunk[..n]);
         }
         out.extend_from_slice(&raw[pos..pos + size]);
-        pos += size + 2; // 跳过数据后的 CRLF
+        pos += size + 2; // skip the CRLF after the data
     }
     *body = out;
     Ok(())
 }
 
-/// 子串查找（小工具，避免引入 memchr 依赖）。
+/// Substring search (small utility, avoids a memchr dependency).
 #[cfg(feature = "s3")]
 fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || hay.len() < needle.len() {
@@ -714,14 +714,14 @@ fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-// ------------------------------------------- 内嵌 mock S3 server（测试用）
+// ------------------------------------------- embedded mock S3 server (for tests)
 
-/// 内嵌 mock S3 server（**仅测试/演示用**）：`std::net::TcpListener`
-/// 解析 HTTP/1.1 请求、校验 SigV4 头（`Authorization` /
-/// `x-amz-date` / `x-amz-content-sha256` 存在且载荷哈希匹配），
-/// 对象存内存。支持 PUT/GET 对象与 ListObjectsV2（`?list-type=2`）。
+/// Embedded mock S3 server (**test/demo only**): a `std::net::TcpListener`
+/// that parses HTTP/1.1 requests and validates SigV4 headers (`Authorization` /
+/// `x-amz-date` / `x-amz-content-sha256` must be present and the payload hash must match);
+/// objects live in memory. Supports PUT/GET objects and ListObjectsV2 (`?list-type=2`).
 ///
-/// 非测试部署请勿使用：无持久化、无并发限速、无真实签名校验。
+/// Do not use in non-test deployments: no persistence, no concurrency limiting, no real signature verification.
 #[cfg(feature = "s3")]
 pub struct MockS3Server {
     addr: std::net::SocketAddr,
@@ -733,7 +733,7 @@ pub struct MockS3Server {
 
 #[cfg(feature = "s3")]
 impl MockS3Server {
-    /// 在 loopback 随机端口启动。
+    /// Start on a random loopback port.
     pub fn start() -> Result<Self> {
         use std::sync::atomic::{AtomicBool, AtomicU64};
         use std::sync::{Arc, Mutex};
@@ -755,17 +755,17 @@ impl MockS3Server {
         Ok(Self { addr, objects, rejected, shutdown, join: Some(handle) })
     }
 
-    /// `http://127.0.0.1:PORT` 形式的 endpoint（直接喂给 [`S3Config`]）。
+    /// Endpoint of the form `http://127.0.0.1:PORT` (feeds straight into [`S3Config`]).
     pub fn endpoint(&self) -> String {
         format!("http://{}", self.addr)
     }
 
-    /// 当前内存中的对象数。
+    /// Current number of in-memory objects.
     pub fn object_count(&self) -> usize {
         self.objects.lock().unwrap().len()
     }
 
-    /// 因签名头缺失/载荷哈希不匹配而被拒绝（403）的请求数。
+    /// Number of requests rejected (403) for missing signature headers / payload-hash mismatch.
     pub fn rejected_requests(&self) -> u64 {
         self.rejected.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -781,7 +781,7 @@ impl Drop for MockS3Server {
     }
 }
 
-/// mock server 主循环：非阻塞 accept + 每连接一线程。
+/// Mock server main loop: non-blocking accept + one thread per connection.
 #[cfg(feature = "s3")]
 fn mock_s3_loop(
     listener: std::net::TcpListener,
@@ -810,7 +810,7 @@ fn mock_s3_loop(
     }
 }
 
-/// 处理单个连接（客户端一律 `Connection: close`，一连接一请求）。
+/// Handle a single connection (clients always use `Connection: close`; one request per connection).
 #[cfg(feature = "s3")]
 fn mock_s3_handle(
     mut stream: std::net::TcpStream,
@@ -864,7 +864,7 @@ fn mock_s3_handle(
 
     let get_header = |name: &str| headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
 
-    // 校验 SigV4 头：存在性 + 载荷哈希匹配（真实 S3 同样校验后者）
+    // validate SigV4 headers: presence + payload-hash match (real S3 validates the latter too)
     let auth_ok = get_header("authorization")
         .map(|a| a.starts_with("AWS4-HMAC-SHA256 Credential=") && a.contains("Signature="))
         .unwrap_or(false);
@@ -886,7 +886,7 @@ fn mock_s3_handle(
         return mock_s3_respond(&mut stream, 403, "Forbidden", "application/xml", xml.as_bytes());
     }
 
-    // 路由：path-style /{bucket}/{key}
+    // routing: path-style /{bucket}/{key}
     let path = target.split('?').next().unwrap_or("");
     let query = target.split('?').nth(1).unwrap_or("");
     let segs: Vec<&str> = path.trim_start_matches('/').splitn(2, '/').collect();
@@ -940,7 +940,7 @@ fn mock_s3_handle(
     }
 }
 
-/// 写出一个完整 HTTP/1.1 响应（Content-Length + close）。
+/// Write out a complete HTTP/1.1 response (Content-Length + close).
 #[cfg(feature = "s3")]
 fn mock_s3_respond(
     stream: &mut std::net::TcpStream,
@@ -959,9 +959,9 @@ fn mock_s3_respond(
     Ok(())
 }
 
-// ------------------------------------------- SHA-256 / HMAC（safe 自实现）
+// ------------------------------------------- SHA-256 / HMAC (safe in-house implementation)
 
-/// SHA-256 摘要（FIPS 180-4 直接实现，仅 feature `s3` 使用）。
+/// SHA-256 digest (direct FIPS 180-4 implementation, used only under feature `s3`).
 #[cfg(feature = "s3")]
 pub fn sha256(data: &[u8]) -> [u8; 32] {
     const K: [u32; 64] = [
@@ -1031,7 +1031,7 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     out
 }
 
-/// HMAC-SHA256（RFC 2104）。
+/// HMAC-SHA256 (RFC 2104).
 #[cfg(feature = "s3")]
 pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     let mut k = [0u8; 64];
@@ -1051,7 +1051,7 @@ pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     sha256(&outer)
 }
 
-/// 小写十六进制。
+/// Lowercase hex.
 #[cfg(feature = "s3")]
 pub fn hex(data: &[u8]) -> String {
     let mut s = String::with_capacity(data.len() * 2);
@@ -1091,7 +1091,7 @@ mod tests {
             vec!["seg-000001-s000007.seg".to_string(), "seg-000002-s000007.seg".to_string()]
         );
         assert_eq!(tier.get_segment("seg-000001-s000007.seg").unwrap(), b"payload-1");
-        // 覆盖同名
+        // overwrite the same name
         tier.put_segment("seg-000001-s000007.seg", b"payload-1b").unwrap();
         assert_eq!(tier.get_segment("seg-000001-s000007.seg").unwrap(), b"payload-1b");
         std::fs::remove_dir_all(&d).ok();
@@ -1102,7 +1102,7 @@ mod tests {
         let d = tmpdir("localfs-err");
         let tier = LocalFsColdTier::new(d.join("cold")).unwrap();
         assert!(matches!(tier.get_segment("nope.seg"), Err(Error::NotFound)));
-        assert!(tier.put_segment("../evil.seg", b"x").is_err(), "路径穿越必须拒绝");
+        assert!(tier.put_segment("../evil.seg", b"x").is_err(), "path traversal must be rejected");
         assert!(tier.put_segment("a/b.seg", b"x").is_err());
         std::fs::remove_dir_all(&d).ok();
     }
@@ -1110,7 +1110,7 @@ mod tests {
     #[cfg(feature = "s3")]
     #[test]
     fn sha256_and_hmac_known_vectors() {
-        // FIPS 180-4 示例向量
+        // FIPS 180-4 example vectors
         assert_eq!(
             hex(&sha256(b"abc")),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
@@ -1134,9 +1134,9 @@ mod tests {
     #[cfg(feature = "s3")]
     #[test]
     fn sigv4_signing_key_matches_aws_doc_example() {
-        // AWS 文档「派生签名密钥」示例：
+        // AWS docs 'derive the signing key' example:
         // secret wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY,
-        // date 20120215, region us-east-1, service iam（本实现固定 s3）
+        // date 20120215, region us-east-1, service iam (this implementation fixes s3)
         let tier = S3ColdTier::new(
             "s3.us-east-1.amazonaws.com",
             "us-east-1",
@@ -1145,10 +1145,10 @@ mod tests {
             "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
         );
         let key = tier.signing_key("20120215");
-        // AWS 文档给出的 kSigning（service=s3 时同样算法）
+        // kSigning given by the AWS docs (same algorithm when service=s3)
         assert_eq!(key.len(), 32);
         assert_eq!(tier.credential_scope("20120215"), "20120215/us-east-1/s3/aws4_request");
-        // 签名确定性：同输入同输出，长度为 64 hex
+        // signing determinism: same input, same output, 64 hex chars long
         let s1 = tier.sign("AWS4-HMAC-SHA256\n20120215T000000Z\nscope\nhash", "20120215");
         assert_eq!(s1.len(), 64);
         assert_eq!(s1, tier.sign("AWS4-HMAC-SHA256\n20120215T000000Z\nscope\nhash", "20120215"));
@@ -1157,9 +1157,9 @@ mod tests {
     #[cfg(feature = "s3")]
     #[test]
     fn sigv4_full_signature_matches_aws_doc_known_answer() {
-        // AWS 官方文档「Examples of the complete version 4 signing
-        // process (Python)」的已知答案（service=iam 示例；本实现签名
-        // 原语 service 可注入，S3ColdTier 固定 "s3"）：
+        // Known answer from the AWS official docs 'Examples of the complete version 4 signing
+        // process (Python)' (the service=iam example; this implementation's signing primitives
+        // accept an injected service, while S3ColdTier fixes "s3"):
         // secret wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY,
         // access AKIDEXAMPLE, region us-east-1, service iam,
         // date 20150830T123600Z, GET iam.amazonaws.com/?Action=ListUsers&Version=2010-05-08
@@ -1180,13 +1180,13 @@ mod tests {
             "content-type;host;x-amz-date\n",
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
-        // 文档给出的 canonical request 哈希
+        // canonical request hash given by the docs
         let cr_hash = hex(&sha256(canonical_request.as_bytes()));
         assert_eq!(cr_hash, "f536975d06c0309214f805bb90ccff089219ecd68b2577efef23edd43b7e1a59");
         let string_to_sign = format!(
             "AWS4-HMAC-SHA256\n20150830T123600Z\n20150830/us-east-1/iam/aws4_request\n{cr_hash}"
         );
-        // 文档给出的最终签名
+        // final signature given by the docs
         let sig = hex(&hmac_sha256(&k, string_to_sign.as_bytes()));
         assert_eq!(sig, "5d672d79c15b13162d9279b0855cfba6789a8edb4c82c400e06b5924a6f2b5d7");
     }
@@ -1194,15 +1194,15 @@ mod tests {
     #[cfg(feature = "s3")]
     #[test]
     fn s3_config_from_env_missing_credentials_is_graceful_err() {
-        // 全空：列出全部缺失项（region 有缺省，不在缺失列表）
+        // all empty: lists every missing item (region has a default, so it is not in the missing list)
         let err = S3Config::from_env_with(|_| None).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("endpoint"), "{msg}");
         assert!(msg.contains("bucket"), "{msg}");
         assert!(msg.contains("access_key"), "{msg}");
         assert!(msg.contains("secret_key"), "{msg}");
-        assert!(!msg.contains("region"), "region 有缺省值，不应缺失: {msg}");
-        // 部分提供
+        assert!(!msg.contains("region"), "region has a default and should not be missing: {msg}");
+        // partially provided
         let err = S3Config::from_env_with(|k| match k {
             "RTI_S3_ENDPOINT" => Some("http://127.0.0.1:9000".into()),
             "AWS_ACCESS_KEY_ID" => Some("AK".into()),
@@ -1212,8 +1212,8 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("bucket") && msg.contains("secret_key"), "{msg}");
         assert!(!msg.contains("endpoint") && !msg.contains("access_key"), "{msg}");
-        // S3ColdTier::from_env 同样优雅 Err（测试进程未设置这些变量时；
-        // 若外部恰好设置则用 from_env_with 已覆盖语义，这里只保证不 panic）
+        // S3ColdTier::from_env also fails gracefully (when the test process has these variables unset;
+        // if they happen to be set externally, from_env_with already covers the semantics — here we only guarantee no panic)
         let _ = S3ColdTier::from_env();
     }
 
@@ -1230,12 +1230,12 @@ mod tests {
             _ => None,
         })
         .unwrap();
-        assert_eq!(cfg.endpoint, "http://s3-style:9000", "S3_ENDPOINT 优先于 AWS_ENDPOINT_URL");
+        assert_eq!(cfg.endpoint, "http://s3-style:9000", "S3_ENDPOINT takes precedence over AWS_ENDPOINT_URL");
         assert_eq!(cfg.region, "eu-west-1");
         assert_eq!(cfg.bucket, "b1");
         assert_eq!(cfg.access_key, "AK");
         assert_eq!(cfg.secret_key, "SK");
-        // region 缺省
+        // region default
         let cfg = S3Config::from_env_with(|k| match k {
             "RTI_S3_ENDPOINT" => Some("h:1".into()),
             "RTI_S3_BUCKET" => Some("b".into()),
@@ -1245,7 +1245,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(cfg.region, "us-east-1");
-        // Debug 脱敏
+        // Debug redaction
         let dbg = format!("{:?}", S3ColdTier::from_config(cfg).unwrap());
         assert!(dbg.contains("<redacted>") && !dbg.contains("\"s\""), "{dbg}");
     }
@@ -1260,9 +1260,9 @@ mod tests {
         assert_eq!(ep.connect, "minio.local:9999");
         let ep = parse_endpoint("http://s3.us-east-1.amazonaws.com").unwrap();
         assert_eq!(ep.connect, "s3.us-east-1.amazonaws.com:80");
-        assert!(parse_endpoint("https://s3.amazonaws.com").is_err(), "https 必须明确拒绝");
+        assert!(parse_endpoint("https://s3.amazonaws.com").is_err(), "https must be explicitly rejected");
         assert!(parse_endpoint("http://").is_err());
-        // from_config 提前校验
+        // from_config validates early
         assert!(S3ColdTier::from_config(S3Config::new("https://x", "r", "b", "a", "s")).is_err());
         assert!(S3ColdTier::from_config(S3Config::new("http://h:1", "r", "b", "a", "s")).is_ok());
     }
@@ -1272,11 +1272,11 @@ mod tests {
     fn amz_date_format_known_answers() {
         let at = |secs: u64| amz_dates(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs));
         assert_eq!(at(0), ("19700101".to_string(), "19700101T000000Z".to_string()));
-        // 2013-05-24 00:00:00 UTC（AWS S3 文档示例日期）
+        // 2013-05-24 00:00:00 UTC (example date from the AWS S3 docs)
         assert_eq!(at(1_369_353_600).1, "20130524T000000Z");
-        // 2015-08-30 12:36:00 UTC（上文 iam 示例时刻）
+        // 2015-08-30 12:36:00 UTC (the iam example moment above)
         assert_eq!(at(1_440_938_160), ("20150830".to_string(), "20150830T123600Z".to_string()));
-        // 闰日边界：2024-02-29 23:59:59 → 1709251199；次日 2024-03-01
+        // leap-day boundary: 2024-02-29 23:59:59 -> 1709251199; next day 2024-03-01
         assert_eq!(at(1_709_251_199).1, "20240229T235959Z");
         assert_eq!(at(1_709_251_200).1, "20240301T000000Z");
     }
@@ -1312,7 +1312,7 @@ mod tests {
         .unwrap()
     }
 
-    /// v0.5 点名：S3ColdTier 对内嵌 mock server 完成 put/get/list 往返。
+    /// Named by v0.5: S3ColdTier round-trips put/get/list against the embedded mock server.
     #[cfg(feature = "s3")]
     #[test]
     fn s3_put_get_list_roundtrip_against_mock() {
@@ -1328,17 +1328,17 @@ mod tests {
         );
         assert_eq!(tier.get_segment("seg-000001-s000007.seg").unwrap(), b"payload-1");
         assert_eq!(tier.get_segment("seg-000002-s000007.seg").unwrap(), b"payload-2\x00\xff");
-        // 覆盖同名
+        // overwrite the same name
         tier.put_segment("seg-000001-s000007.seg", b"payload-1b").unwrap();
         assert_eq!(tier.get_segment("seg-000001-s000007.seg").unwrap(), b"payload-1b");
-        // 缺失对象 → NotFound
+        // missing object -> NotFound
         assert!(matches!(tier.get_segment("nope.seg"), Err(Error::NotFound)));
-        // 非法名字在发起请求前即拒绝
+        // illegal names are rejected before any request is issued
         assert!(tier.put_segment("../evil.seg", b"x").is_err());
-        assert_eq!(server.rejected_requests(), 0, "合法客户端不应被 mock 拒签");
+        assert_eq!(server.rejected_requests(), 0, "a legitimate client must not be signature-rejected by the mock");
     }
 
-    /// mock 必须拒绝缺少 SigV4 头的请求（证明它真在校验签名头）。
+    /// The mock must reject requests lacking SigV4 headers (proving it really validates them).
     #[cfg(feature = "s3")]
     #[test]
     fn mock_rejects_unsigned_requests() {
@@ -1351,8 +1351,8 @@ mod tests {
         std::io::Read::read_to_string(&mut s, &mut resp).unwrap();
         assert!(resp.starts_with("HTTP/1.1 403"), "{resp}");
         assert_eq!(server.rejected_requests(), 1);
-        assert_eq!(server.object_count(), 0, "未签名请求不得写入对象");
-        // 签名头存在但载荷哈希不匹配同样 403
+        assert_eq!(server.object_count(), 0, "unsigned requests must not write objects");
+        // signature headers present but payload hash mismatched: also 403
         let mut s = std::net::TcpStream::connect(&addr).unwrap();
         let req = concat!(
             "PUT /rti-cold/seg-bad.seg HTTP/1.1\r\nHost: h\r\nContent-Length: 1\r\nConnection: close\r\n",
@@ -1367,11 +1367,11 @@ mod tests {
         assert_eq!(server.rejected_requests(), 2);
     }
 
-    /// 无凭证（from_env 缺项）→ 优雅 Err；endpoint 不可达 → Err 而非 panic。
+    /// No credentials (from_env incomplete) -> graceful Err; unreachable endpoint -> Err instead of panic.
     #[cfg(feature = "s3")]
     #[test]
     fn s3_graceful_errors() {
-        // 不可达 endpoint：连接被拒绝 → Io Err（10s 超时上限， refused 会立即返回）
+        // unreachable endpoint: connection refused -> Io Err (10s timeout ceiling; refused returns immediately)
         let tier = S3ColdTier::from_config(S3Config::new(
             "http://127.0.0.1:1",
             "us-east-1",
@@ -1383,7 +1383,7 @@ mod tests {
         assert!(tier.put_segment("seg-000001-s000001.seg", b"x").is_err());
         assert!(tier.get_segment("seg-000001-s000001.seg").is_err());
         assert!(tier.list().is_err());
-        // 无凭证：from_env_with 空环境
+        // no credentials: from_env_with with an empty environment
         assert!(S3Config::from_env_with(|_| None).is_err());
     }
 }

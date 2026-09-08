@@ -1,18 +1,18 @@
-//! WAL 后端对比基准（v0.5 Stream B）：`uring-pipeline vs std write`。
+//! WAL backend comparison benchmark (v0.5 Stream B): `uring-pipeline vs std write`.
 //!
-//! 对比三个后端的吞吐与 p99 时延（真实数字，沙箱内核 6.6 实测
-//! io_uring 可用；不可用时会打印限制说明并只跑 std）：
+//! Compares throughput and p99 latency of three backends (real numbers; io_uring is
+//! available on the sandbox's 6.6 kernel — when unavailable, a limitation note is printed and only std runs):
 //!
-//! - `std`            ：StdWalWriter（v0.1 语义，BufWriter + sync_data）
-//! - `uring-sync`     ：IoUringWalWriter（v0.2，SQE 提交后阻塞等完成）
-//! - `uring-pipeline` ：IoUringPipelinedWalWriter（v0.5，多批在途，
-//!                      CQE reap 循环，sync 只等本组，深度 64）
+//! - `std`            : StdWalWriter (v0.1 semantics, BufWriter + sync_data)
+//! - `uring-sync`     : IoUringWalWriter (v0.2, blocks after SQE submission until completion)
+//! - `uring-pipeline` : IoUringPipelinedWalWriter (v0.5, multiple batches in flight,
+//!                      CQE reap loop, sync waits only for its own group, depth 64)
 //!
-//! 场景：
-//! - throughput   ：SyncPolicy::None 写 N 条 + 结尾一次 sync（测提交路径）
-//! - group-commit ：每 64 条 sync_now 一次（测持久化边界的 p99 与吞吐）
+//! Scenarios:
+//! - throughput   : write N records with SyncPolicy::None + one final sync (exercises the submit path)
+//! - group-commit : sync_now every 64 records (measures p99 and throughput at durability boundaries)
 //!
-//! 运行：`cargo run --release -p rti-wal --features io-uring --example wal_bench`
+//! Run: `cargo run --release -p rti-wal --features io-uring --example wal_bench`
 
 use std::time::Instant;
 
@@ -39,7 +39,7 @@ fn pct(sorted: &[u64], p: f64) -> u64 {
     sorted[(p * (sorted.len() - 1) as f64) as usize]
 }
 
-/// 场景 A：攒批提交吞吐（结尾一次持久化）。返回 ops/s。
+/// Scenario A: batched-submission throughput (one durability point at the end). Returns ops/s.
 fn bench_throughput(w: &mut dyn WalWriter) -> f64 {
     let t = Instant::now();
     for i in 0..N {
@@ -50,7 +50,7 @@ fn bench_throughput(w: &mut dyn WalWriter) -> f64 {
     N as f64 / wall.as_secs_f64()
 }
 
-/// 场景 B：组提交（每 GROUP 条一个持久化边界）。返回 (ops/s, p99 组时延 ns)。
+/// Scenario B: group commit (one durability boundary per GROUP records). Returns (ops/s, p99 group latency ns).
 fn bench_group_commit(w: &mut dyn WalWriter) -> (f64, u64) {
     let mut lat = Vec::with_capacity((N / GROUP) as usize);
     let t = Instant::now();
@@ -69,10 +69,10 @@ fn bench_group_commit(w: &mut dyn WalWriter) -> (f64, u64) {
     (N as f64 / wall.as_secs_f64(), pct(&lat, 0.99))
 }
 
-/// 校验落盘记录数与内容抽样，防止"快但错"。
+/// Validate the on-disk record count and spot-check contents, guarding against 'fast but wrong'.
 fn verify(path: &std::path::Path) {
     let recs: Vec<Record> = Wal::recover(path).unwrap().collect();
-    assert_eq!(recs.len(), N as usize, "落盘记录数不符");
+    assert_eq!(recs.len(), N as usize, "on-disk record count mismatch");
     assert_eq!(recs[0], rec(0));
     assert_eq!(recs[N as usize - 1], rec(N - 1));
 }
@@ -80,7 +80,7 @@ fn verify(path: &std::path::Path) {
 fn main() {
     println!("== wal bench: uring-pipeline vs std write (N={N}, group={GROUP}, best of {ROUNDS}) ==");
 
-    // 后端可用性探测：io_uring 被内核策略拦截时记录限制并只跑 std。
+    // backend availability probe: when io_uring is blocked by kernel policy, note the limitation and run only std.
     let probe_dir = tmpdir("probe");
     let uring_ok = IoUringPipelinedWalWriter::open(
         probe_dir.join("probe.log"),
@@ -110,14 +110,14 @@ fn main() {
         for _ in 0..ROUNDS {
             let d = tmpdir(name);
             let p = d.join("wal.log");
-            // 场景 A
+            // scenario A
             {
                 let mut w = open_backend(name, &p, SyncPolicy::None);
                 thr = thr.max(bench_throughput(&mut *w));
             }
             verify(&p);
             std::fs::remove_file(&p).unwrap();
-            // 场景 B
+            // scenario B
             {
                 let mut w = open_backend(name, &p, SyncPolicy::None);
                 let (o, p99) = bench_group_commit(&mut *w);
@@ -132,7 +132,7 @@ fn main() {
     println!("frames: 28 B/record, {} MiB total", N as usize * 28 / (1 << 20));
 }
 
-/// 按名打开后端；SyncPolicy::None + 显式 sync_now（两个场景自控节奏）。
+/// Open a backend by name; SyncPolicy::None + explicit sync_now (both scenarios control their own pacing).
 fn open_backend(name: &str, p: &std::path::Path, sync: SyncPolicy) -> Box<dyn WalWriter> {
     match name {
         "std" => Box::new(StdWalWriter::open(p, sync).unwrap()),

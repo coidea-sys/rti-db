@@ -1,19 +1,19 @@
-//! rti-query：查询引擎。
+//! rti-query: query engine.
 //!
-//! - 谓词下推：[`Pred`] 在存储层 decode 循环内生效（不物化不满足的点），
-//!   并可结合 segment zone map 直接跳过整段；
-//! - 聚合：[`Agg`]（min/max/sum/avg/count）单遍累加，O(1) 额外内存；
-//! - 扫描：[`scan`] 返回零拷贝语义的惰性迭代器。
+//! - predicate pushdown: [`Pred`] takes effect inside the storage layer's decode loop
+//!   (non-matching points are never materialized), and can combine with segment zone maps to skip whole segments;
+//! - aggregation: [`Agg`] (min/max/sum/avg/count) accumulates in a single pass with O(1) extra memory;
+//! - scanning: [`scan`] returns a lazy iterator with zero-copy semantics.
 //!
-//! 为避免 `rti-query ↔ rti-db` 循环依赖，扫描目标抽象为 [`ScanSource`]
-//! trait；门面 crate rti-db 为 `Db` 实现该 trait，并提供与 SPEC §3
-//! 逐字一致的 `scan(&Db, ...)` 自由函数。
+//! To avoid an `rti-query <-> rti-db` dependency cycle, the scan target is abstracted as the
+//! [`ScanSource`] trait; the facade crate rti-db implements it for `Db` and provides a
+//! `scan(&Db, ...)` free function verbatim per SPEC §3.
 
 #![forbid(unsafe_code)]
 
 use rti_core::{Result, Sample, SeriesId, Timestamp};
 
-/// 值谓词。
+/// Value predicate.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Pred {
     /// value > x
@@ -25,7 +25,7 @@ pub enum Pred {
 }
 
 impl Pred {
-    /// 判断值是否满足谓词。
+    /// Test whether a value satisfies the predicate.
     #[inline]
     pub fn matches(&self, v: f64) -> bool {
         match self {
@@ -35,7 +35,7 @@ impl Pred {
         }
     }
 
-    /// zone map 级下推：给定段值域 `[min,max]`，是否可能存在匹配。
+    /// Zone-map-level pushdown: given a segment value range `[min,max]`, could a match exist?
     #[inline]
     pub fn zone_may_match(&self, min: f64, max: f64) -> bool {
         match self {
@@ -46,23 +46,23 @@ impl Pred {
     }
 }
 
-/// 聚合算子。
+/// Aggregation operator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Agg {
-    /// 最小值。
+    /// Minimum.
     Min,
-    /// 最大值。
+    /// Maximum.
     Max,
-    /// 求和。
+    /// Sum.
     Sum,
-    /// 平均。
+    /// Average.
     Avg,
-    /// 计数。
+    /// Count.
     Count,
 }
 
 impl Agg {
-    /// 对样本集单遍聚合；空集返回 `None`。
+    /// Single-pass aggregation over a sample set; returns `None` for the empty set.
     pub fn apply(&self, samples: &[Sample]) -> Option<f64> {
         if samples.is_empty() {
             return None;
@@ -79,12 +79,12 @@ impl Agg {
     }
 }
 
-/// 扫描数据源抽象（由 rti-db 的 `Db` 实现）。
+/// Scan data-source abstraction (implemented by rti-db's `Db`).
 ///
-/// 实现方负责：memtable + segment 合并、zone map 跳过、
-/// 以及把 `pred` 下推到 decode 循环。
+/// Implementors are responsible for: memtable + segment merging, zone-map skipping,
+/// and pushing `pred` down into the decode loop.
 pub trait ScanSource {
-    /// 收集 `series` 在 `[t0, t1]` 内满足 `pred` 的样本（按 ts 有序）到 `out`。
+    /// Collect samples of `series` within `[t0, t1]` satisfying `pred` (ordered by ts) into `out`.
     fn collect(
         &self,
         series: SeriesId,
@@ -95,12 +95,12 @@ pub trait ScanSource {
     ) -> Result<()>;
 }
 
-/// 扫描 `series` 在 `[t0, t1]` 内的样本。
+/// Scan samples of `series` within `[t0, t1]`.
 ///
-/// - `pred` 为值谓词（下推到存储层）；
-/// - `agg` 为 `Some` 时返回恰好一个样本的迭代器：
-///   `ts = t0`、`value = 聚合结果`（空集则不产出任何样本）；
-/// - 否则按 ts 升序产出全部匹配样本。
+/// - `pred` is a value predicate (pushed down to the storage layer);
+/// - when `agg` is `Some`, returns an iterator of exactly one sample:
+///   `ts = t0`, `value = aggregate result` (no samples produced for an empty set);
+/// - otherwise yields all matching samples in ascending ts order.
 pub fn scan<S: ScanSource + ?Sized>(
     db: &S,
     series: SeriesId,
@@ -124,7 +124,7 @@ pub fn scan<S: ScanSource + ?Sized>(
 mod tests {
     use super::*;
 
-    /// 内存 mock 数据源，验证 scan 语义（真实 Db 的测试在 rti-db）。
+    /// In-memory mock data source validating scan semantics (tests against the real Db live in rti-db).
     struct Mock(Vec<Sample>);
 
     impl ScanSource for Mock {
@@ -157,7 +157,7 @@ mod tests {
         assert!(gt.matches(6.0));
         assert!(!gt.matches(5.0));
         assert!(gt.zone_may_match(0.0, 10.0));
-        assert!(!gt.zone_may_match(0.0, 4.0)); // 整段跳过
+        assert!(!gt.zone_may_match(0.0, 4.0)); // skip the whole segment
         let bt = Pred::Between(2.0, 3.0);
         assert!(bt.matches(2.5));
         assert!(!bt.matches(3.5));
@@ -185,7 +185,7 @@ mod tests {
         let got: Vec<Sample> = scan(&m, 0, 100, 290, Some(Pred::Gt(15.0)), None)
             .unwrap()
             .collect();
-        // ts 100..290 → i ∈ 10..=29，再过滤 value>15 → i ∈ 16..=29
+        // ts 100..290 -> i in 10..=29, then filter value>15 -> i in 16..=29
         assert_eq!(got.len(), 14);
         assert!(got.iter().all(|s| s.value > 15.0 && s.ts >= 100 && s.ts <= 290));
         assert!(got.windows(2).all(|w| w[0].ts <= w[1].ts));
@@ -199,7 +199,7 @@ mod tests {
         assert_eq!(got[0].ts, 0);
         assert_eq!(got[0].value, 49.5);
 
-        // 空区间 + 聚合 → 无样本
+        // empty range + aggregation -> no samples
         let empty: Vec<Sample> = scan(&m, 0, 5000, 9000, None, Some(Agg::Count))
             .unwrap()
             .collect();

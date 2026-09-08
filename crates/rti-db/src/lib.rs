@@ -1,23 +1,23 @@
-//! rti-db 门面：`Db::open` / `put` / `scan`。
+//! rti-db facade: `Db::open` / `put` / `scan`.
 //!
-//! 写路径（SPEC §4.1）：`put` 只做一次无锁 SPSC 入队（~20ns 级）；
-//! 后台 ingest 线程批量出队 → 批量 WAL append → 按 [`SyncPolicy`]
-//! 组提交 → 写入 MemTable；MemTable 满则 seal 为列式 segment。
+//! Write path (SPEC §4.1): `put` performs a single lock-free SPSC enqueue (~20ns);
+//! a background ingest thread dequeues in batches → batch WAL append → group commit
+//! per [`SyncPolicy`] → write into the MemTable; when full, the MemTable is sealed into a columnar segment.
 //!
-//! 读路径（SPEC §4.2）：`scan` 先 `flush` 保证读己之写，然后
-//! zone map 跳过无关 segment、谓词下推到 decode 层；结果缓冲
-//! 取自对象池，稳态扫描 0 次 malloc。
+//! Read path (SPEC §4.2): `scan` first `flush`es to guarantee read-your-writes, then
+//! zone maps skip irrelevant segments and predicates are pushed down to the decode layer;
+//! result buffers come from an object pool, so steady-state scans perform 0 mallocs.
 
 #![forbid(unsafe_code)]
 
-//! ## v0.3：确定性配置档与镜像
+//! ## v0.3: deterministic profile and mirroring
 //!
-//! [`Profile::Deterministic`] 下：强制 [`SyncPolicy::None`]、纯内存运行
-//! （不建目录、不开 WAL、不写 segment，即使 `data_dir = Some` 也绝不
-//! 触碰文件系统）、MemTable 满按 LRU 丢弃最老序列并计数
-//! （[`Db::lru_evictions`]）；[`Mirror`] 使 `put` 入队成功的同时以
-//! 非阻塞 UDP 发送 20 字节镜像数据报（best-effort，失败仅计数，
-//! 见 [`Db::mirror_stats`]）。
+//! Under [`Profile::Deterministic`]: forces [`SyncPolicy::None`], runs purely in memory
+//! (no directories created, no WAL opened, no segments written — the file system is
+//! never touched even when `data_dir = Some`); when the MemTable is full the oldest series
+//! is evicted by LRU and counted ([`Db::lru_evictions`]); [`Mirror`] sends a 20-byte mirror
+//! datagram over non-blocking UDP on every successful `put` enqueue (best-effort: failures
+//! are only counted, see [`Db::mirror_stats`]).
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -37,46 +37,46 @@ use rti_wal::{Record, Wal};
 #[cfg(feature = "alloc-count")]
 pub use rti_mem::alloc_count::{alloc_count, CountingAllocator};
 
-/// ingest ring 默认容量（2 的幂）。
+/// Default capacity of the ingest ring (power of two).
 const RING_CAP: usize = 1 << 16;
-/// ingest 线程单批最大处理条数（v0.6 动态批：单次唤醒尽量 drain
-/// ring，以此上限分批；fsync 频率由 SyncPolicy interval 决定而非批大小）。
+/// Maximum records the ingest thread processes per batch (v0.6 dynamic batching: each wakeup
+/// drains as much of the ring as possible, chunked by this cap; fsync frequency is governed by the SyncPolicy interval, not the batch size).
 const BATCH_MAX: usize = 8192;
-/// MemTable 序列槽位数上限。
+/// Maximum number of series slots in the MemTable.
 const MAX_SERIES: usize = 4096;
 
-/// 内部共享状态（ingest 线程与查询线程共享）。
+/// Internal shared state (shared by the ingest thread and query threads).
 struct Shared {
     state: Mutex<DbState>,
-    /// 已入队计数（put 成功后 +1；即下一张水位票据的基数）。
+    /// Enqueue counter (+1 after a successful put; the base of the next watermark ticket).
     enqueued: AtomicU64,
-    /// 已被 ingest 线程应用计数（= durable 水位，v0.6）。
+    /// Counter of records applied by the ingest thread (= durable watermark, v0.6).
     acked: AtomicU64,
-    /// ingest 线程致命错误（set 后 put/scan 失败）。
+    /// Fatal ingest-thread error (put/scan fail once set).
     err: Mutex<Option<String>>,
-    /// 扫描结果缓冲池（稳态复用，0 malloc）。
+    /// Scan result buffer pool (reused in steady state, 0 malloc).
     buf_pool: Arc<Mutex<Vec<Vec<Sample>>>>,
-    /// segment 文件序号。
+    /// Segment file sequence number.
     seg_seq: Mutex<u64>,
-    /// 冷分层存储（v0.4；`set_cold_tier` 注入）。
+    /// Cold-tier storage (v0.4; injected via `set_cold_tier`).
     cold: Mutex<Option<Arc<dyn ColdTier>>>,
     config: Config,
 }
 
-/// segment 位置：本地（内存已解析）或冷层（按需取回并缓存）。
+/// Segment location: local (parsed in memory) or cold tier (fetched on demand and cached).
 enum SegLoc {
-    /// 本地 segment（v0.1 语义：打开时全量读入内存）。
+    /// Local segment (v0.1 semantics: fully read into memory at open).
     Local(SegmentReader),
-    /// 已归档冷层；`Option` 为透明读回缓存（首次命中后驻留内存）。
+    /// Archived to the cold tier; the `Option` is the transparent read-back cache (kept in memory after the first hit).
     Archived(Option<SegmentReader>),
 }
 
-/// catalog 中的一条 segment 记录（v0.4 冷分层）。
+/// One segment record in the catalog (v0.4 cold tiering).
 struct SegEntry {
-    /// segment 文件名（冷层对象名）。
+    /// Segment file name (cold-tier object name).
     name: String,
     series: SeriesId,
-    /// zone map：归档后也保留在 catalog，scan 仍可整段跳过。
+    /// zone map: kept in the catalog after archiving, so scans can still skip whole segments.
     zone: ZoneMap,
     loc: SegLoc,
 }
@@ -92,52 +92,52 @@ impl SegEntry {
 }
 
 struct DbState {
-    /// Balanced 档为 `Some`；Deterministic 纯内存运行，为 `None`。
+    /// `Some` under Balanced; `None` under Deterministic (pure in-memory operation).
     wal: Option<Wal>,
     mem: MemTable,
     segments: Vec<SegEntry>,
 }
 
-/// 镜像统计（v0.3）：UDP 镜像数据报发送计数。
+/// Mirror statistics (v0.3): UDP mirror datagram send counters.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MirrorStats {
-    /// 成功交给 socket 的数据报数。
+    /// Datagrams successfully handed to the socket.
     pub sent: u64,
-    /// 发送失败（非阻塞拒绝/错误）的数据报数。
+    /// Datagrams that failed to send (non-blocking refusal/error).
     pub failed: u64,
 }
 
-/// 数据库句柄。`Send + Sync`，可跨线程共享（如 rti-net server）。
+/// Database handle. `Send + Sync`, shareable across threads (e.g. the rti-net server).
 ///
-/// `put` 经 `Mutex<SpscProducer>` 入队：单写者（推荐部署）时锁无竞争，
-/// 开销与无锁入队同量级；多写者并发时退化为短临界区（有界）。
+/// `put` enqueues via `Mutex<SpscProducer>`: with a single writer (the recommended deployment)
+/// the lock is uncontended and costs about the same as a lock-free enqueue; with concurrent writers it degrades to a short (bounded) critical section.
 pub struct Db {
     shared: Arc<Shared>,
     producer: Mutex<rti_buffer::SpscProducer<Record>>,
     shutdown: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
-    /// 非阻塞 UDP 镜像 socket（`Some` 时 put 入队成功后发送镜像）。
+    /// Non-blocking UDP mirror socket (when `Some`, a mirror datagram is sent after each successful put enqueue).
     mirror: Option<UdpSocket>,
     mirror_sent: AtomicU64,
     mirror_failed: AtomicU64,
 }
 
 impl Db {
-    /// 打开（或创建）数据库：建目录 → 加载已有 segment → WAL 崩溃恢复。
+    /// Open (or create) the database: create directories → load existing segments → WAL crash recovery.
     ///
-    /// [`Profile::Deterministic`] 下跳过全部文件系统操作（纯内存），
-    /// 并强制 [`SyncPolicy::None`]；[`Profile::Balanced`] 下
-    /// `config.data_dir` 必须为 `Some`。
+    /// Under [`Profile::Deterministic`] all file-system operations are skipped (pure in-memory),
+    /// and [`SyncPolicy::None`] is forced; under [`Profile::Balanced`]
+    /// `config.data_dir` must be `Some`.
     pub fn open(config: Config) -> Result<Db> {
         let deterministic = config.profile == Profile::Deterministic;
-        // 确定性档强制 SyncPolicy::None（无 WAL，刷盘语义为空操作）。
+        // The deterministic profile forces SyncPolicy::None (no WAL; flushing is a no-op).
         let mut config = config;
         if deterministic {
             config.wal_sync = SyncPolicy::None;
         }
 
         let (wal, segments, seg_seq) = if deterministic {
-            // 纯内存：不建目录、不开 WAL、不加载 segment。
+            // Pure in-memory: no directories, no WAL, no segment loading.
             (None, Vec::new(), 0)
         } else {
             let dir = config
@@ -146,7 +146,7 @@ impl Db {
                 .ok_or_else(|| Error::Corrupt("Balanced profile requires data_dir = Some(..)".into()))?;
             fs::create_dir_all(dir)?;
 
-            // 加载已有 segment（按文件名序 = 时间序）
+            // Load existing segments (file-name order == time order)
             let mut segments = Vec::new();
             let mut seg_seq = 0u64;
             let mut names: Vec<PathBuf> = fs::read_dir(dir)?
@@ -160,8 +160,8 @@ impl Db {
                 segments.push(SegEntry::local(name, SegmentReader::open(&p)?));
                 seg_seq += 1;
             }
-            // 读回归档 catalog：冷层 segment 注册为 Archived（lazy 读回）。
-            // 若同名文件仍在本地（归档-删除间崩溃），以本地为准并跳过。
+            // Read back the archive catalog: cold-tier segments are registered as Archived (lazy read-back).
+            // If a same-named file still exists locally (crash between archive and delete), the local one wins and the entry is skipped.
             for entry in load_catalog(dir)? {
                 if !segments.iter().any(|e: &SegEntry| e.name == entry.name) {
                     segments.push(entry);
@@ -183,19 +183,19 @@ impl Db {
             config: config.clone(),
         });
 
-        // WAL 崩溃恢复：直接回放进 memtable（必要时中途 seal）
+        // WAL crash recovery: replay directly into the memtable (sealing midway if necessary)
         if let Some(dir) = config.data_dir.as_ref().filter(|_| !deterministic) {
             let mut state = shared.state.lock().unwrap();
             for rec in Wal::recover(dir.join("wal.log"))? {
                 if state.mem.is_full() {
-                    // 恢复重放期间禁止 checkpoint WAL（重放尚未读完）。
+                    // WAL checkpointing is forbidden during recovery replay (the replay has not finished reading).
                     seal_memtable(&shared, &mut state)?;
                 }
                 state.mem.insert(rec.series, rec.sample)?;
             }
         }
 
-        // 镜像 socket：非阻塞，配置错误（绑定失败等）在 open 时即报错。
+        // Mirror socket: non-blocking; configuration errors (bind failure, etc.) are reported at open.
         let mirror = match &config.mirror {
             Some(m) => {
                 let sock = UdpSocket::bind("0.0.0.0:0")?;
@@ -228,16 +228,16 @@ impl Db {
         })
     }
 
-    /// 写入一个采样点：无锁 SPSC 入队，O(1)，无堆分配。
+    /// Write one sample: lock-free SPSC enqueue, O(1), no heap allocation.
     ///
-    /// ring 满（消费速度跟不上）时返回 [`Error::SeriesFull`] 作为背压信号。
-    /// 配置了 [`rti_core::Mirror`] 时，入队成功的同时以非阻塞 UDP
-    /// 发送一条 20 字节镜像数据报（best-effort：失败仅计数，
-    /// 不阻塞、不重试、不影响返回值）。
+    /// Returns [`Error::SeriesFull`] as a backpressure signal when the ring is full (consumption cannot keep up).
+    /// When [`rti_core::Mirror`] is configured, a 20-byte mirror datagram is sent over non-blocking
+    /// UDP on every successful enqueue (best-effort: failures are only counted; never blocks,
+    /// never retries, never affects the return value).
     pub fn put(&self, series: SeriesId, sample: Sample) -> Result<()> {
         self.check_err()?;
-        // 占位计数与入队在同一临界区：序号（水位票据）与 ring 顺序一致，
-        // 这是 put_durable 等待语义的正确性基础；单写者时锁无竞争。
+        // The placeholder count and the enqueue happen in the same critical section: the sequence number
+        // (watermark ticket) matches ring order — the correctness basis of put_durable's wait semantics; the lock is uncontended with a single writer.
         let prod = self.producer.lock().unwrap();
         self.shared.enqueued.fetch_add(1, Ordering::SeqCst);
         match prod.push(Record { series, sample }) {
@@ -253,18 +253,18 @@ impl Db {
         }
     }
 
-    /// 写入一个采样点并**阻塞等待其持久化**（v0.6，崩溃不丢档）。
+    /// Write one sample and **block until it is persisted** (v0.6, no loss on crash). Enqueues first
     ///
-    /// 与 [`Db::put`] 同样先入队（低延迟路径不变），随后等待 ingest
-    /// 线程完成「应用 MemTable + WAL append」（是否含 fsync 由当前
-    /// [`SyncPolicy`] 决定：`Always` 含每条刷盘；`Group` 受组提交窗口
-    /// 约束，进程崩溃时 OS 页缓存内的已写数据仍在，但机器掉电语义
-    /// 以 interval 为上界；`None` 不刷盘）。返回时的 durable 水位序号
-    /// （≥ 本记录的序号，单调递增）。
+    /// like [`Db::put`] (low-latency path unchanged), then waits for the ingest thread to complete
+    /// "apply MemTable + WAL append" (whether fsync is included depends on the current
+    /// [`SyncPolicy`]: `Always` fsyncs every record; `Group` is bounded by the group-commit window —
+    /// on process crash the data already in the OS page cache survives, while machine power-loss
+    /// semantics are bounded by the interval; `None` never fsyncs). Returns the durable watermark
+    /// sequence number (>= this record's number, monotonically increasing). Returns [`Error::Timeout`]
     ///
-    /// 超时返回 [`Error::Timeout`]，但**数据不丢**：记录仍在 ingest
-    /// 管线中，稍后会持久化；调用方可稍后用 [`Db::durable_watermark`]
-    /// 复查。ring 满返回 [`Error::SeriesFull`]（背压，未入队，可重试）。
+    /// on timeout, but **no data is lost**: the record is still in the ingest pipeline and will be
+    /// persisted shortly; the caller may re-check later with [`Db::durable_watermark`].
+    /// A full ring returns [`Error::SeriesFull`] (backpressure; not enqueued, retryable).
     pub fn put_durable(&self, series: SeriesId, sample: Sample, timeout: Duration) -> Result<u64> {
         self.check_err()?;
         let ticket = {
@@ -293,18 +293,18 @@ impl Db {
         }
     }
 
-    /// 当前 durable 水位（v0.6）：已被 ingest 线程「应用 MemTable +
-    /// WAL append」的记录总数（按入队序号），单调递增。
+    /// Current durable watermark (v0.6): total number of records the ingest thread has
+    /// "applied to MemTable + WAL-appended" (by enqueue sequence number), monotonically increasing.
     ///
-    /// [`Db::put_durable`] 返回的水位 ≥ 其记录序号即表示该记录已持久化
-    /// （fsync 与否取决于 [`SyncPolicy`]，同上）。
+    /// When the watermark returned by [`Db::put_durable`] is >= a record's sequence number, that
+    /// record is persisted (fsync or not depends on [`SyncPolicy`], see above).
     pub fn durable_watermark(&self) -> u64 {
         self.shared.acked.load(Ordering::SeqCst)
     }
 
-    /// 镜像发送：20 字节小端数据报（series | ts | value bits）。
+    /// Mirror send: 20-byte little-endian datagram (series | ts | value bits).
     ///
-    /// 非阻塞 socket；任何失败只计数——镜像不进入热路径延迟预算。
+    /// Non-blocking socket; any failure is only counted — mirroring stays out of the hot-path latency budget.
     #[inline]
     fn mirror_send(&self, series: SeriesId, sample: &Sample) {
         if let Some(sock) = &self.mirror {
@@ -319,7 +319,7 @@ impl Db {
         }
     }
 
-    /// 镜像统计（v0.3）：发送成功/失败计数。
+    /// Mirror statistics (v0.3): send success/failure counters.
     pub fn mirror_stats(&self) -> MirrorStats {
         MirrorStats {
             sent: self.mirror_sent.load(Ordering::Relaxed),
@@ -327,31 +327,31 @@ impl Db {
         }
     }
 
-    /// Deterministic 档 LRU 丢弃的序列总数（v0.3；Balanced 档恒 0）。
+    /// Total number of series evicted by LRU under the Deterministic profile (v0.3; always 0 under Balanced).
     pub fn lru_evictions(&self) -> u64 {
         self.shared.state.lock().unwrap().mem.lru_evictions()
     }
 
-    /// 注入冷分层存储（v0.4）。归档/透明读回都经此句柄。
+    /// Inject cold-tier storage (v0.4). Archiving and transparent read-back both go through this handle.
     pub fn set_cold_tier(&self, tier: Arc<dyn ColdTier>) {
         *self.shared.cold.lock().unwrap() = Some(tier);
     }
 
-    /// 已归档到冷层的 segment 数（v0.4）。
+    /// Number of segments archived to the cold tier (v0.4).
     pub fn archived_segment_count(&self) -> usize {
         self.shared.state.lock().unwrap().segments.iter().filter(|e| e.is_archived()).count()
     }
 
-    /// 冷分层归档（v0.4）：把 zone.max_ts 严格早于 `ts` 的本地 segment
-    /// 移入冷层——上传字节、删除本地文件、更新 catalog。
+    /// Cold-tier archiving (v0.4): move local segments whose zone.max_ts is strictly before `ts`
+    /// into the cold tier — upload the bytes, delete the local file, update the catalog.
     ///
-    /// 之后 `scan` 对这些时间段**透明读回**（命中时从冷层取回并缓存；
-    /// zone map 仍在 catalog，谓词整段跳过不触发读回）。
+    /// Afterwards `scan` reads those time ranges back **transparently** (fetched from the cold tier and
+    /// cached on hit; the zone map stays in the catalog, so predicate-based whole-segment skipping never triggers a read-back).
     ///
-    /// 崩溃安全说明：上传与删除之间崩溃 → 本地文件与冷层同时存在，
-    /// open 时以本地为准去重（scan 结果不受影响，scan 本就按 ts 去重）。
+    /// Crash-safety note: a crash between upload and delete leaves both the local file and the cold-tier
+    /// copy; open deduplicates in favor of the local one (scan results are unaffected — scans deduplicate by ts anyway).
     ///
-    /// 错误：Deterministic 档（无文件系统）或未注入冷层时返回 `Err`。
+    /// Errors: returns `Err` under the Deterministic profile (no file system) or when no cold tier was injected.
     pub fn archive_older_than(&self, ts: Timestamp) -> Result<usize> {
         if self.shared.config.profile == Profile::Deterministic {
             return Err(Error::Corrupt("archive is unavailable in Deterministic profile".into()));
@@ -395,7 +395,7 @@ impl Db {
         Ok(n)
     }
 
-    /// 阻塞直到当前已入队的记录全部落盘（WAL sync）并可见。
+    /// Block until all currently enqueued records are flushed to disk (WAL sync) and visible.
     pub fn flush(&self) -> Result<()> {
         self.check_err()?;
         loop {
@@ -414,10 +414,10 @@ impl Db {
         Ok(())
     }
 
-    /// 扫描 `series` 在 `[t0, t1]` 的样本。
+    /// Scan samples of `series` within `[t0, t1]`.
     ///
-    /// `pred` 下推到 decode 层；`agg` 为 `Some` 时返回单样本迭代器
-    /// （`ts = t0`，`value = 聚合结果`）。语义同 [`rti_query::scan`]。
+    /// `pred` is pushed down to the decode layer; when `agg` is `Some`, returns a single-sample iterator
+    /// (`ts = t0`, `value = aggregate result`). Semantics match [`rti_query::scan`].
     pub fn scan(
         &self,
         series: SeriesId,
@@ -445,19 +445,19 @@ impl Db {
         }
     }
 
-    /// 当前 segment 数量（含已加载与运行期 seal 的）。
+    /// Current number of segments (loaded at open plus sealed at runtime).
     pub fn segment_count(&self) -> usize {
         self.shared.state.lock().unwrap().segments.len()
     }
 
-    /// 当前 MemTable 中的样本数。
+    /// Current number of samples in the MemTable.
     pub fn memtable_len(&self) -> usize {
         self.shared.state.lock().unwrap().mem.len()
     }
 
-    /// 手动触发一次 MemTable seal（测试/运维钩子）。
+    /// Manually trigger one MemTable seal (test/ops hook).
     ///
-    /// Deterministic 档为 no-op（segment 落盘禁用）。
+    /// No-op under the Deterministic profile (segment persistence is disabled).
     pub fn seal(&self) -> Result<()> {
         self.flush()?;
         if self.shared.config.profile == Profile::Deterministic {
@@ -465,16 +465,16 @@ impl Db {
         }
         let mut state = self.shared.state.lock().unwrap();
         seal_memtable(&self.shared, &mut state)?;
-        // v0.6：手动 seal 后 MemTable 必为空 ⇒ WAL 中记录全部被
-        // segment 覆盖（WAL 不变式：WAL 恰好保护当前 MemTable 的内容），
-        // 直接截断为空。
+        // v0.6: after a manual seal the MemTable is empty, so every record in the WAL is covered
+        // by segments (WAL invariant: the WAL protects exactly the current MemTable contents) —
+        // truncate it to empty.
         if let Some(wal) = &mut state.wal {
             wal.checkpoint_keep(&[])?;
         }
         Ok(())
     }
 
-    /// 从缓冲池取一个结果缓冲（稳态复用）。
+    /// Take a result buffer from the pool (reused in steady state).
     fn take_buf(&self) -> Vec<Sample> {
         self.shared.buf_pool.lock().unwrap().pop().unwrap_or_default()
     }
@@ -493,7 +493,7 @@ impl Db {
         Ok(())
     }
 
-    /// 合并 memtable + segments，按 ts 排序去重（调用前已 flush）。
+    /// Merge memtable + segments, sorted and deduplicated by ts (flush happened before the call).
     fn collect_into(
         &self,
         series: SeriesId,
@@ -505,9 +505,9 @@ impl Db {
         self.flush()?;
         let tier = self.shared.cold.lock().unwrap().clone();
         let mut state = self.shared.state.lock().unwrap();
-        // memtable（新数据）
+        // memtable (new data)
         out.extend(state.mem.range(series, t0, t1).filter(|s| pred.map(|p| p.matches(s.value)).unwrap_or(true)));
-        // segments（zone map 跳过 + decode 层谓词下推；归档段透明读回）
+        // segments (zone-map skipping + predicate pushdown at the decode layer; archived segments read back transparently)
         let pred_fn;
         let pred_ref: Option<&dyn Fn(f64) -> bool> = match pred {
             Some(p) => {
@@ -522,7 +522,7 @@ impl Db {
             }
             if let Some(p) = &pred {
                 if !p.zone_may_match(seg.zone.min_val, seg.zone.max_val) {
-                    continue; // 整段跳过（归档段同样适用——不触发冷层读回）
+                    continue; // skip the whole segment (applies to archived segments too — no cold-tier read-back triggered)
                 }
             }
             let reader: &SegmentReader = match &mut seg.loc {
@@ -568,7 +568,7 @@ impl Drop for Db {
         if let Some(w) = self.worker.take() {
             let _ = w.join();
         }
-        // 尽力最终落盘
+        // best-effort final flush to disk
         if let Ok(mut state) = self.shared.state.lock() {
             if let Some(wal) = &mut state.wal {
                 let _ = wal.sync_now();
@@ -577,7 +577,7 @@ impl Drop for Db {
     }
 }
 
-/// 与 SPEC §3 逐字一致的门面自由函数。
+/// Facade free function, verbatim per SPEC §3.
 pub fn scan(
     db: &Db,
     series: SeriesId,
@@ -589,7 +589,7 @@ pub fn scan(
     db.scan(series, t0, t1, pred, agg)
 }
 
-/// 惰性扫描迭代器：持有一个池化缓冲，Drop 时归还（稳态 0 malloc）。
+/// Lazy scan iterator: holds a pooled buffer and returns it on Drop (0 malloc in steady state).
 struct ScanIter {
     pos: usize,
     buf: Option<Vec<Sample>>,
@@ -618,8 +618,8 @@ impl Drop for ScanIter {
     }
 }
 
-/// ingest 线程主循环：单次唤醒尽量 drain ring（动态批，上限
-/// [`BATCH_MAX`]）→ 整批 WAL append → 到期组提交 → MemTable。
+/// Ingest thread main loop: drain as much of the ring as possible per wakeup (dynamic batching,
+/// capped at [`BATCH_MAX`]) → whole-batch WAL append → due group commit → MemTable.
 fn ingest_loop(
     shared: Arc<Shared>,
     consumer: rti_buffer::SpscConsumer<Record>,
@@ -649,32 +649,32 @@ fn ingest_loop(
         }
         shared.acked.fetch_add(n, Ordering::SeqCst);
     }
-    // 关闭前排空：ring 中剩余记录继续处理
+    // drain before shutdown: keep processing the records left in the ring
     while let Some(r) = consumer.pop() {
         let _ = apply_batch(&shared, &[r]);
         shared.acked.fetch_add(1, Ordering::SeqCst);
     }
 }
 
-/// 应用一批记录：WAL（整批一次写 + 到期组提交 + 批末 flush 到 OS）→
-/// MemTable（满则 seal）；批内发生过 seal 时，批末对 WAL 做
-/// checkpoint——只截断已被 segment 覆盖的前缀，保留 seal 点后进入
-/// 新 MemTable 的尾巴（`keep`）。Deterministic 档跳过 WAL，满则 LRU 丢弃。
+/// Apply one batch of records: WAL (one write for the whole batch + due group commit +
+/// end-of-batch flush to the OS) → MemTable (seal when full); if a seal occurred within the batch,
+/// checkpoint the WAL at batch end — truncate only the prefix already covered by segments, keeping
+/// the tail that entered the new MemTable after the seal point (`keep`). The Deterministic profile skips the WAL and evicts by LRU when full.
 fn apply_batch(shared: &Shared, batch: &[Record]) -> Result<()> {
     let deterministic = shared.config.profile == Profile::Deterministic;
     let mut state = shared.state.lock().unwrap();
     if let Some(wal) = &mut state.wal {
         match shared.config.wal_sync {
-            // Always 保持逐条 append（每条 fsync，v0.1 语义不变）。
+            // Always keeps per-record append (fsync per record, v0.1 semantics unchanged).
             SyncPolicy::Always => {
                 for rec in batch {
                     wal.append(rec)?;
                 }
             }
-            // Group/None：整批一次编码一次写；fsync 频率由 interval
-            // 决定（批边界仅到期才刷），不再每批无条件 fsync；
-            // 批末 flush_os 保证已应用记录至少进入 OS 页缓存
-            // （进程崩溃不丢；机器掉电窗口仍由 interval 决定）。
+            // Group/None: the whole batch is encoded once and written once; fsync frequency is governed by
+            // the interval (flushing at batch boundaries only when due), no longer an unconditional fsync per
+            // batch; the end-of-batch flush_os guarantees applied records reach at least the OS page cache
+            // (surviving process crash; the machine power-loss window is still governed by the interval).
             _ => {
                 wal.append_batch(batch)?;
                 wal.sync_if_due()?;
@@ -682,12 +682,12 @@ fn apply_batch(shared: &Shared, batch: &[Record]) -> Result<()> {
             }
         }
     }
-    // 批内最后一次 seal 对应的 batch 下标：seal 点之后的记录仍需要
-    // WAL 保护（它们只在新 MemTable 中），checkpoint 时必须保留。
+    // Batch index of the last seal within the batch: records after the seal point still need WAL
+    // protection (they live only in the new MemTable) and must be kept at checkpoint.
     let mut keep_from: Option<usize> = None;
     for (j, rec) in batch.iter().enumerate() {
         if deterministic {
-            // 纯内存：满则 LRU 丢弃最老序列（内部计数），永不 seal。
+            // Pure in-memory: evict the oldest series by LRU when full (counted internally); never seal.
             state.mem.insert_lru(rec.series, rec.sample)?;
             continue;
         }
@@ -698,7 +698,7 @@ fn apply_batch(shared: &Shared, batch: &[Record]) -> Result<()> {
         match state.mem.insert(rec.series, rec.sample) {
             Ok(()) => {}
             Err(Error::SeriesFull) => {
-                // 序列数超池容量：seal 后重试一次
+                // series count exceeds pool capacity: retry once after sealing
                 seal_memtable(shared, &mut state)?;
                 keep_from = Some(j);
                 state.mem.insert(rec.series, rec.sample)?;
@@ -706,10 +706,10 @@ fn apply_batch(shared: &Shared, batch: &[Record]) -> Result<()> {
             Err(e) => return Err(e),
         }
     }
-    // v0.6 WAL checkpoint：本批发生过 seal ⇒ 最后一次 seal 点之前的
-    // 全部 WAL 记录已被 segment 覆盖（segment 已 fsync 落盘），
-    // 原子截断并保留 seal 点后的尾巴。批内无 seal 则不截断——
-    // 当前 MemTable 的记录仍由 WAL 保护。
+    // v0.6 WAL checkpoint: a seal occurred within this batch, so all WAL records before the last seal
+    // point are already covered by segments (segments are fsynced to disk); atomically truncate while
+    // keeping the tail after the seal point. Without a seal in the batch nothing is truncated — the
+    // current MemTable's records are still protected by the WAL.
     if let Some(j) = keep_from {
         if let Some(wal) = &mut state.wal {
             wal.checkpoint_keep(&batch[j..])?;
@@ -718,11 +718,11 @@ fn apply_batch(shared: &Shared, batch: &[Record]) -> Result<()> {
     Ok(())
 }
 
-/// 将 MemTable 落盘为一个（按序列分组，每序列一个）segment，并登记 reader。
+/// Persist the MemTable as segments (grouped by series, one per series) and register the reader.
 ///
-/// 本函数**不**截断 WAL：WAL checkpoint 由调用方在确知「被覆盖前缀
-/// 与待保留尾巴」的边界后执行（见 `apply_batch` 的 `keep_from` 与
-/// `Db::seal`）；恢复重放期间调用本函数后同样不得截断（重放未读完）。
+/// This function does **not** truncate the WAL: the caller performs the WAL checkpoint once it knows
+/// the boundary between the "covered prefix and the tail to keep" (see `keep_from` in `apply_batch`
+/// and `Db::seal`); calls during recovery replay must not truncate either (replay has not finished reading).
 fn seal_memtable(shared: &Shared, state: &mut DbState) -> Result<()> {
     let data: BTreeMap<SeriesId, Vec<Sample>> = state.mem.take();
     if data.is_empty() {
@@ -739,9 +739,9 @@ fn seal_memtable(shared: &Shared, state: &mut DbState) -> Result<()> {
         *seq += 1;
         drop(seq);
         let path = dir.join(&name);
-        // SyncPolicy::None = 「不刷盘」档：segment 也不 fsync（v0.5 行为），
-        // 避免为未要求的持久性付 fsync 税；Group/Always 走持久化写入，
-        // 这是 WAL checkpoint 截断的崩溃安全前提。
+        // SyncPolicy::None is the "no flush" tier: segments are not fsynced either (v0.5 behavior),
+        // avoiding the fsync tax for durability that was never requested; Group/Always use durable writes —
+        // the crash-safety prerequisite for WAL checkpoint truncation.
         if shared.config.wal_sync == SyncPolicy::None {
             SegmentWriter::write_unsynced(&path, series, &samples)?;
         } else {
@@ -752,12 +752,12 @@ fn seal_memtable(shared: &Shared, state: &mut DbState) -> Result<()> {
     Ok(())
 }
 
-// ------------------------------------------------- 归档 catalog（v0.4）
+// ------------------------------------------------- archive catalog (v0.4)
 
-/// catalog 文件名（data_dir 内）。
+/// Catalog file name (inside data_dir).
 const CATALOG_FILE: &str = "archive.catalog";
 
-/// catalog 行：`A <name> <series> <min_ts> <max_ts> <min_val_bits> <max_val_bits> <count>`。
+/// Catalog line: `A <name> <series> <min_ts> <max_ts> <min_val_bits> <max_val_bits> <count>`.
 fn format_catalog_line(e: &SegEntry) -> String {
     format!(
         "A {} {} {} {} {} {} {}\n",
@@ -771,9 +771,9 @@ fn format_catalog_line(e: &SegEntry) -> String {
     )
 }
 
-/// 解析 catalog；**不完整/畸形行静默跳过**（归档中途崩溃只可能留下
-/// 残行，对应 segment 仍在本地 `.seg` 或下次归档时重写——不会双读，
-/// 因为 open 对同名条目以本地为准去重）。
+/// Parse the catalog; **incomplete/malformed lines are silently skipped** (a crash mid-archive can
+/// only leave a partial line, and the corresponding segment is either still a local `.seg` or will be
+/// rewritten by the next archive — never read twice, because open deduplicates same-named entries in favor of the local one).
 fn load_catalog(dir: &Path) -> Result<Vec<SegEntry>> {
     let path = dir.join(CATALOG_FILE);
     if !path.exists() {
@@ -784,7 +784,7 @@ fn load_catalog(dir: &Path) -> Result<Vec<SegEntry>> {
     for line in text.lines() {
         let f: Vec<&str> = line.split_whitespace().collect();
         if f.len() != 8 || f[0] != "A" {
-            continue; // 残行/未知格式：跳过
+            continue; // partial line / unknown format: skip
         }
         let parse = || -> Option<SegEntry> {
             Some(SegEntry {
@@ -847,7 +847,7 @@ mod tests {
         let got: Vec<Sample> = db.scan(1, 0, 9990, None, None).unwrap().collect();
         assert_eq!(got.len(), 1000);
         assert_eq!(got[500].value, 500.0);
-        // 聚合路径
+        // aggregation path
         let agg: Vec<Sample> = db.scan(1, 0, 9990, None, Some(Agg::Max)).unwrap().collect();
         assert_eq!(agg.len(), 1);
         assert_eq!(agg[0].value, 999.0);
@@ -858,20 +858,20 @@ mod tests {
     #[test]
     fn memtable_seals_into_segments_and_scan_merges() {
         let d = tmpdir("seal");
-        let db = Db::open(config(d.clone(), 256)).unwrap(); // 小表促 seal
+        let db = Db::open(config(d.clone(), 256)).unwrap(); // small table to encourage a seal
         for i in 0..1000 {
             db.put(1, Sample::new(i, (i % 50) as f64)).unwrap();
         }
         db.flush().unwrap();
-        assert!(db.segment_count() >= 3, "1000 点 / 256 容量应多次 seal");
-        // 跨 segment + memtable 合并
+        assert!(db.segment_count() >= 3, "1000 points / 256 capacity should seal multiple times");
+        // merge across segments + memtable
         let got: Vec<Sample> = db.scan(1, 0, 999, None, None).unwrap().collect();
         assert_eq!(got.len(), 1000);
         assert!(got.windows(2).all(|w| w[0].ts < w[1].ts));
-        // 谓词下推
+        // predicate pushdown
         let pred: Vec<Sample> = db.scan(1, 0, 999, Some(Pred::Gt(40.0)), None).unwrap().collect();
         assert!(pred.iter().all(|s| s.value > 40.0));
-        assert_eq!(pred.len(), 9 * 20); // 每 50 点中 41..49 共 9 个 × 20 组
+        assert_eq!(pred.len(), 9 * 20); // 9 points (41..49) out of every 50, times 20 groups
         drop(db);
         std::fs::remove_dir_all(&d).ok();
     }
@@ -885,22 +885,22 @@ mod tests {
                 db.put(7, Sample::new(i, i as f64 * 2.0)).unwrap();
             }
             db.flush().unwrap();
-        } // drop：worker 退出，wal 已 sync
+        } // drop: the worker exits and the WAL is synced
         let db = Db::open(config(d.clone(), 256)).unwrap();
         let got: Vec<Sample> = db.scan(7, 0, 599, None, None).unwrap().collect();
-        assert_eq!(got.len(), 600, "segment + WAL 恢复后应无丢失无重复");
+        assert_eq!(got.len(), 600, "no loss and no duplication after segment + WAL recovery");
         assert_eq!(got[300].value, 600.0);
         drop(db);
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// 重负载测试（1M put / UDP 镜像）互斥，避免并发时 CPU 竞争
-    /// 饿死镜像接收线程造成抖动性失败。
+    /// The heavy-load tests (1M put / UDP mirror) are mutually exclusive, avoiding CPU contention
+    /// that could starve the mirror receiver thread and cause flaky failures.
     static HEAVY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// v0.3 点名：Deterministic 下 1M 次 put 全程不落盘。
+    /// Named by v0.3: 1M puts under Deterministic never touch the disk.
     ///
-    /// 故意传入 `data_dir = Some(..)`：目录都不应被创建。
+    /// Deliberately pass `data_dir = Some(..)`: not even the directory may be created.
     #[test]
     fn deterministic_never_touches_filesystem() {
         let _heavy = HEAVY_LOCK.lock().unwrap();
@@ -910,7 +910,7 @@ mod tests {
             data_dir: Some(data.clone()),
             memtable_max: 1 << 14,
             profile: Profile::Deterministic,
-            wal_sync: SyncPolicy::Always, // 必须被强制改写为 None
+            wal_sync: SyncPolicy::Always, // must be force-overridden to None
             ..Config::default()
         };
         let db = Db::open(cfg).unwrap();
@@ -919,40 +919,40 @@ mod tests {
         while i < PUTS {
             match db.put((i % 8) as u32, Sample::new(i, i as f64)) {
                 Ok(()) => i += 1,
-                Err(Error::SeriesFull) => std::thread::yield_now(), // 背压重试
+                Err(Error::SeriesFull) => std::thread::yield_now(), // backpressure retry
                 Err(e) => panic!("put failed: {e}"),
             }
         }
         db.flush().unwrap();
-        assert!(!data.exists(), "Deterministic 档不得创建任何文件/目录");
+        assert!(!data.exists(), "the Deterministic profile must not create any file/directory");
         assert_eq!(db.segment_count(), 0);
         let ev = db.lru_evictions();
-        assert!(ev > 0, "1M put / 16K 容量必然发生 LRU 丢弃");
-        // 最近窗口数据仍可查（LRU 保留最近触达的序列尾部）
+        assert!(ev > 0, "1M puts / 16K capacity must cause LRU evictions");
+        // the recent window must remain queryable (LRU keeps the tails of recently touched series)
         let recent: Vec<Sample> = db.scan(7, PUTS - 100, PUTS, None, None).unwrap().collect();
-        assert!(!recent.is_empty(), "最近窗口必须可查");
+        assert!(!recent.is_empty(), "the recent window must be queryable");
         assert!(recent.iter().all(|s| s.ts % 8 == 7));
-        // seal 为 no-op
+        // seal is a no-op
         db.seal().unwrap();
         assert_eq!(db.segment_count(), 0);
         drop(db);
-        assert!(!data.exists(), "drop 后仍不得有文件");
+        assert!(!data.exists(), "still no files after drop");
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// Balanced 档 data_dir 为 None 必须报错（误配置 fail-fast）。
+    /// Balanced with data_dir = None must fail (fail-fast on misconfiguration).
     #[test]
     fn balanced_requires_data_dir() {
         let cfg = Config { data_dir: None, ..Config::default() };
         assert!(matches!(Db::open(cfg), Err(Error::Corrupt(_))));
     }
 
-    /// v0.3 点名：镜像 loopback 接收端收到 >99% 记录，且报文格式可解析。
+    /// Named by v0.3: the mirror loopback receiver gets >99% of records, and datagrams are parseable.
     #[test]
     fn mirror_loopback_receives_nearly_all_records() {
         let _heavy = HEAVY_LOCK.lock().unwrap();
         let d = tmpdir("mirror");
-        // 接收端先绑定（loopback，端口 0 自动分配）
+        // bind the receiver first (loopback, port 0 auto-assigned)
         let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
         let addr = rx.local_addr().unwrap();
 
@@ -961,7 +961,7 @@ mod tests {
         cfg.mirror = Some(rti_core::Mirror::new(addr));
         let db = Db::open(cfg).unwrap();
 
-        // 并发接收线程：20 字节数据报解析并计数
+        // concurrent receiver thread: parse 20-byte datagrams and count them
         let stop = Arc::new(AtomicBool::new(false));
         let got = Arc::new(AtomicU64::new(0));
         let bad = Arc::new(AtomicU64::new(0));
@@ -996,9 +996,9 @@ mod tests {
             })
         };
 
-        // 内核 rmem 有限（本机折算容量仅数百报文），突发发送必然丢包
-        // ——这正是镜像 best-effort 语义。测试以 64 报文为一批、批间
-        // 让出 500µs 供接收线程排空，使 loopback 丢包率远低于 1%。
+        // kernel rmem is limited (a few hundred datagrams on this machine), so bursts inevitably drop packets
+        // — exactly the mirror's best-effort semantics. The test sends 64 datagrams per batch and yields
+        // 500µs between batches so the receiver can drain, keeping loopback loss far below 1%.
         const PUTS: u64 = 2_000;
         for i in 0..PUTS as i64 {
             db.put((i % 4) as u32, Sample::new(i, i as f64)).unwrap();
@@ -1007,24 +1007,24 @@ mod tests {
             }
         }
         let stats = db.mirror_stats();
-        assert_eq!(stats.sent + stats.failed, PUTS, "每次成功 put 恰好镜像一次");
-        // 等接收线程排空（超时 100ms 轮询）
+        assert_eq!(stats.sent + stats.failed, PUTS, "every successful put is mirrored exactly once");
+        // wait for the receiver thread to drain (100ms poll timeout)
         std::thread::sleep(std::time::Duration::from_millis(300));
         stop.store(true, Ordering::SeqCst);
         th.join().unwrap();
 
         let received = got.load(Ordering::SeqCst);
-        assert_eq!(bad.load(Ordering::SeqCst), 0, "报文格式必须全部可解析");
+        assert_eq!(bad.load(Ordering::SeqCst), 0, "every datagram must be parseable");
         assert!(
             received as f64 >= stats.sent as f64 * 0.99,
-            "loopback 必须收到 >99%（received={received}, sent={})",
+            "loopback must receive >99% (received={received}, sent={})",
             stats.sent
         );
         drop(db);
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// 未配置镜像时统计为零；put 不受影响。
+    /// Stats are zero when no mirror is configured; put is unaffected.
     #[test]
     fn mirror_absent_stats_are_zero() {
         let d = tmpdir("mirror-off");
@@ -1036,8 +1036,8 @@ mod tests {
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// v0.4 点名：归档后本地 segment 删除、catalog 可读回、
-    /// scan 结果与归档前一致（含重启后透明读回）。
+    /// Named by v0.4: after archiving, local segments are deleted, the catalog is readable back,
+    /// and scan results are identical to before archiving (including transparent read-back after restart).
     #[test]
     fn archive_then_scan_reads_through_cold_tier() {
         let d = tmpdir("archive");
@@ -1058,91 +1058,91 @@ mod tests {
             db.seal().unwrap();
             seg_count = db.segment_count();
             assert!(seg_count > 0);
-            // 归档前基线
+            // baseline before archiving
             baseline = (0..4u32)
                 .map(|s| db.scan(s, 0, i64::MAX, None, None).unwrap().collect())
                 .collect();
             assert!(baseline.iter().all(|v| !v.is_empty()));
 
-            // 注入冷层并归档全部（ts 阈值大于所有数据）
+            // inject the cold tier and archive everything (ts threshold beyond all data)
             db.set_cold_tier(Arc::new(LocalFsColdTier::new(&cold_dir).unwrap()));
             let n = db.archive_older_than(i64::MAX - 1).unwrap();
-            assert_eq!(n, seg_count, "全部 segment 都应归档");
+            assert_eq!(n, seg_count, "all segments should be archived");
             assert_eq!(db.archived_segment_count(), seg_count);
-            // 本地 .seg 全删，冷层可读，catalog 存在
+            // all local .seg files deleted, cold tier readable, catalog exists
             let local_segs = std::fs::read_dir(&data)
                 .unwrap()
                 .filter_map(|e| e.ok())
                 .filter(|e| e.path().extension().map(|x| x == "seg").unwrap_or(false))
                 .count();
-            assert_eq!(local_segs, 0, "归档后本地不得残留 .seg");
+            assert_eq!(local_segs, 0, "no local .seg may remain after archiving");
             let tier = LocalFsColdTier::new(&cold_dir).unwrap();
-            assert_eq!(tier.list().unwrap().len(), seg_count, "冷层必须持有全部 segment");
-            assert!(data.join("archive.catalog").exists(), "catalog 必须落盘");
+            assert_eq!(tier.list().unwrap().len(), seg_count, "the cold tier must hold all segments");
+            assert!(data.join("archive.catalog").exists(), "catalog must be persisted");
 
-            // scan 透明读回：与归档前逐点一致
+            // scan transparent read-back: point-for-point identical to before archiving
             for (s, want) in baseline.iter().enumerate() {
                 let got: Vec<Sample> = db.scan(s as u32, 0, i64::MAX, None, None).unwrap().collect();
-                assert_eq!(&got, want, "series {s} 归档前后 scan 必须一致");
+                assert_eq!(&got, want, "series {s} scan must be identical before/after archiving");
             }
         }
 
-        // 重启：catalog 读回 Archived 条目，scan 仍透明
+        // restart: catalog reads back Archived entries, scan still transparent
         {
             let db = Db::open(config(data.clone(), 128)).unwrap();
-            assert_eq!(db.archived_segment_count(), seg_count, "重启后 catalog 必须读回");
-            // 未注入冷层：命中归档段时报错（而非静默丢数据）
+            assert_eq!(db.archived_segment_count(), seg_count, "catalog must be readable after restart");
+            // no cold tier injected: hitting an archived segment errors out (instead of silently losing data)
             assert!(db.scan(0, 0, i64::MAX, None, None).is_err());
             db.set_cold_tier(Arc::new(LocalFsColdTier::new(&cold_dir).unwrap()));
             for (s, want) in baseline.iter().enumerate() {
                 let got: Vec<Sample> = db.scan(s as u32, 0, i64::MAX, None, None).unwrap().collect();
-                assert_eq!(&got, want, "series {s} 重启后 scan 必须一致");
+                assert_eq!(&got, want, "series {s} scan must be identical after restart");
             }
         }
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// 归档守卫：未注入冷层 / Deterministic 档均报错。
+    /// Archive guard: errors both without an injected cold tier and under the Deterministic profile.
     #[test]
     fn archive_guards() {
         let d = tmpdir("archive-guard");
         let db = Db::open(config(d.join("data"), 128)).unwrap();
         db.put(1, Sample::new(1, 1.0)).unwrap();
         db.seal().unwrap();
-        assert!(db.archive_older_than(100).is_err(), "无冷层必须报错");
+        assert!(db.archive_older_than(100).is_err(), "missing cold tier must error");
 
         let db2 = Db::open(Config::deterministic()).unwrap();
         db2.set_cold_tier(Arc::new(LocalFsColdTier::new(d.join("cold")).unwrap()));
-        assert!(db2.archive_older_than(100).is_err(), "Deterministic 档必须拒绝归档");
+        assert!(db2.archive_older_than(100).is_err(), "the Deterministic profile must refuse archiving");
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// 谓词 zone-map 跳过对归档段同样生效（不触发冷层读回也不出错）。
+    /// Predicate zone-map skipping works on archived segments too (no cold-tier read-back, no error).
     #[test]
     fn archived_segments_still_zone_skipped() {
         let d = tmpdir("archive-zone");
         let data = d.join("data");
         let db = Db::open(config(data.clone(), 64)).unwrap();
         for i in 0..100i64 {
-            db.put(1, Sample::new(i, 10.0)).unwrap(); // 值恒 10
+            db.put(1, Sample::new(i, 10.0)).unwrap(); // constant value 10
         }
         db.seal().unwrap();
         db.set_cold_tier(Arc::new(LocalFsColdTier::new(d.join("cold")).unwrap()));
         let n = db.segment_count();
         assert!(n >= 1);
         assert_eq!(db.archive_older_than(1000).unwrap(), n);
-        // 谓词值域 [50, 60] 与段 zone [10,10] 不相交 → 整段跳过 → 空结果
+        // predicate range [50, 60] does not intersect the segment zone [10,10] -> whole segment skipped -> empty result
         let got: Vec<Sample> = db.scan(1, 0, 1000, Some(Pred::Between(50.0, 60.0)), None).unwrap().collect();
-        assert!(got.is_empty(), "zone 不相交必须整段跳过（含归档段）");
-        // 相交谓词 → 透明读回
+        assert!(got.is_empty(), "disjoint zones must skip the whole segment (including archived ones)");
+        // intersecting predicate -> transparent read-back
         let got: Vec<Sample> = db.scan(1, 0, 1000, Some(Pred::Between(5.0, 15.0)), None).unwrap().collect();
         assert_eq!(got.len(), 100);
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// v0.5 点名：`archive_older_than` 配 S3 冷层的端到端测试——
-    /// 内嵌 mock S3 server + Db 归档 + scan 读回逐点一致（含重启后
-    /// catalog 读回再透明读回）。
+    /// Named by v0.5: end-to-end test of `archive_older_than` with an S3 cold tier —
+    /// embedded mock S3 server + Db archiving + scan read-back point-for-point identical
+    /// (including catalog read-back after restart followed by transparent read-back).
     #[cfg(feature = "s3")]
     #[test]
     fn archive_to_s3_mock_end_to_end() {
@@ -1184,24 +1184,24 @@ mod tests {
 
             db.set_cold_tier(mk_tier());
             let n = db.archive_older_than(i64::MAX - 1).unwrap();
-            assert_eq!(n, seg_count, "全部 segment 都应归档到 mock S3");
+            assert_eq!(n, seg_count, "all segments should be archived to mock S3");
             assert_eq!(db.archived_segment_count(), seg_count);
-            assert_eq!(server.object_count(), seg_count, "mock S3 必须持有全部 segment");
-            assert_eq!(server.rejected_requests(), 0, "签名请求不应被 mock 拒签");
+            assert_eq!(server.object_count(), seg_count, "mock S3 must hold all segments");
+            assert_eq!(server.rejected_requests(), 0, "signed requests must not be rejected by the mock");
             let local_segs = std::fs::read_dir(&data)
                 .unwrap()
                 .filter_map(|e| e.ok())
                 .filter(|e| e.path().extension().map(|x| x == "seg").unwrap_or(false))
                 .count();
-            assert_eq!(local_segs, 0, "归档后本地不得残留 .seg");
-            assert!(data.join("archive.catalog").exists(), "catalog 必须落盘");
+            assert_eq!(local_segs, 0, "no local .seg may remain after archiving");
+            assert!(data.join("archive.catalog").exists(), "catalog must be persisted");
 
-            // scan 透明读回（经 HTTP 从 mock S3 取回）：与归档前逐点一致
+            // scan transparent read-back (fetched from mock S3 over HTTP): point-for-point identical to before archiving
             for (s, want) in baseline.iter().enumerate() {
                 let got: Vec<Sample> = db.scan(s as u32, 0, i64::MAX, None, None).unwrap().collect();
-                assert_eq!(&got, want, "series {s} 归档前后 scan 必须一致");
+                assert_eq!(&got, want, "series {s} scan must be identical before/after archiving");
             }
-            // 谓词 + 聚合路径同样走透明读回
+            // the predicate + aggregation path also goes through transparent read-back
             let pred: Vec<Sample> = db
                 .scan(1, 0, i64::MAX, Some(Pred::Gt(1500.0)), None)
                 .unwrap()
@@ -1212,22 +1212,22 @@ mod tests {
             assert_eq!(agg[0].value, baseline[1].len() as f64);
         }
 
-        // 重启：catalog 读回 Archived 条目，冷层对象仍在 mock，scan 仍一致
+        // restart: catalog reads back Archived entries, cold-tier objects still in the mock, scan still identical
         {
             let db = Db::open(config(data.clone(), 128)).unwrap();
-            assert_eq!(db.archived_segment_count(), seg_count, "重启后 catalog 必须读回");
-            assert!(db.scan(0, 0, i64::MAX, None, None).is_err(), "未注入冷层必须报错");
+            assert_eq!(db.archived_segment_count(), seg_count, "catalog must be readable after restart");
+            assert!(db.scan(0, 0, i64::MAX, None, None).is_err(), "no injected cold tier must error");
             db.set_cold_tier(mk_tier());
             for (s, want) in baseline.iter().enumerate() {
                 let got: Vec<Sample> = db.scan(s as u32, 0, i64::MAX, None, None).unwrap().collect();
-                assert_eq!(&got, want, "series {s} 重启后 scan 必须一致");
+                assert_eq!(&got, want, "series {s} scan must be identical after restart");
             }
         }
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// v0.6 点名：put_durable 确认的点在模拟崩溃（不执行 Drop、
-    /// 无最终 flush/sync，等价 kill -9）后重启 0 丢失。
+    /// Named by v0.6: points acknowledged by put_durable suffer zero loss after a simulated crash
+    /// (no Drop executed, no final flush/sync — equivalent to kill -9) and restart.
     #[test]
     fn put_durable_survives_simulated_crash() {
         let d = tmpdir("durable-crash");
@@ -1238,22 +1238,22 @@ mod tests {
                 let wm = db
                     .put_durable(1, Sample::new(i, i as f64), Duration::from_secs(5))
                     .unwrap();
-                assert!(wm >= (i + 1) as u64, "返回水位必须 ≥ 本记录序号");
+                assert!(wm >= (i + 1) as u64, "the returned watermark must be >= this record's sequence number");
             }
             assert_eq!(db.durable_watermark(), 500);
-            // 模拟 kill -9：不执行 Drop（ingest 不再 drain、无最终 sync）。
-            // ingest 批末 flush_os 已保证已确认记录进入 OS 页缓存。
+            // simulate kill -9: no Drop (ingest no longer drains, no final sync).
+            // the ingest end-of-batch flush_os already guarantees acknowledged records reached the OS page cache.
             std::mem::forget(db);
         }
         let db = Db::open(cfg).unwrap();
         let got: Vec<Sample> = db.scan(1, 0, 499, None, None).unwrap().collect();
-        assert_eq!(got.len(), 500, "put_durable 已确认的点必须 0 丢失");
+        assert_eq!(got.len(), 500, "points acknowledged by put_durable must suffer zero loss");
         assert_eq!(got[250].value, 250.0);
         drop(db);
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// v0.6 点名：durable_watermark 单调递增，且与 put/put_durable 计数一致。
+    /// Named by v0.6: durable_watermark is monotonically increasing and consistent with put/put_durable counts.
     #[test]
     fn durable_watermark_monotonic_and_matches_puts() {
         let d = tmpdir("watermark");
@@ -1263,11 +1263,11 @@ mod tests {
             let wm = db
                 .put_durable(3, Sample::new(i, i as f64), Duration::from_secs(5))
                 .unwrap();
-            assert!(wm >= last, "水位必须单调递增（{wm} < {last}）");
+            assert!(wm >= last, "watermark must increase monotonically ({wm} < {last})");
             last = wm;
         }
         assert_eq!(db.durable_watermark(), 200);
-        // 混合异步 put：flush 后水位覆盖全部已入队记录
+        // mixed async puts: after flush the watermark covers all enqueued records
         for i in 200..400i64 {
             db.put(3, Sample::new(i, i as f64)).unwrap();
         }
@@ -1277,28 +1277,28 @@ mod tests {
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// v0.6：put_durable 超时返回 Err(Timeout) 但数据不丢（仍在管线中）。
+    /// v0.6: put_durable times out with Err(Timeout) but no data is lost (still in the pipeline).
     #[test]
     fn put_durable_timeout_keeps_data_in_pipeline() {
         let d = tmpdir("durable-timeout");
         let db = Db::open(config(d.clone(), 1 << 10)).unwrap();
-        // 零超时：可能 Ok（恰好已应用）或 Timeout；两种结果都合法
+        // zero timeout: may be Ok (happens to be applied already) or Timeout; both outcomes are legal
         let r = db.put_durable(5, Sample::new(1, 42.0), Duration::ZERO);
         match r {
             Ok(_) | Err(Error::Timeout) => {}
-            Err(e) => panic!("只允许 Ok 或 Timeout，得到 {e}"),
+            Err(e) => panic!("only Ok or Timeout allowed, got {e}"),
         }
-        // 无论是否超时，记录最终必须持久可查
+        // whether it timed out or not, the record must eventually be persisted and queryable
         db.flush().unwrap();
         let got: Vec<Sample> = db.scan(5, 0, 10, None, None).unwrap().collect();
-        assert_eq!(got, vec![Sample::new(1, 42.0)], "超时不等于丢数据");
+        assert_eq!(got, vec![Sample::new(1, 42.0)], "a timeout does not mean data loss");
         assert_eq!(db.durable_watermark(), 1);
         drop(db);
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// v0.6 点名：seal 后 WAL 被 checkpoint 截断，稳态落盘
-    /// ≈ segment + 至多一个 MemTable 的 WAL 尾巴。
+    /// Named by v0.6: after sealing, the WAL is truncated by checkpointing; steady-state on-disk data
+    /// is approximately the segments plus at most one MemTable's WAL tail.
     #[test]
     fn wal_checkpoint_truncates_after_seal() {
         let d = tmpdir("wal-checkpoint");
@@ -1308,25 +1308,25 @@ mod tests {
             db.put(1, Sample::new(i, i as f64)).unwrap();
         }
         db.flush().unwrap();
-        // 自动 seal 约 9 次；WAL 只剩最后一个未满 MemTable 的尾巴
+        // about 9 automatic seals; the WAL keeps only the tail of the last, not-yet-full MemTable
         let mid = std::fs::metadata(&wal).unwrap().len();
         assert!(
             mid <= 1024 * 28,
-            "自动 seal 后 WAL 必须被 checkpoint 截断（实际 {mid} 字节）"
+            "the WAL must be checkpoint-truncated after automatic seals (actual {mid} bytes)"
         );
-        assert!(db.segment_count() >= 9, "10_000 点 / 1024 容量应多次 seal");
-        // 手动 seal 剩余 MemTable 后 WAL 必须为空
+        assert!(db.segment_count() >= 9, "10_000 points / 1024 capacity should seal multiple times");
+        // after manually sealing the remaining MemTable, the WAL must be empty
         db.seal().unwrap();
         let after = std::fs::metadata(&wal).unwrap().len();
-        assert_eq!(after, 0, "手动 seal 后 WAL 必须为空（实际 {after} 字节）");
-        // 数据完整性不受截断影响
+        assert_eq!(after, 0, "the WAL must be empty after manual seal (actual {after} bytes)");
+        // data integrity is unaffected by truncation
         assert_eq!(db.scan(1, 0, 9999, None, None).unwrap().count(), 10_000);
         drop(db);
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// v0.6 点名：稳态总落盘 ≤ 1.5× segment 大小（WAL 不再与
-    /// segment 并存双份）。
+    /// Named by v0.6: total steady-state on-disk footprint <= 1.5x the segment size (the WAL no
+    /// longer coexists as a second copy next to segments).
     #[test]
     fn steady_state_disk_within_1_5x_segments() {
         let d = tmpdir("disk-ratio");
@@ -1340,7 +1340,7 @@ mod tests {
             }
         }
         db.flush().unwrap();
-        // 不做手动 seal：稳态 = 已 seal 的 segment + WAL 尾巴（≤ 1 个 MemTable）
+        // no manual seal: steady state = sealed segments + WAL tail (<= 1 MemTable)
         let mut seg_bytes = 0u64;
         let mut wal_bytes = 0u64;
         for e in std::fs::read_dir(&d).unwrap() {
@@ -1356,41 +1356,41 @@ mod tests {
             }
         }
         assert!(seg_bytes > 0);
-        assert!(wal_bytes <= 4096 * 28, "WAL 尾巴不得超出一个 MemTable（{wal_bytes}）");
+        assert!(wal_bytes <= 4096 * 28, "the WAL tail must not exceed one MemTable ({wal_bytes})");
         let total = seg_bytes + wal_bytes;
         assert!(
             total * 2 <= seg_bytes * 3,
-            "稳态总落盘 {total} 必须 ≤ 1.5× segment {seg_bytes}"
+            "steady-state total {total} must be <= 1.5x segment {seg_bytes}"
         );
         drop(db);
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// v0.6 点名：截断点前后混合场景——崩溃恢复在 checkpoint 后仍正确
-    /// （segment 中的旧数据 + WAL 尾巴中的新数据，无丢失无重复）。
+    /// Named by v0.6: mixed scenario around the truncation point — crash recovery stays correct
+    /// after checkpointing (old data in segments + new data in the WAL tail, no loss, no duplication).
     #[test]
     fn recovery_correct_across_checkpoint_mixed() {
         let d = tmpdir("ckpt-mixed");
         let cfg = config(d.clone(), 1024);
         {
             let db = Db::open(cfg.clone()).unwrap();
-            // 第一批：触发多次自动 seal + checkpoint
+            // first batch: triggers multiple automatic seals + checkpoints
             for i in 0..5_000i64 {
                 db.put(1, Sample::new(i, i as f64)).unwrap();
             }
             db.flush().unwrap();
-            // 第二批：checkpoint 之后进入新 WAL 尾巴（尚未 seal）
+            // second batch: enters the new WAL tail after the checkpoint (not yet sealed)
             for i in 5_000..5_700i64 {
                 db.put(1, Sample::new(i, i as f64)).unwrap();
             }
             db.flush().unwrap();
             assert!(std::fs::metadata(d.join("wal.log")).unwrap().len() <= 1024 * 28);
-            // 模拟崩溃：不 Drop（ingest 已 drain 且 flush_os，无最终 sync）
+            // simulate a crash: no Drop (ingest has drained and flush_os'ed, no final sync)
             std::mem::forget(db);
         }
         let db = Db::open(cfg).unwrap();
         let got: Vec<Sample> = db.scan(1, 0, 5699, None, None).unwrap().collect();
-        assert_eq!(got.len(), 5_700, "截断后恢复必须无丢失无重复");
+        assert_eq!(got.len(), 5_700, "recovery after truncation must have no loss and no duplication");
         assert!(got.windows(2).all(|w| w[0].ts < w[1].ts));
         assert_eq!(got[5_650].value, 5_650.0);
         drop(db);
@@ -1405,7 +1405,7 @@ mod tests {
         db.flush().unwrap();
         let got: Vec<Sample> = scan(&db, 3, 0, 10, None, None).unwrap().collect();
         assert_eq!(got, vec![Sample::new(1, 42.0)]);
-        // 通过 ScanSource trait 走 rti_query::scan 泛型路径
+        // go through the rti_query::scan generic path via the ScanSource trait
         let via_query: Vec<Sample> = rti_query::scan(&db, 3, 0, 10, None, Some(Agg::Sum))
             .unwrap()
             .collect();

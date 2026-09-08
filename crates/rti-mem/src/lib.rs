@@ -1,16 +1,16 @@
-//! rti-mem：确定性内存池。
+//! rti-mem: deterministic memory pools.
 //!
-//! - [`BumpArena`]：预分配定长 arena，`alloc` 只是指针碰撞（bump），
-//!   永不逐个 free，`reset()` O(1) 整体回收。
-//! - [`SlabPool<T>`]：固定大小对象池，`alloc`/`free` 均 O(1) 且无系统调用。
+//! - [`BumpArena`]: pre-allocated fixed-size arena; `alloc` is just pointer bumping,
+//!   never frees individually, and `reset()` reclaims everything in O(1).
+//! - [`SlabPool<T>`]: fixed-size object pool; `alloc`/`free` are both O(1) with no syscalls.
 //!
-//! 这是 SPEC 允许使用 unsafe 的两个 crate 之一；每处 unsafe 均附
-//! `// SAFETY:` 注释说明不变量。
+//! This is one of the two crates where the SPEC permits unsafe code; every unsafe
+//! block carries a `// SAFETY:` comment explaining the invariants.
 //!
-//! ## no_std（v0.3）
+//! ## no_std (v0.3)
 //!
-//! 默认 feature `std` 关闭时本 crate 为 `no_std`（`core` + `alloc`），
-//! [`BumpArena`] / [`SlabPool`] API 完全一致。
+//! With the default `std` feature disabled this crate is `no_std` (`core` + `alloc`);
+//! the [`BumpArena`] / [`SlabPool`] APIs are identical.
 
 #![allow(unsafe_code)]
 #![cfg_attr(not(feature = "std"), no_std)]
@@ -23,9 +23,9 @@ mod slab;
 pub use arena::BumpArena;
 pub use slab::SlabPool;
 
-/// 计数全局分配器（feature `alloc-count`，仅测试用，v0.3）。
+/// Counting global allocator (feature `alloc-count`, test-only, v0.3).
 ///
-/// 用法（集成测试二进制中注册为全局分配器）：
+/// Usage (registered as the global allocator in an integration-test binary):
 ///
 /// ```ignore
 /// #[global_allocator]
@@ -33,36 +33,36 @@ pub use slab::SlabPool;
 ///     rti_mem::alloc_count::CountingAllocator;
 /// ```
 ///
-/// 之后 [`alloc_count::alloc_count`] 返回进程累计分配次数，
-/// 用于验证热路径稳态 0 堆分配增长。计数本身是一次 `Relaxed`
-/// 原子加，不改变分配语义（直接委托 `std::alloc::System`）。
+/// Afterwards [`alloc_count::alloc_count`] returns the cumulative number of process
+/// allocations, used to verify zero heap-allocation growth on the steady-state hot path. Counting itself is a single
+/// `Relaxed` atomic increment and does not change allocation semantics (it delegates directly to `std::alloc::System`).
 #[cfg(feature = "alloc-count")]
 pub mod alloc_count {
     use core::sync::atomic::{AtomicU64, Ordering};
     use std::alloc::{GlobalAlloc, Layout, System};
 
-    /// 计数分配器：每次 `alloc` 使计数 +1（`dealloc` 不计）。
+    /// Counting allocator: each `alloc` increments the count by 1 (`dealloc` is not counted).
     pub struct CountingAllocator;
 
     static ALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
 
-    // SAFETY: 所有方法原样委托 `System`（其本身满足 GlobalAlloc
-    // 全部不变量）；附加操作仅为无内存序要求的计数。
+    // SAFETY: every method delegates verbatim to `System` (which itself satisfies all
+    // GlobalAlloc invariants); the only addition is a count with no ordering requirements.
     unsafe impl GlobalAlloc for CountingAllocator {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
             ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
-            // SAFETY: layout 原样传递，与调用方的约定一致。
+            // SAFETY: layout is passed through unchanged, matching the caller's contract.
             unsafe { System.alloc(layout) }
         }
 
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-            // SAFETY: ptr/layout 来自本分配器的 alloc（调用方保证），
-            // 原样委托 System。
+            // SAFETY: ptr/layout come from this allocator's alloc (guaranteed by the caller),
+            // delegated verbatim to System.
             unsafe { System.dealloc(ptr, layout) }
         }
     }
 
-    /// 进程累计堆分配次数（本分配器注册为全局分配器后）。
+    /// Cumulative number of heap allocations in the process (after this allocator is registered globally).
     pub fn alloc_count() -> u64 {
         ALLOC_COUNT.load(Ordering::Relaxed)
     }
@@ -82,7 +82,7 @@ mod tests {
         assert_eq!(a.used(), 16);
         a.reset();
         assert_eq!(a.used(), 0);
-        // reset 后可以从头再分配
+        // after reset, allocation can start over from the beginning
         let p3 = a.alloc(Layout::new::<u64>()).unwrap();
         assert_eq!(p3, p1);
     }
@@ -93,7 +93,7 @@ mod tests {
         let layout = Layout::from_size_align(16, 16).unwrap();
         let p = a.alloc(layout).unwrap();
         assert_eq!(p.as_ptr() as usize % 16, 0);
-        // 64 字节放不下 5 个 16 字节块
+        // 64 bytes cannot hold five 16-byte blocks
         assert!(a.alloc(layout).is_some());
         assert!(a.alloc(layout).is_some());
         assert!(a.alloc(layout).is_some());
@@ -105,11 +105,11 @@ mod tests {
         let mut pool = SlabPool::<u64>::with_capacity(2);
         let s1 = pool.alloc(1).unwrap();
         let s2 = pool.alloc(2).unwrap();
-        assert!(pool.alloc(3).is_none()); // 满
+        assert!(pool.alloc(3).is_none()); // full
         *pool.get_mut(s1).unwrap() = 10;
         assert_eq!(*pool.get(s1).unwrap(), 10);
         pool.free(s1).unwrap();
-        let s3 = pool.alloc(3).unwrap(); // 复用被释放的槽位
+        let s3 = pool.alloc(3).unwrap(); // reuse the freed slot
         assert_eq!(s3, s1);
         assert_eq!(*pool.get(s3).unwrap(), 3);
         assert_eq!(*pool.get(s2).unwrap(), 2);
@@ -120,7 +120,7 @@ mod tests {
         let mut pool = SlabPool::<u32>::with_capacity(1);
         let s = pool.alloc(7).unwrap();
         pool.free(s).unwrap();
-        assert!(pool.free(s).is_err()); // 双重释放被拒绝
-        assert!(pool.get(99).is_none()); // 越界句柄
+        assert!(pool.free(s).is_err()); // double free is rejected
+        assert!(pool.get(99).is_none()); // out-of-bounds handle
     }
 }

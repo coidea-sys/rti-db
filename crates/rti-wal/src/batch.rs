@@ -1,10 +1,10 @@
-//! 批量提交的 WAL 写者（v0.2）：帧先入 pending 缓冲，按 [`SyncPolicy`]
-//! 整批提交到后端，组提交边界一次 fsync。
+//! Batch-committing WAL writer (v0.2): frames first go into a pending buffer and are
+//! committed to the backend in whole batches per [`SyncPolicy`], with one fsync per group-commit boundary.
 //!
-//! 提交后端抽象为 [`BatchSubmitter`]：真实后端是 feature `io-uring`
-//! （Linux only）下的 `IoUringSubmitter`（一次系统调用提交整批 SQE）；
-//! 测试用 mock 后端验证批处理/组提交决策逻辑，与内核是否放行
-//! io_uring 无关。
+//! The commit backend is abstracted as [`BatchSubmitter`]: the real backend is `IoUringSubmitter`
+//! under feature `io-uring` (Linux only) (a whole batch of SQEs in one syscall);
+//! tests use a mock backend to validate the batching/group-commit decision logic, independent
+//! of whether the kernel allows io_uring.
 
 use std::time::Instant;
 
@@ -12,36 +12,36 @@ use rti_core::{Result, SyncPolicy};
 
 use super::{encode_frame, Record, WalWriter, FRAME_LEN};
 
-/// pending 缓冲默认上限（字节）：达到即强制提交，保证内存有界。
+/// Default pending-buffer cap (bytes): forces a commit when reached, keeping memory bounded.
 pub const DEFAULT_MAX_BATCH_BYTES: usize = 64 * 1024;
 
-/// 批量提交后端抽象（同步阻塞语义：返回即完成）。
+/// Batch-commit backend abstraction (synchronous blocking semantics: return means done).
 ///
-/// 实现者必须是安全的（rti-wal 为 `#![forbid(unsafe_code)]`）；
-/// io_uring 的 unsafe 胶水隔离在 `rti-wal-uring` crate。
+/// Implementations must be safe (rti-wal is `#![forbid(unsafe_code)]`);
+/// the unsafe io_uring glue is isolated in the `rti-wal-uring` crate.
 pub trait BatchSubmitter {
-    /// 把 `buf` 整体写入文件的 `offset` 处，完成（至少进入内核）后返回。
+    /// Write all of `buf` at `offset` of the file; returns once completed (at least inside the kernel).
     fn submit_write(&mut self, buf: &[u8], offset: u64) -> Result<()>;
-    /// 组提交刷盘边界。
+    /// Group-commit flush boundary.
     fn submit_fsync(&mut self) -> Result<()>;
-    /// 后端名（诊断/测试用）。
+    /// Backend name (diagnostics/tests).
     fn name(&self) -> &'static str;
 }
 
-/// 批量提交 WAL 写者：泛型于提交后端。
+/// Batch-committing WAL writer: generic over the commit backend.
 ///
-/// - `append`/`append_batch` 只编码进 pending（O(1)，无系统调用）；
-/// - `SyncPolicy::Always`：每次 append 提交 + fsync；
-/// - `SyncPolicy::Group`：距上次 fsync 超过 `interval_us` 才提交 + fsync；
-/// - `SyncPolicy::None`：pending 达到 [`DEFAULT_MAX_BATCH_BYTES`] 才提交
-///   （不 fsync），崩溃窗口与 v0.1 Std 后端同语义。
+/// - `append`/`append_batch` only encode into pending (O(1), no syscalls);
+/// - `SyncPolicy::Always`: commit + fsync on every append;
+/// - `SyncPolicy::Group`: commit + fsync only when more than `interval_us` has elapsed since the last fsync;
+/// - `SyncPolicy::None`: commit only when pending reaches [`DEFAULT_MAX_BATCH_BYTES`]
+///   (no fsync); the crash window has the same semantics as the v0.1 Std backend.
 pub struct BatchingWalWriter<S: BatchSubmitter> {
     submitter: S,
-    /// 已编码未提交的帧。
+    /// Encoded but not-yet-committed frames.
     pending: Vec<u8>,
-    /// 下一条记录的逻辑偏移（= committed + pending 已占）。
+    /// Logical offset of the next record (= committed + pending occupied).
     offset: u64,
-    /// 已提交到后端的字节数（= 文件写位置）。
+    /// Bytes committed to the backend (= file write position).
     committed: u64,
     sync: SyncPolicy,
     last_sync: Instant,
@@ -49,7 +49,7 @@ pub struct BatchingWalWriter<S: BatchSubmitter> {
 }
 
 impl<S: BatchSubmitter> BatchingWalWriter<S> {
-    /// 用给定后端构造；`start_offset` 为已有日志长度（续写场景）。
+    /// Construct with a given backend; `start_offset` is the existing log length (append-resume scenario).
     pub fn with_submitter(submitter: S, sync: SyncPolicy, start_offset: u64) -> Self {
         Self {
             submitter,
@@ -62,18 +62,18 @@ impl<S: BatchSubmitter> BatchingWalWriter<S> {
         }
     }
 
-    /// 设置 pending 上限（至少一帧）。
+    /// Set the pending cap (at least one frame).
     pub fn with_max_batch_bytes(mut self, n: usize) -> Self {
         self.max_batch = n.max(FRAME_LEN);
         self
     }
 
-    /// 当前 pending 未提交字节数（诊断/测试用）。
+    /// Current pending uncommitted bytes (diagnostics/tests).
     pub fn pending_bytes(&self) -> usize {
         self.pending.len()
     }
 
-    /// 把 pending 整批提交（一次后端调用）。
+    /// Commit the whole pending batch (one backend call).
     fn flush_pending(&mut self) -> Result<()> {
         if self.pending.is_empty() {
             return Ok(());
@@ -84,7 +84,7 @@ impl<S: BatchSubmitter> BatchingWalWriter<S> {
         Ok(())
     }
 
-    /// 按同步策略决定是否提交/刷盘。
+    /// Decide whether to commit/flush per the sync policy.
     fn maybe_flush(&mut self) -> Result<()> {
         match self.sync {
             SyncPolicy::Always => self.sync_now(),
@@ -130,10 +130,10 @@ impl<S: BatchSubmitter> WalWriter for BatchingWalWriter<S> {
 
     fn sync_now(&mut self) -> Result<()> {
         if let Err(e) = self.flush_pending() {
-            // v0.5 在途流水：Error 背压策略下 pending 提交可能因在途深度满
-            // 被拒。持久化边界必须能推进：先 submit_fsync 回收在途批
-            // （流水后端 drain 在途 + fsync；同步后端本就要 fsync），
-            // 再重试本批提交一次。
+            // v0.5 in-flight pipeline: under the Error backpressure policy a pending commit may be
+            // rejected because the in-flight depth is full. The durability boundary must still advance:
+            // first submit_fsync to reap in-flight batches (a pipeline backend drains in-flight + fsyncs;
+            // a synchronous backend fsyncs anyway), then retry this batch's commit once.
             if matches!(e, rti_core::Error::Backpressure) {
                 self.submitter.submit_fsync()?;
                 self.flush_pending()?;
@@ -161,14 +161,14 @@ impl<S: BatchSubmitter> WalWriter for BatchingWalWriter<S> {
 
 impl<S: BatchSubmitter> Drop for BatchingWalWriter<S> {
     fn drop(&mut self) {
-        // 尽力提交残余 pending；Drop 中忽略错误。
+        // best-effort commit of leftover pending; errors are ignored in Drop.
         let _ = self.flush_pending();
     }
 }
 
-// ------------------------------------------------- io_uring 后端（feature）
+// ------------------------------------------------- io_uring backend (feature)
 
-/// io_uring 提交后端（feature `io-uring`，Linux only）。
+/// io_uring commit backend (feature `io-uring`, Linux only).
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
 pub struct IoUringSubmitter {
     file: rti_wal_uring::UringFile,
@@ -191,19 +191,19 @@ impl BatchSubmitter for IoUringSubmitter {
     }
 }
 
-/// io_uring 后端 WAL 写者（feature `io-uring`，Linux only）。
+/// io_uring-backend WAL writer (feature `io-uring`, Linux only).
 ///
-/// 打开失败（`io_uring_setup` 被 seccomp 拒绝、内核 < 5.1 等）返回
-/// `Err`；自动后端选择请用 [`WalWriter::auto`]（探测失败回退 Std）。
+/// Returns `Err` when opening fails (`io_uring_setup` rejected by seccomp, kernel < 5.1, etc.);
+/// for automatic backend selection use [`WalWriter::auto`] (falls back to Std when probing fails).
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
 pub type IoUringWalWriter = BatchingWalWriter<IoUringSubmitter>;
 
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
 impl BatchingWalWriter<IoUringSubmitter> {
-    /// 打开（不存在则创建）`path`；已有内容长度作为续写起点。
+    /// Open (creating if missing) `path`; the existing content length is the resume point.
     ///
-    /// `queue_depth` 固定 64：单写者按批提交，64 个 SQE 槽位远超
-    /// 「每批一次提交」的需求。
+    /// `queue_depth` is fixed at 64: a single writer commits batch by batch, and 64 SQE slots far
+    /// exceed the 'one submission per batch' need.
     pub fn open(path: impl AsRef<std::path::Path>, sync: SyncPolicy) -> Result<Self> {
         let path = path.as_ref();
         let start = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
@@ -212,21 +212,21 @@ impl BatchingWalWriter<IoUringSubmitter> {
     }
 }
 
-// ------------------------------------- io_uring 在途批流水（v0.5 Stream B）
+// ------------------------------------- io_uring in-flight batch pipeline (v0.5 Stream B)
 
-/// io_uring **在途批流水**提交后端（feature `io-uring`，Linux only，v0.5）。
+/// io_uring **in-flight batch pipeline** commit backend (feature `io-uring`, Linux only, v0.5).
 ///
-/// 与 [`IoUringSubmitter`]（同步阻塞）的差异：`submit_write` 提交 SQE 后
-/// **不等待**完成即返回（多批在途），`submit_fsync`（= 组提交边界）只等待
-/// 当前已提交批的完成事件再 fsync。背压由
-/// [`rti_wal_uring::PipelineConfig`] 配置：在途深度（默认 64）满时返回
-/// [`rti_core::Error::Backpressure`] 或阻塞 reap。
+/// Difference from [`IoUringSubmitter`] (synchronous blocking): `submit_write` returns **without
+/// waiting** for completion after submitting SQEs (multiple batches in flight); `submit_fsync` (= the
+/// group-commit boundary) waits only for the completion events of the currently submitted batches,
+/// then fsyncs. Backpressure is configured via [`rti_wal_uring::PipelineConfig`]: when the in-flight
+/// depth (default 64) is full, it returns [`rti_core::Error::Backpressure`] or blocks in reap.
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
 pub struct IoUringPipelineSubmitter {
     pipe: rti_wal_uring::UringPipeline,
 }
 
-/// 把流水错误映射为引擎错误：背压 → [`rti_core::Error::Backpressure`]。
+/// Map pipeline errors to engine errors: backpressure → [`rti_core::Error::Backpressure`].
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
 fn map_pipe_err(e: rti_wal_uring::PipeError) -> rti_core::Error {
     match e {
@@ -238,15 +238,15 @@ fn map_pipe_err(e: rti_wal_uring::PipeError) -> rti_core::Error {
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
 impl BatchSubmitter for IoUringPipelineSubmitter {
     fn submit_write(&mut self, buf: &[u8], offset: u64) -> Result<()> {
-        debug_assert_eq!(offset, self.pipe.offset(), "WAL 提交偏移必须连续");
-        // 提交即返回（批进入内核在途）；持久化由 submit_fsync 保证，
-        // 满足 BatchSubmitter「完成（至少进入内核）后返回」的合同。
+        debug_assert_eq!(offset, self.pipe.offset(), "WAL commit offsets must be continuous");
+        // submit and return immediately (the batch enters the kernel in flight); durability is guaranteed by
+        // submit_fsync, satisfying BatchSubmitter's 'return once completed (at least inside the kernel)' contract.
         self.pipe.push(buf).map_err(map_pipe_err)?;
         Ok(())
     }
 
     fn submit_fsync(&mut self) -> Result<()> {
-        // 只等当前已提交批（本组）完成 + fsync；不清空环。
+        // wait only for the currently submitted batches (this group) to complete + fsync; the ring is not drained.
         self.pipe.sync().map_err(map_pipe_err)
     }
 
@@ -255,20 +255,20 @@ impl BatchSubmitter for IoUringPipelineSubmitter {
     }
 }
 
-/// io_uring 在途批流水 WAL 写者（feature `io-uring`，Linux only，v0.5）。
+/// io_uring in-flight batch pipeline WAL writer (feature `io-uring`, Linux only, v0.5).
 ///
-/// 打开失败（`io_uring_setup` 被 seccomp 拒绝、内核 < 5.1 等）返回
-/// `Err`；自动后端选择仍用 [`WalWriter::auto`]（保持 v0.2 行为），
-/// 流水后端需显式打开。
+/// Returns `Err` when opening fails (`io_uring_setup` rejected by seccomp, kernel < 5.1, etc.);
+/// automatic backend selection still goes through [`WalWriter::auto`] (preserving v0.2 behavior);
+/// the pipeline backend must be opened explicitly.
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
 pub type IoUringPipelinedWalWriter = BatchingWalWriter<IoUringPipelineSubmitter>;
 
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
 impl BatchingWalWriter<IoUringPipelineSubmitter> {
-    /// 打开（不存在则创建）`path`；已有内容长度作为续写起点。
+    /// Open (creating if missing) `path`; the existing content length is the resume point.
     ///
-    /// `cfg.max_in_flight` 为在途深度上限（默认 64），`cfg.backpressure`
-    /// 为深度满时策略；pending 攒批上限自动对齐槽位大小。
+    /// `cfg.max_in_flight` is the in-flight depth cap (default 64); `cfg.backpressure` is the policy
+    /// when the depth is full; the pending batching cap is automatically aligned to the slot size.
     pub fn open(
         path: impl AsRef<std::path::Path>,
         sync: SyncPolicy,
@@ -281,7 +281,7 @@ impl BatchingWalWriter<IoUringPipelineSubmitter> {
             .with_max_batch_bytes(slot))
     }
 
-    /// 当前在途批数（诊断/测试用）。
+    /// Current number of in-flight batches (diagnostics/tests).
     pub fn in_flight(&self) -> usize {
         self.submitter.pipe.in_flight()
     }
@@ -291,7 +291,7 @@ impl BatchingWalWriter<IoUringPipelineSubmitter> {
 mod tests {
     use super::*;
 
-    /// mock 提交后端：内存"文件"，记录 fsync 次数与提交调用。
+    /// Mock commit backend: an in-memory 'file' that records fsync counts and commit calls.
     struct MockSubmitter {
         file: Vec<u8>,
         fsyncs: usize,
@@ -343,7 +343,7 @@ mod tests {
         Record::new(i, i as i64 * 10, i as f64 + 0.5)
     }
 
-    /// 组提交：interval 内不提交不 fsync；sync_now 一次提交整批。
+    /// Group commit: no commit and no fsync within the interval; sync_now commits the whole batch at once.
     #[test]
     fn group_commit_holds_batch_until_sync() {
         let m = MockSubmitter::new();
@@ -352,19 +352,19 @@ mod tests {
         let first = w.append_batch(&recs).unwrap();
         assert_eq!(first, 0);
         assert_eq!(w.offset(), 100 * FRAME_LEN as u64);
-        assert_eq!(w.pending_bytes(), 100 * FRAME_LEN, "组提交窗口内必须攒批");
+        assert_eq!(w.pending_bytes(), 100 * FRAME_LEN, "must batch within the group-commit window");
         assert_eq!(w.submitter.write_calls, 0);
         assert_eq!(w.submitter.fsyncs, 0);
 
         w.sync_now().unwrap();
-        assert_eq!(w.submitter.write_calls, 1, "整批必须一次提交");
+        assert_eq!(w.submitter.write_calls, 1, "the whole batch must be committed in one call");
         assert_eq!(w.submitter.fsyncs, 1);
         assert_eq!(w.pending_bytes(), 0);
-        assert_eq!(w.submitter.records(), recs, "mock 文件逐帧可解码且一致");
+        assert_eq!(w.submitter.records(), recs, "the mock file must be frame-by-frame decodable and consistent");
         assert_eq!(w.flush_policy(), SyncPolicy::Group { interval_us: 60_000_000 });
     }
 
-    /// Always：每条记录一次提交 + 一次 fsync。
+    /// Always: one commit + one fsync per record.
     #[test]
     fn always_syncs_every_append() {
         let m = MockSubmitter::new();
@@ -377,7 +377,7 @@ mod tests {
         assert_eq!(w.submitter.records(), (0..3).map(rec).collect::<Vec<_>>());
     }
 
-    /// None：不 fsync；pending 达到阈值强制提交（内存有界）。
+    /// None: no fsync; pending is force-committed at the threshold (bounded memory).
     #[test]
     fn none_flushes_on_threshold_without_fsync() {
         let m = MockSubmitter::new();
@@ -387,13 +387,13 @@ mod tests {
             w.append(&rec(i)).unwrap();
         }
         assert_eq!(w.submitter.fsyncs, 0);
-        assert_eq!(w.submitter.write_calls, 2, "每攒够 4 帧提交一次");
+        assert_eq!(w.submitter.write_calls, 2, "commit once per 4 accumulated frames");
         assert_eq!(w.pending_bytes(), 2 * FRAME_LEN);
-        // Drop 尽力 flush 残余
+        // Drop best-effort flushes the remainder
         drop(w);
     }
 
-    /// 批量提交偏移连续；后端错误沿 append 传播（fail-fast）。
+    /// Batch commits have continuous offsets; backend errors propagate through append (fail-fast).
     #[test]
     fn batch_offsets_contiguous_and_errors_propagate() {
         let m = MockSubmitter::new();
@@ -408,7 +408,7 @@ mod tests {
         let mut failing = MockSubmitter::new();
         failing.fail_on_write = true;
         let mut w2 = BatchingWalWriter::with_submitter(failing, SyncPolicy::Always, 0);
-        assert!(w2.append(&rec(0)).is_err(), "后端写失败必须传播");
+        assert!(w2.append(&rec(0)).is_err(), "backend write failures must propagate");
     }
 
     #[test]
@@ -417,16 +417,16 @@ mod tests {
         let mut w = BatchingWalWriter::with_submitter(m, SyncPolicy::None, 7 * FRAME_LEN as u64);
         assert_eq!(w.backend_name(), "mock");
         let off = w.append(&rec(0)).unwrap();
-        assert_eq!(off, 7 * FRAME_LEN as u64, "续写起点必须生效");
+        assert_eq!(off, 7 * FRAME_LEN as u64, "the resume point must take effect");
         w.sync_now().unwrap();
-        // 帧必须落在起始偏移处且可解码
+        // frames must land at the start offset and be decodable
         let s = 7 * FRAME_LEN;
         let frame = super::super::decode_frame(&w.submitter.file[s..s + FRAME_LEN]).unwrap();
         assert_eq!(frame, rec(0));
     }
 }
 
-/// io_uring 真实后端测试（feature on + Linux；ring 不可用时优雅跳过）。
+/// Real io_uring backend tests (feature on + Linux; skipped gracefully when rings are unavailable).
 #[cfg(all(test, feature = "io-uring", target_os = "linux"))]
 mod uring_tests {
     use super::*;
@@ -447,7 +447,7 @@ mod uring_tests {
         d
     }
 
-    /// 真实 ring：append + append_batch + sync，Std 恢复路径读回一致。
+    /// Real ring: append + append_batch + sync, read back identically through the Std recovery path.
     #[test]
     fn uring_writer_roundtrip_via_std_recover() {
         let d = tmpdir("roundtrip");
@@ -479,8 +479,8 @@ mod uring_tests {
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// v0.5 点名：流水下顺序性。多批在途（批数 > 深度）经
-    /// IoUringPipelinedWalWriter 写入，Std 恢复路径读回逐条一致。
+    /// Named by v0.5: ordering under the pipeline. Multiple batches in flight (more batches than the
+    /// depth) written via IoUringPipelinedWalWriter, read back record-by-record identical through the Std recovery path.
     #[test]
     fn pipelined_writer_roundtrip_via_std_recover() {
         let d = tmpdir("pipe-roundtrip");
@@ -499,13 +499,13 @@ mod uring_tests {
                 }
             };
             assert_eq!(w.backend_name(), "io_uring_pipeline");
-            // 256 B 槽位 / 28 B 帧：每槽 9 帧；2000 条 >> 深度 8。
+            // 256 B slots / 28 B frames: 9 frames per slot; 2000 records >> depth 8.
             for i in 0..2000u32 {
                 w.append(&Record::new(i, i as i64 * 7, i as f64 + 0.25)).unwrap();
             }
-            assert!(w.in_flight() > 0, "SyncPolicy::None 下提交后必须有多批在途");
+            assert!(w.in_flight() > 0, "under SyncPolicy::None there must be multiple batches in flight after commit");
             w.sync_now().unwrap();
-            assert_eq!(w.in_flight(), 0, "sync_now 必须等本组全部完成");
+            assert_eq!(w.in_flight(), 0, "sync_now must wait for this whole group to complete");
         }
         let recs: Vec<Record> = Wal::recover(&p).unwrap().collect();
         assert_eq!(recs.len(), 2000);
@@ -517,47 +517,47 @@ mod uring_tests {
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// v0.5 点名：背压触发。Error 策略 + 深度 2：在途满时 append 返回
-    /// Error::Backpressure；sync_now 回收后可继续写且数据完整。
+    /// Named by v0.5: backpressure triggering. Error policy + depth 2: append returns
+    /// Error::Backpressure when in-flight is full; after sync_now reaps, writing continues with data intact.
     #[test]
     fn pipelined_backpressure_surfaces_as_error() {
         let d = tmpdir("pipe-bp");
         let p = d.join("wal.log");
         let cfg = rti_wal_uring::PipelineConfig {
             max_in_flight: 2,
-            slot_bytes: 2 * FRAME_LEN, // 每批 2 帧即触发提交
+            slot_bytes: 2 * FRAME_LEN, // 2 frames per batch trigger a commit
             backpressure: rti_wal_uring::BackpressurePolicy::Error,
         };
         let mut w = match IoUringPipelinedWalWriter::open(&p, SyncPolicy::None, cfg) {
             Ok(w) => w,
-            Err(_) => return, // 环境不支持时优雅跳过
+            Err(_) => return, // skip gracefully when the environment does not support it
         };
-        // 槽位 = 2 帧：append 1/3 各触发一次提交 → 深度 2 占满在途。
+        // slot = 2 frames: appends 1/3 each trigger a commit -> depth 2 fills the in-flight slots.
         for i in 0..5u32 {
             w.append(&Record::new(i, i as i64, 1.0)).unwrap();
         }
         assert_eq!(w.in_flight(), 2);
-        // append 5 使 pending 满 2 帧触发第三次提交：Error 策略不做隐式
-        // reap，确定性触发背压。
+        // append 5 fills pending with 2 frames and triggers a third commit: the Error policy does no
+        // implicit reap, so backpressure fires deterministically.
         let err = w.append(&Record::new(5, 5, 1.0));
         assert!(
             matches!(err, Err(rti_core::Error::Backpressure)),
-            "在途深度满必须返回 Backpressure，实际 {err:?}"
+            "a full in-flight depth must return Backpressure, got {err:?}"
         );
-        // sync_now 回收在途批；被拒批仍在 pending，重试后完整落盘。
+        // sync_now reaps in-flight batches; the rejected batch stays in pending and is fully persisted on retry.
         w.sync_now().unwrap();
         w.append(&Record::new(6, 6, 1.0)).unwrap();
         w.sync_now().unwrap();
         drop(w);
         let recs: Vec<Record> = Wal::recover(&p).unwrap().collect();
-        assert_eq!(recs.len(), 7, "背压拒绝不丢数据：pending 保留可重试");
+        assert_eq!(recs.len(), 7, "backpressure rejection loses no data: pending is kept for retry");
         for (i, r) in recs.iter().enumerate() {
             assert_eq!(r.series, i as u32);
         }
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// v0.5 点名：关闭时全部 drain。不显式 sync_now，Drop 后读回完整。
+    /// Named by v0.5: everything drains on close. No explicit sync_now; read-back is complete after Drop.
     #[test]
     fn pipelined_drop_drains_all_in_flight() {
         let d = tmpdir("pipe-drain");
@@ -575,18 +575,18 @@ mod uring_tests {
             for i in 0..100u32 {
                 w.append(&Record::new(i, i as i64, 2.5)).unwrap();
             }
-            assert!(w.in_flight() > 0, "Drop 前必须仍有在途批");
-        } // Drop：flush pending + drain 全部在途
+            assert!(w.in_flight() > 0, "there must still be in-flight batches before Drop");
+        } // Drop: flush pending + drain all in-flight
         let recs: Vec<Record> = Wal::recover(&p).unwrap().collect();
-        assert_eq!(recs.len(), 100, "Drop 必须 drain 全部在途批");
+        assert_eq!(recs.len(), 100, "Drop must drain all in-flight batches");
         for (i, r) in recs.iter().enumerate() {
             assert_eq!(r.series, i as u32);
         }
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// v0.5：流水后端组提交语义与 v0.2 一致（Group 窗口内攒批，
-    /// sync_now 一次组提交）；续写不覆盖历史帧。
+    /// v0.5: pipeline backend group-commit semantics match v0.2 (batching within the Group window,
+    /// one group commit at sync_now); resuming does not overwrite historical frames.
     #[test]
     fn pipelined_group_commit_and_resume() {
         let d = tmpdir("pipe-group");
@@ -609,8 +609,8 @@ mod uring_tests {
                 Err(_) => return,
             };
             let off = w.append(&Record::new(9, 90, 9.0)).unwrap();
-            assert_eq!(off, 3 * FRAME_LEN as u64, "续写起点必须生效");
-            assert_eq!(w.pending_bytes(), FRAME_LEN, "Group 窗口内必须攒批");
+            assert_eq!(off, 3 * FRAME_LEN as u64, "the resume point must take effect");
+            assert_eq!(w.pending_bytes(), FRAME_LEN, "must batch within the Group window");
             w.sync_now().unwrap();
         }
         let recs: Vec<Record> = Wal::recover(&p).unwrap().collect();
@@ -619,7 +619,7 @@ mod uring_tests {
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// 续写：已有日志长度作为起始偏移，不覆盖历史帧。
+    /// Resume: the existing log length is the start offset; historical frames are not overwritten.
     #[test]
     fn uring_open_resumes_at_existing_length() {
         let d = tmpdir("resume");

@@ -1,18 +1,18 @@
-//! rti-raft：rti-db 的单分片简化 Raft 副本（v0.5）。
+//! rti-raft: a single-shard, simplified Raft replica for rti-db (v0.5).
 //!
-//! 范围（诚实声明）：单分片、内存日志；覆盖 Raft 核心四件事——
-//! 选主（确定性种子的"随机"超时 + PreVote 预投票）、心跳、
-//! 日志复制（AppendEntries 含冲突截断）、多数派提交；v0.5 增加
-//! 快照（InstallSnapshot RPC + 日志压缩）与单步成员变更
-//! （`add_peer`/`remove_peer`，提交生效，一次只变一个）。
+//! Scope (honest disclosure): single shard, in-memory log; covers the four Raft essentials —
+//! leader election (deterministically seeded 'random' timeouts + PreVote), heartbeats,
+//! log replication (AppendEntries with conflict truncation), majority commit; v0.5 adds
+//! snapshots (InstallSnapshot RPC + log compaction) and single-step membership changes
+//! (`add_peer`/`remove_peer`, effective once committed, one at a time).
 //!
-//! - [`Node`]：协议状态机，**时间由调用方以逻辑时钟注入**
-//!   （`tick(now)`），测试用虚拟时钟做到完全确定性；
-//! - [`Transport`]：传输抽象（`send`/`recv`，允许丢包——Raft 天然容忍），
-//!   提供 [`MemoryTransport`]（测试/仿真，支持网络分区）与
-//!   [`TcpTransport`]（loopback/真实部署）；
-//! - [`ReplicatedWal`]：与 rti-wal 的集成点——日志条目即 WAL
-//!   [`Record`] 批次，**多数派确认（commit）后才算 durable**。
+//! - [`Node`]: the protocol state machine — **time is injected by the caller as a logical
+//!   clock** (`tick(now)`); tests use a virtual clock for full determinism;
+//! - [`Transport`]: transport abstraction (`send`/`recv`, packet loss allowed — Raft tolerates
+//!   it naturally), with [`MemoryTransport`] (test/simulation, supports network partitions) and
+//!   [`TcpTransport`] (loopback / real deployment);
+//! - [`ReplicatedWal`]: integration point with rti-wal — a log entry is a batch of WAL
+//!   [`Record`]s, **durable only after majority acknowledgment (commit)**.
 
 #![forbid(unsafe_code)]
 
@@ -27,52 +27,52 @@ pub use transport::{MemoryNetwork, MemoryTransport, TcpTransport};
 use rti_core::{Error, Result};
 use rti_wal::Record;
 
-/// 复制 WAL：[`Node`] 的薄包装，把 Raft 提交语义映射为 WAL 持久性语义。
+/// Replicated WAL: a thin wrapper over [`Node`] mapping Raft commit semantics to WAL durability semantics.
 ///
-/// - [`ReplicatedWal::append_batch`] 向 Leader 提议一批 [`Record`]
-///   （一个 Raft 日志条目 = 一个 WAL Record 批次）；
-/// - 条目被多数派复制后才推进 commit，[`ReplicatedWal::take_durable`]
-///   只返回**已确认 durable** 的 Record——在此之前的记录在多数派
-///   崩溃下可能丢失，调用方不得将其视为崩溃安全。
+/// - [`ReplicatedWal::append_batch`] proposes a batch of [`Record`]s to the Leader
+///   (one Raft log entry = one WAL Record batch);
+/// - commit advances only after the entry is replicated to a majority; [`ReplicatedWal::take_durable`]
+///   returns only Records **confirmed durable** — records before that may be lost under a majority
+///   crash, and callers must not treat them as crash-safe.
 pub struct ReplicatedWal<T: Transport> {
     node: Node<T>,
 }
 
 impl<T: Transport> ReplicatedWal<T> {
-    /// 包装一个 Raft 节点。
+    /// Wrap a Raft node.
     pub fn new(node: Node<T>) -> Self {
         Self { node }
     }
 
-    /// 提议一批记录（仅 Leader；非 Leader 返回 `Err(Error::SeriesFull)`
-    /// 语义的背压信号——调用方应转发给 Leader 或等待选主）。
+    /// Propose a batch of records (Leader only; a non-Leader returns `Err(Error::SeriesFull)`
+    /// as a backpressure signal — the caller should forward to the Leader or wait for an election).
     ///
-    /// 返回条目索引；**返回时不保证 durable**，用
+    /// Returns the entry index; **durability is not guaranteed on return** — use
     /// [`ReplicatedWal::durable_index`] / [`ReplicatedWal::take_durable`]
-    /// 跟踪多数派确认进度。
+    /// to track majority-acknowledgment progress.
     pub fn append_batch(&mut self, records: Vec<Record>) -> Result<u64> {
         self.node.propose(records)
     }
 
-    /// 驱动协议时钟（心跳/选主超时），时间语义由调用方定义（毫秒建议）。
+    /// Drive the protocol clock (heartbeats/election timeouts); time semantics are caller-defined (milliseconds recommended).
     pub fn tick(&mut self, now: u64) {
         self.node.tick(now);
     }
 
-    /// 处理一条收到的协议消息。
+    /// Handle one received protocol message.
     pub fn handle(&mut self, from: NodeId, msg: Msg) {
         self.node.handle(from, msg);
     }
 
-    /// 已确认 durable 的最大日志索引（多数派 commit 水位）。
+    /// Maximum log index confirmed durable (majority commit watermark).
     pub fn durable_index(&self) -> u64 {
         self.node.commit_index()
     }
 
-    /// 取走新确认 durable 的记录（按日志顺序摊平批次）。
+    /// Take newly confirmed-durable records (batches flattened in log order).
     ///
-    /// 成员变更条目（哨兵 series = [`CONF_SERIES`]）对用户数据透明，
-    /// 在此过滤，不会出现在返回流中。
+    /// Membership-change entries (sentinel series = [`CONF_SERIES`]) are transparent to user data
+    /// and filtered here, never appearing in the returned stream.
     pub fn take_durable(&mut self) -> Vec<Record> {
         let entries = self.node.take_committed();
         let n: usize = entries.iter().map(|e| e.records.len()).sum();
@@ -83,28 +83,28 @@ impl<T: Transport> ReplicatedWal<T> {
         out
     }
 
-    /// 本节点是否为 Leader。
+    /// Whether this node is the Leader.
     pub fn is_leader(&self) -> bool {
         self.node.is_leader()
     }
 
-    /// 当前任期。
+    /// Current term.
     pub fn term(&self) -> u64 {
         self.node.term()
     }
 
-    /// 底层节点引用（诊断/测试）。
+    /// Underlying node reference (diagnostics/tests).
     pub fn node(&self) -> &Node<T> {
         &self.node
     }
 
-    /// 底层节点可变引用（驱动/测试）。
+    /// Underlying node mutable reference (driving/tests).
     pub fn node_mut(&mut self) -> &mut Node<T> {
         &mut self.node
     }
 }
 
-/// 非 Leader 提议的错误构造（背压语义，供调用方转发/重试）。
+/// Error constructor for non-Leader proposals (backpressure semantics, for callers to forward/retry).
 pub(crate) fn not_leader_err() -> Error {
     Error::Corrupt("raft: not leader (redirect or wait for election)".into())
 }

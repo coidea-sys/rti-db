@@ -1,26 +1,26 @@
-//! rti-buffer：无锁环形缓冲。
+//! rti-buffer: lock-free ring buffers.
 //!
-//! - [`SpscRing`]：单生产者单消费者，容量为 2 的幂，
-//!   head/tail 分处不同 cache line，避免 false sharing；
-//!   可 [`SpscRing::split`] 为跨线程的 producer/consumer。
-//! - [`MpmcRing`]：Vyukov 有界 MPMC 队列（sequence 数组 + CAS）。
+//! - [`SpscRing`]: single-producer single-consumer, power-of-two capacity;
+//!   head/tail live on separate cache lines to avoid false sharing;
+//!   can be [`SpscRing::split`] into cross-thread producer/consumer endpoints.
+//! - [`MpmcRing`]: Vyukov bounded MPMC queue (sequence array + CAS).
 //!
-//! 这是 SPEC 允许使用 unsafe 的两个 crate 之一；每处 unsafe 均附
-//! `// SAFETY:` 注释。所有缓冲构造时一次分配，热路径零 malloc。
+//! This is one of the two crates where the SPEC permits unsafe code; every unsafe
+//! block carries a `// SAFETY:` comment. All buffers are allocated once at construction; zero malloc on hot paths.
 //!
-//! ## no_std（v0.3）
+//! ## no_std (v0.3)
 //!
-//! 默认 feature `std` 关闭时本 crate 为 `no_std`（`core` + `alloc`）：
-//! [`SpscRing`] / [`MpmcRing`] 的堆分配版本 API 完全一致；另提供
-//! [`SpscRingN`]——存储内联（`[MaybeUninit<T>; N]`，可驻留静态区/
-//! 栈上）、无堆分配的 const-generic SPSC ring。
+//! With the default `std` feature disabled this crate is `no_std` (`core` + `alloc`):
+//! the heap-allocated [`SpscRing`] / [`MpmcRing`] APIs are identical; this crate also
+//! provides [`SpscRingN`] — a const-generic SPSC ring with inline storage
+//! (`[MaybeUninit<T>; N]`, can live in static memory or on the stack) and zero heap allocation.
 
 #![allow(unsafe_code)]
 #![cfg_attr(not(feature = "std"), no_std)]
 
 extern crate alloc;
 
-/// 按 64 字节 cache line 对齐的包装，隔离 head/tail 等热计数器。
+/// Wrapper aligned to a 64-byte cache line, isolating hot counters such as head/tail.
 #[repr(align(64))]
 #[derive(Debug)]
 pub(crate) struct CacheLine<T>(pub T);
@@ -45,7 +45,7 @@ mod tests {
             r.push(i).unwrap();
         }
         assert_eq!(r.len(), 4);
-        assert_eq!(r.push(99), Err(99)); // 满，元素被退回
+        assert_eq!(r.push(99), Err(99)); // full; the element is handed back
         assert_eq!(r.pop(), Some(0));
         assert_eq!(r.pop(), Some(1));
         r.push(10).unwrap();
@@ -55,12 +55,12 @@ mod tests {
         assert_eq!(r.pop(), None);
     }
 
-    /// SPEC §5 点名：ring 回绕测试。
+    /// Named by SPEC §5: ring wrap-around test.
     #[test]
     fn spsc_wraparound() {
         let cap = 8;
         let mut r = SpscRing::with_capacity(cap);
-        // 反复写满再读空，游标多次回绕 storage
+        // repeatedly fill and drain so the cursors wrap around the storage many times
         for round in 0..1000u64 {
             for i in 0..cap as u64 {
                 r.push(round * cap as u64 + i).unwrap();
@@ -154,7 +154,7 @@ mod tests {
             h.join().unwrap();
         }
         let sum: u64 = consumers.into_iter().map(|h| h.join().unwrap()).sum();
-        // 每个生产者产生 0..per，共 producers 份
+        // each producer produces 0..per, `producers` copies in total
         assert_eq!(sum, producers * (per * (per - 1) / 2));
         assert_eq!(q.len(), 0);
     }

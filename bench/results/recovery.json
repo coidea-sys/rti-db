@@ -1,0 +1,35 @@
+[
+  {
+    "lost_points": 65824,
+    "notes": "DONE 后立即 SIGKILL（崩溃窗口=SPSC ring 未出队点（RING_CAP=65536）+ 已出队未组提交点；put 成功≠持久化（异步管线语义，如实记录））；open_ms=110.3 含 WAL 重放，count_ms=31.1",
+    "recovery_ms": 141.4,
+    "system": "rti-db",
+    "variant": "sync=group1ms",
+    "workload": {
+      "n": 500000,
+      "series": 8
+    }
+  },
+  {
+    "lost_points": 0,
+    "notes": "DONE 后立即 SIGKILL；进程崩溃 OS 存活，WAL 页缓存不丢（synchronous=NORMAL 仅 checkpoint 时 fsync）",
+    "recovery_ms": 13.7,
+    "system": "sqlite",
+    "variant": "synchronous=NORMAL,WAL",
+    "workload": {
+      "n": 500000,
+      "series": 8
+    }
+  },
+  {
+    "lost_points": 0,
+    "notes": "全部应答后 SIGKILL 服务端（everysec 崩溃窗口≈1s）；ping_up_ms=1093.7 含 AOF 重放，zcard_ms=0.3",
+    "recovery_ms": 1093.999237,
+    "system": "redis",
+    "variant": "aof-everysec",
+    "workload": {
+      "n": 500000,
+      "series": 8
+    }
+  }
+]

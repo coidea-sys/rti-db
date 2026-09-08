@@ -1,8 +1,8 @@
-//! 协议消息的二进制编解码（小端，无第三方依赖）。
+//! Binary codec for protocol messages (little-endian, no third-party dependencies).
 //!
-//! 帧格式：`len u32` + payload（不含 len 自身）。payload 首字节为
-//! 消息 tag，随后定长字段按声明序、变长字段以 `count u32` 引导。
-//! 解码遇到截断/未知 tag 返回 `None`（Raft 容忍丢包：坏帧即丢）。
+//! Frame format: `len u32` + payload (excluding len itself). The first payload byte is the
+//! message tag, followed by fixed-length fields in declaration order; variable-length fields are led by a `count u32`.
+//! Decoding returns `None` on truncation/unknown tags (Raft tolerates packet loss: bad frames are dropped).
 
 use rti_wal::Record;
 
@@ -54,7 +54,7 @@ impl<'a> Reader<'a> {
         let term = self.u64()?;
         let n = self.u32()? as usize;
         if n > 1 << 20 {
-            return None; // 防御性上限，拒绝畸形帧
+            return None; // defensive upper bound; reject malformed frames
         }
         let mut records = Vec::with_capacity(n.min(1 << 10));
         for _ in 0..n {
@@ -67,7 +67,7 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// 把 `msg` 编码为一帧（`len u32` + payload）追加到 `out`。
+/// Encode `msg` as one frame (`len u32` + payload) appended to `out`.
 pub fn encode_msg(msg: &Msg, out: &mut Vec<u8>) {
     let mut payload = Vec::new();
     match msg {
@@ -127,7 +127,7 @@ pub fn encode_msg(msg: &Msg, out: &mut Vec<u8>) {
     out.extend_from_slice(&payload);
 }
 
-/// 从帧体（payload，不含 len 前缀）解码一条消息；坏帧返回 `None`。
+/// Decode one message from a frame body (payload, without the len prefix); returns `None` for bad frames.
 pub fn decode_payload(buf: &[u8]) -> Option<Msg> {
     let mut r = Reader { buf, pos: 0 };
     let tag = *buf.first()?;
@@ -171,7 +171,7 @@ pub fn decode_payload(buf: &[u8]) -> Option<Msg> {
             let last_included_term = r.u64()?;
             let n = r.u32()? as usize;
             if n > 16 << 20 {
-                return None; // 与帧长上限一致的防御
+                return None; // defense consistent with the frame-length limit
             }
             let state = r.buf.get(r.pos..r.pos + n)?.to_vec();
             let snapshot = Snapshot { last_included_index, last_included_term, state };
@@ -182,15 +182,15 @@ pub fn decode_payload(buf: &[u8]) -> Option<Msg> {
     Some(msg)
 }
 
-/// 尝试从字节流头部切出一帧：成功返回 `(消息, 消费字节数)`，
-/// 数据不足返回 `Ok(None)`，坏帧返回 `Err`。
+/// Try to cut one frame from the head of the byte stream: on success returns `(message, bytes consumed)`,
+/// returns `Ok(None)` when more data is needed, `Err` for bad frames.
 pub fn decode_frame(buf: &[u8]) -> std::result::Result<Option<(Msg, usize)>, ()> {
     if buf.len() < 4 {
         return Ok(None);
     }
     let len = u32::from_le_bytes(buf[0..4].try_into().map_err(|_| ())?) as usize;
     if len > 16 << 20 {
-        return Err(()); // 防御性上限
+        return Err(()); // defensive upper bound
     }
     if buf.len() < 4 + len {
         return Ok(None);
@@ -199,7 +199,7 @@ pub fn decode_frame(buf: &[u8]) -> std::result::Result<Option<(Msg, usize)>, ()>
     Ok(Some((msg, 4 + len)))
 }
 
-/// 单帧便捷解码（含 len 前缀），供测试使用。
+/// Convenience single-frame decode (including the len prefix), for tests.
 pub fn decode_msg(buf: &[u8]) -> Option<Msg> {
     match decode_frame(buf) {
         Ok(Some((m, _))) => Some(m),
@@ -273,7 +273,7 @@ mod tests {
         for m in sample_msgs() {
             encode_msg(&m, &mut buf);
         }
-        // 逐字节喂给 decode_frame，模拟 TCP 流切分
+        // feed decode_frame byte by byte, simulating TCP stream segmentation
         let mut pending: Vec<u8> = Vec::new();
         let mut decoded = Vec::new();
         for b in buf {
@@ -295,7 +295,7 @@ mod tests {
     #[test]
     fn codec_rejects_garbage() {
         assert!(decode_msg(b"").is_none());
-        assert!(decode_msg(&[9, 0, 0, 0, 0xFE]).is_none()); // 未知 tag
-        assert!(decode_msg(&[100, 0, 0, 0, 0x00]).is_none()); // 长度超实际
+        assert!(decode_msg(&[9, 0, 0, 0, 0xFE]).is_none()); // unknown tag
+        assert!(decode_msg(&[100, 0, 0, 0, 0x00]).is_none()); // length exceeds the actual data
     }
 }

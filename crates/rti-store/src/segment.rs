@@ -1,20 +1,20 @@
-//! Segment：不可变列式存储文件（一个 segment 存一条序列的一段有序数据）。
+//! Segment: immutable columnar storage file (one segment stores one ordered run of one series).
 //!
-//! 文件格式（小端）：
+//! File format (little-endian):
 //!
 //! ```text
 //! ┌─────────────┬─────────┬────────┬──────────────────────────┐
 //! │ magic 8B    │ series  │ count  │ zone map: min_ts, max_ts │
-//! │ "RTISEG01"  │ u32     │ u64    │ min_val, max_val (各 8B) │
+//! │ "RTISEG01"  │ u32     │ u64    │ min_val, max_val (8B each) │
 //! ├─────────────┴─────────┴────────┴──────────────────────────┤
-//! │ ts_len u64 │ ts 列 (delta-of-delta + varint)              │
-//! │ val_len u64│ val 列 (XOR float)                          │
-//! │ crc32 u32  │ 覆盖 magic 之后、crc 之前的全部字节         │
+//! │ ts_len u64 │ ts column (delta-of-delta + varint)             │
+//! │ val_len u64│ val column (XOR float)                         │
+//! │ crc32 u32  │ covers all bytes after magic and before crc    │
 //! └────────────────────────────────────────────────────────────┘
 //! ```
 //!
-//! 读路径：打开时一次预读入内存（预读缓冲代替 mmap，见 SPEC §1 回退条款），
-//! zone map 用于跳过无关 segment；解码迭代器流式产出，逐点零分配。
+//! Read path: the whole file is pre-read into memory at open (a pre-read buffer instead of mmap,
+//! see the SPEC §1 fallback clause); the zone map skips irrelevant segments; the decode iterator streams point by point with zero allocation.
 
 use std::fs;
 use std::path::Path;
@@ -23,28 +23,28 @@ use rti_core::{Error, Result, Sample, SeriesId, Timestamp};
 
 use crate::encode::{self, TsDecoder, ValDecoder};
 
-/// segment 文件魔数。
+/// Segment file magic.
 pub const MAGIC: &[u8; 8] = b"RTISEG01";
-/// 固定头部长度：magic(8) + series(4) + count(8) + zone(32)。
+/// Fixed header length: magic(8) + series(4) + count(8) + zone(32).
 const HEADER_LEN: usize = 60;
 
-/// 段级 zone map：min/max 索引，用于读路径跳过与谓词下推。
+/// Segment-level zone map: min/max index for read-path skipping and predicate pushdown.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ZoneMap {
-    /// 最小时间戳。
+    /// Minimum timestamp.
     pub min_ts: Timestamp,
-    /// 最大时间戳。
+    /// Maximum timestamp.
     pub max_ts: Timestamp,
-    /// 最小值。
+    /// Minimum value.
     pub min_val: f64,
-    /// 最大值。
+    /// Maximum value.
     pub max_val: f64,
-    /// 采样点数。
+    /// Number of samples.
     pub count: u64,
 }
 
 impl ZoneMap {
-    /// 从有序样本构建 zone map。
+    /// Build a zone map from ordered samples.
     pub fn from_samples(samples: &[Sample]) -> Option<Self> {
         let first = samples.first()?;
         let mut zm = ZoneMap {
@@ -63,38 +63,38 @@ impl ZoneMap {
         Some(zm)
     }
 
-    /// 时间段 `[t0, t1]` 是否可能与本段相交。
+    /// Whether the time range `[t0, t1]` could intersect this segment.
     pub fn overlaps(&self, t0: Timestamp, t1: Timestamp) -> bool {
         self.max_ts >= t0 && self.min_ts <= t1
     }
 
-    /// 值域谓词（`f(min,max) == false` 表示必然无匹配）是否可能命中。
+    /// Whether a value-range predicate (`f(min,max) == false` means definitely no match) could hit.
     pub fn value_may_match(&self, f: impl Fn(f64, f64) -> bool) -> bool {
         f(self.min_val, self.max_val)
     }
 }
 
-/// Segment 写入器：把一条序列的有序样本编码为列式文件。
+/// Segment writer: encodes one series' ordered samples into a columnar file.
 pub struct SegmentWriter;
 
 impl SegmentWriter {
-    /// 将 `samples`（按 ts 排序）写入 `path`，返回 zone map。
+    /// Write `samples` (sorted by ts) to `path`, returning the zone map.
     ///
-    /// 先写临时文件再 rename，保证崩溃时不会出现半个 segment。
+    /// Writes a temporary file first and then renames, so a crash never leaves half a segment.
     ///
-    /// v0.6：rename 前对临时文件 `sync_data`、rename 后 fsync 目录——
-    /// rti-db 的 WAL checkpoint 依赖「segment 落盘成功 ⇒ 数据已持久」，
-    /// 否则截断 WAL 后崩溃可能丢数据。
+    /// v0.6: `sync_data` the temporary file before rename and fsync the directory after —
+    /// rti-db's WAL checkpoint relies on 'segment write succeeded ⇒ data is durable';
+    /// otherwise a crash after truncating the WAL could lose data.
     ///
-    /// [`SyncPolicy::None`](rti_core::SyncPolicy) 的调用方应使用
-    /// [`SegmentWriter::write_unsynced`]（v0.5 行为，全程无 fsync）。
+    /// Callers on [`SyncPolicy::None`](rti_core::SyncPolicy) should use
+    /// [`SegmentWriter::write_unsynced`] (v0.5 behavior, no fsync at all).
     pub fn write(path: impl AsRef<Path>, series: SeriesId, samples: &[Sample]) -> Result<ZoneMap> {
         Self::write_impl(path, series, samples, true)
     }
 
-    /// 不 fsync 的 segment 写入（v0.5 行为）：进程崩溃（kill -9）安全
-    /// （页缓存仍在），机器掉电不保证——仅供 `SyncPolicy::None`
-    /// （语义即「不刷盘」）的 seal 路径使用，避免为不要求的持久性付费。
+    /// Segment write without fsync (v0.5 behavior): safe against process crashes (kill -9)
+    /// (the page cache survives), but not against machine power loss — only for seal paths on
+    /// `SyncPolicy::None` (semantically 'no flushing'), avoiding paying for durability that was never requested.
     pub fn write_unsynced(path: impl AsRef<Path>, series: SeriesId, samples: &[Sample]) -> Result<ZoneMap> {
         Self::write_impl(path, series, samples, false)
     }
@@ -143,25 +143,25 @@ impl SegmentWriter {
     }
 }
 
-/// Segment 读取器：预读整文件，按 zone map 跳过，流式解码。
+/// Segment reader: pre-reads the whole file, skips via the zone map, decodes streaming.
 pub struct SegmentReader {
     series: SeriesId,
     zone: ZoneMap,
-    /// 整个文件内容（预读缓冲）。
+    /// Entire file contents (pre-read buffer).
     buf: Vec<u8>,
     ts_range: (usize, usize),
     val_range: (usize, usize),
 }
 
 impl SegmentReader {
-    /// 打开并校验一个 segment 文件。
+    /// Open and validate a segment file.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::from_bytes(fs::read(path)?)
     }
 
-    /// 从内存字节构造（v0.4：冷分层透明读回路径）。
+    /// Construct from in-memory bytes (v0.4: cold-tier transparent read-back path).
     ///
-    /// 校验逻辑与 [`SegmentReader::open`] 完全一致。
+    /// Validation logic is identical to [`SegmentReader::open`].
     pub fn from_bytes(buf: Vec<u8>) -> Result<Self> {
         if buf.len() < HEADER_LEN + 4 || &buf[0..8] != MAGIC {
             return Err(Error::Corrupt("bad segment magic/len".into()));
@@ -208,22 +208,22 @@ impl SegmentReader {
         })
     }
 
-    /// 本段的序列 id。
+    /// This segment's series id.
     pub fn series(&self) -> SeriesId {
         self.series
     }
 
-    /// 本段的 zone map。
+    /// This segment's zone map.
     pub fn zone_map(&self) -> ZoneMap {
         self.zone
     }
 
-    /// 时间段 `[t0,t1]` 是否可能相交（zone map 跳过）。
+    /// Whether the time range `[t0,t1]` could intersect (zone-map skip).
     pub fn may_overlap(&self, t0: Timestamp, t1: Timestamp) -> bool {
         self.zone.overlaps(t0, t1)
     }
 
-    /// 全段流式解码迭代器（零拷贝：直接读预读缓冲，逐点产出）。
+    /// Whole-segment streaming decode iterator (zero-copy: reads the pre-read buffer directly, point by point).
     pub fn iter(&self) -> Result<DecodeIter<'_>> {
         DecodeIter::new(
             &self.buf[self.ts_range.0..self.ts_range.1],
@@ -232,8 +232,8 @@ impl SegmentReader {
         )
     }
 
-    /// 谓词下推到 decode 层：收集 `[t0,t1]` 内满足 `pred` 的样本，
-    /// 不满足谓词的点在解码循环内直接丢弃、不物化。
+    /// Predicate pushed down to the decode layer: collects samples in `[t0,t1]` satisfying `pred`;
+    /// non-matching points are dropped inside the decode loop, never materialized.
     pub fn collect_range(
         &self,
         t0: Timestamp,
@@ -259,7 +259,7 @@ impl SegmentReader {
     }
 }
 
-/// 段解码迭代器：时间戳列与值列双游标同步推进。
+/// Segment decode iterator: timestamp-column and value-column cursors advance in lockstep.
 pub struct DecodeIter<'a> {
     ts: Option<TsDecoder<'a>>,
     val: Option<ValDecoder<'a>>,
@@ -319,7 +319,7 @@ mod tests {
             .collect()
     }
 
-    /// SPEC §5 点名：压缩往返一致性测试。
+    /// Named by SPEC §5: compression round-trip consistency test.
     #[test]
     fn segment_compression_roundtrip() {
         let d = tmpdir("roundtrip");
@@ -333,9 +333,9 @@ mod tests {
         assert_eq!(got.len(), want.len());
         for (g, w) in got.iter().zip(want.iter()) {
             assert_eq!(g.ts, w.ts);
-            assert_eq!(g.value.to_bits(), w.value.to_bits(), "float 必须 bit-exact");
+            assert_eq!(g.value.to_bits(), w.value.to_bits(), "floats must be bit-exact");
         }
-        // 压缩率检查
+        // compression-ratio check
         let raw = want.len() * 16;
         let file = std::fs::metadata(&p).unwrap().len() as usize;
         assert!(file < raw, "file {} should beat raw {}", file, raw);
@@ -350,7 +350,7 @@ mod tests {
         let zm = SegmentWriter::write(&p, 3, &s).unwrap();
         let r = SegmentReader::open(&p).unwrap();
         assert_eq!(r.zone_map(), zm);
-        assert!(!r.may_overlap(0, 999_999), "不重叠区间必须被 zone map 跳过");
+        assert!(!r.may_overlap(0, 999_999), "non-overlapping ranges must be skipped by the zone map");
         assert!(r.may_overlap(1_500_000, 1_600_000));
 
         let mut out = Vec::new();
@@ -358,7 +358,7 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].ts, 1_500_000);
 
-        // 值谓词下推：只收集 value > 21.0 的点
+        // value predicate pushdown: collect only points with value > 21.0
         out.clear();
         let pred = |v: f64| v > 21.0;
         r.collect_range(1_000_000, 2_000_000, Some(&pred), &mut out).unwrap();
@@ -375,7 +375,7 @@ mod tests {
         SegmentWriter::write(&p, 1, &samples(10)).unwrap();
         let mut bytes = std::fs::read(&p).unwrap();
         let n = bytes.len();
-        bytes[n - 10] ^= 0xFF; // 破坏数据区
+        bytes[n - 10] ^= 0xFF; // corrupt the data region
         std::fs::write(&p, bytes).unwrap();
         assert!(matches!(SegmentReader::open(&p), Err(Error::Corrupt(_))));
         std::fs::remove_dir_all(&d).ok();

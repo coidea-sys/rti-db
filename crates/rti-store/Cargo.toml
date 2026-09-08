@@ -1,12 +1,13 @@
 [package]
 name = "rti-store"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "rti-db columnar storage: MemTable, Segments, zone maps, Gorilla-style compression"
 
 [features]
-# S3 冷层骨架（SigV4 签名；零新增依赖，纯 safe 自实现 SHA-256/HMAC）。
+# S3 cold tier (SigV4 signing; zero new dependencies, pure-safe in-house SHA-256/HMAC).
 s3 = []
 
 [dependencies]

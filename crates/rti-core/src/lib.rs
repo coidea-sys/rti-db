@@ -1,19 +1,19 @@
-//! rti-core：rti-db 的基础类型、错误、时间与配置。
+//! rti-core: fundamental types, errors, time, and configuration for rti-db.
 //!
-//! 本 crate 不包含任何 unsafe 代码，也不做任何堆上的隐式魔法：
-//! 所有类型都是 `Copy` 或显式拥有所有权的小结构，供上层 crate 在
-//! 硬实时热路径上自由传递。
+//! This crate contains no unsafe code and performs no hidden heap magic:
+//! every type is `Copy` or a small explicitly-owned struct that upper-layer
+//! crates can pass around freely on hard-real-time hot paths.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(not(feature = "std"), no_std)]
 
-//! ## no_std（v0.3）
+//! ## no_std (v0.3)
 //!
-//! 默认 feature `std` 关闭时本 crate 为 `no_std`（仅依赖 `core` + `alloc`）：
-//! - [`Error`] 的 `Io` 变体与 `std::error::Error` 实现仅在 `std` 下存在；
-//! - [`Config`]（含 `PathBuf`）仅在 `std` 下存在；
-//! - 其余类型（[`Sample`] / [`SyncPolicy`] / [`Profile`] / [`Mirror`] /
-//!   [`TsAligner`] 等）在两种模式下完全一致。
+//! With the default `std` feature disabled this crate is `no_std` (depends only on `core` + `alloc`):
+//! - the `Io` variant of [`Error`] and the `std::error::Error` impl exist only under `std`;
+//! - [`Config`] (which contains a `PathBuf`) exists only under `std`;
+//! - all other types ([`Sample`] / [`SyncPolicy`] / [`Profile`] / [`Mirror`] /
+//!   [`TsAligner`], etc.) are identical in both modes.
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -29,39 +29,39 @@ use std::path::PathBuf;
 
 use core::net::SocketAddr;
 
-/// 序列（时间序列/事件流）标识。
+/// Series (time-series / event stream) identifier.
 pub type SeriesId = u32;
 
-/// 时间戳，纳秒，单调时钟域由调用方保证。
+/// Timestamp in nanoseconds; the monotonic clock domain is guaranteed by the caller.
 pub type Timestamp = i64;
 
-/// 单个采样点：时间戳 + f64 值，16 字节，`Copy`。
+/// A single sample point: timestamp + f64 value, 16 bytes, `Copy`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Sample {
-    /// 纳秒时间戳。
+    /// Nanosecond timestamp.
     pub ts: Timestamp,
-    /// 采样值。
+    /// Sample value.
     pub value: f64,
 }
 
 impl Sample {
-    /// 构造一个采样点。
+    /// Construct a sample point.
     pub fn new(ts: Timestamp, value: f64) -> Self {
         Self { ts, value }
     }
 }
 
-/// WAL / 存储的同步（持久化）策略。
+/// Sync (durability) policy for the WAL / storage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SyncPolicy {
-    /// 每次 append 都 `sync_data`（最低时延抖动上界明确，吞吐最低）。
+    /// `sync_data` on every append (tightest latency-jitter bound, lowest throughput).
     Always,
-    /// 组提交：距上次 sync 超过 `interval_us` 微秒时才刷盘。
+    /// Group commit: flush only when more than `interval_us` microseconds have elapsed since the last sync.
     Group {
-        /// 组提交间隔（微秒）。
+        /// Group-commit interval in microseconds.
         interval_us: u32,
     },
-    /// 不主动刷盘，交给 OS 页缓存（吞吐最高，崩溃窗口最大）。
+    /// No explicit flushing; rely on the OS page cache (highest throughput, largest crash window).
     None,
 }
 
@@ -71,62 +71,62 @@ impl Default for SyncPolicy {
     }
 }
 
-/// 运行配置档（v0.3）。
+/// Runtime configuration profile (v0.3).
 ///
-/// - [`Profile::Balanced`]：v0.1/v0.2 语义——WAL + segment 落盘，
-///   MemTable 满则 seal；
-/// - [`Profile::Deterministic`]：确定性档——强制 [`SyncPolicy::None`]、
-///   纯内存运行（WAL/segment 落盘禁用，`data_dir` 可为 `None` 且即使
-///   为 `Some` 也绝不触碰文件系统）、MemTable 满按 LRU 丢弃最老序列
-///   并计数（见 `Db::lru_evictions`），可挂接 [`Mirror`] UDP 镜像。
+/// - [`Profile::Balanced`]: v0.1/v0.2 semantics — WAL + segment persistence;
+///   the MemTable is sealed when full.
+/// - [`Profile::Deterministic`]: deterministic profile — forces [`SyncPolicy::None`],
+///   runs purely in memory (WAL/segment persistence disabled; `data_dir` may be `None`,
+///   and even when it is `Some` the file system is never touched); when the MemTable is full the oldest
+///   series is evicted by LRU and counted (see `Db::lru_evictions`); an optional [`Mirror`] UDP mirror can be attached.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Profile {
-    /// 默认档：持久化 + 平衡时延。
+    /// Default profile: persistence + balanced latency.
     #[default]
     Balanced,
-    /// 确定性档：纯内存、LRU 丢弃、可选镜像。
+    /// Deterministic profile: pure in-memory, LRU eviction, optional mirroring.
     Deterministic,
 }
 
-/// UDP 镜像配置（v0.3，best-effort）。
+/// UDP mirror configuration (v0.3, best-effort).
 ///
-/// `put` 入队成功的同时向 `addr` 发送一条 20 字节小端数据报
-/// （`series u32 | ts i64 | value bits u64`）。非阻塞 socket：
-/// 发送失败只计数（`Db::mirror_stats`），不重试、不阻塞热路径。
+/// On every successful `put` enqueue, send one 20-byte little-endian datagram
+/// (`series u32 | ts i64 | value bits u64`) to `addr`. Non-blocking socket:
+/// send failures are only counted (`Db::mirror_stats`); never retried, never blocking the hot path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Mirror {
-    /// 镜像接收端地址。
+    /// Mirror receiver address.
     pub addr: SocketAddr,
 }
 
 impl Mirror {
-    /// 构造镜像配置。
+    /// Construct a mirror configuration.
     pub fn new(addr: SocketAddr) -> Self {
         Self { addr }
     }
 }
 
-/// 引擎配置。所有缓冲均按此预分配。
+/// Engine configuration. All buffers are pre-allocated according to it.
 ///
-/// 仅 `std` feature 下存在（`PathBuf` 依赖 std）。
+/// Exists only under the `std` feature (`PathBuf` requires std).
 #[cfg(feature = "std")]
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// 数据目录（WAL 与 segment 文件所在）。
+    /// Data directory (where WAL and segment files live).
     ///
-    /// v0.3 起为 `Option`：`Profile::Deterministic` 下可为 `None`
-    /// （纯内存运行）；`Profile::Balanced` 下必须为 `Some`。
+    /// `Option` since v0.3: may be `None` under `Profile::Deterministic`
+    /// (pure in-memory operation); must be `Some` under `Profile::Balanced`.
     pub data_dir: Option<PathBuf>,
-    /// MemTable 最大采样点数，达到后 seal 落盘为 segment
-    /// （Deterministic 档改为 LRU 丢弃）。
+    /// Maximum number of samples in the MemTable; on reaching it, seal to disk as a segment
+    /// (the Deterministic profile evicts by LRU instead).
     pub memtable_max: usize,
-    /// WAL 同步策略（Deterministic 档强制为 [`SyncPolicy::None`]）。
+    /// WAL sync policy (forced to [`SyncPolicy::None`] under the Deterministic profile).
     pub wal_sync: SyncPolicy,
-    /// rti-mem 内存池预分配字节数。
+    /// Number of bytes to pre-allocate for the rti-mem memory pool.
     pub pool_bytes: usize,
-    /// 运行配置档。
+    /// Runtime configuration profile.
     pub profile: Profile,
-    /// 可选 UDP 镜像。
+    /// Optional UDP mirror.
     pub mirror: Option<Mirror>,
 }
 
@@ -146,8 +146,8 @@ impl Default for Config {
 
 #[cfg(feature = "std")]
 impl Config {
-    /// 确定性档便捷构造：纯内存（`data_dir = None`）、LRU 丢弃、
-    /// 无镜像（可再设 `mirror` 字段）。
+    /// Convenience constructor for the deterministic profile: pure in-memory (`data_dir = None`),
+    /// LRU eviction, no mirror (set the `mirror` field afterwards if needed).
     pub fn deterministic() -> Self {
         Self {
             data_dir: None,
@@ -158,30 +158,30 @@ impl Config {
     }
 }
 
-/// 引擎统一错误类型。
+/// Unified engine error type.
 #[derive(Debug)]
 pub enum Error {
-    /// 序列/缓冲已满，写入被拒绝（背压信号，调用方可重试）。
+    /// Series/buffer is full and the write was rejected (backpressure signal; the caller may retry).
     SeriesFull,
-    /// WAL 在 `offset` 处 CRC 校验失败或帧不完整；恢复时应在此截断。
+    /// WAL CRC check failed or frame incomplete at `offset`; recovery should truncate here.
     WalCorrupt {
-        /// 损坏发生的字节偏移。
+        /// Byte offset where the corruption occurred.
         offset: u64,
     },
-    /// 底层 I/O 错误（仅 `std` feature）。
+    /// Underlying I/O error (`std` feature only).
     #[cfg(feature = "std")]
     Io(std::io::Error),
-    /// 请求的序列或 segment 不存在。
+    /// The requested series or segment does not exist.
     NotFound,
-    /// 协议解析错误（rti-net 行协议）。
+    /// Protocol parse error (rti-net line protocol).
     Protocol(String),
-    /// 数据格式错误（segment 头部、压缩流损坏等）。
+    /// Data format error (segment header, corrupted compressed stream, etc.).
     Corrupt(String),
-    /// 在途流水深度已满，写入被拒绝（背压信号，调用方可稍后重试；
-    /// v0.5 io_uring 在途批流水 `BackpressurePolicy::Error` 下产生）。
+    /// In-flight pipeline depth is full and the write was rejected (backpressure signal; the caller
+    /// may retry later; produced under `BackpressurePolicy::Error` of the v0.5 io_uring in-flight batch pipeline).
     Backpressure,
-    /// 等待持久化确认超时（v0.6 `put_durable`）。**数据未丢失**——
-    /// 记录仍在 ingest 管线中，稍后将持久化；调用方可重查水位或重试等待。
+    /// Timed out waiting for durability acknowledgment (v0.6 `put_durable`). **No data was lost** —
+    /// the record is still in the ingest pipeline and will be persisted shortly; the caller may re-check the watermark or retry the wait.
     Timeout,
 }
 
@@ -218,7 +218,7 @@ impl From<std::io::Error> for Error {
     }
 }
 
-/// 引擎结果别名。
+/// Engine result alias.
 pub type Result<T> = core::result::Result<T, Error>;
 
 #[cfg(test)]
@@ -260,8 +260,8 @@ mod tests {
     fn deterministic_config_is_in_memory() {
         let c = Config::deterministic();
         assert_eq!(c.profile, Profile::Deterministic);
-        assert_eq!(c.wal_sync, SyncPolicy::None, "确定性档强制 SyncPolicy::None");
-        assert!(c.data_dir.is_none(), "确定性档默认纯内存");
+        assert_eq!(c.wal_sync, SyncPolicy::None, "Deterministic profile forces SyncPolicy::None");
+        assert!(c.data_dir.is_none(), "Deterministic profile defaults to pure in-memory");
         assert!(c.mirror.is_none());
     }
 

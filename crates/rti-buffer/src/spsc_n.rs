@@ -1,86 +1,86 @@
-//! const-generic SPSC ring（v0.3，no_std 友好）：存储内联在结构体内。
+//! const-generic SPSC ring (v0.3, no_std friendly): storage is inline in the struct.
 //!
-//! 与堆分配版 [`crate::SpscRing`] 的区别：
-//! - 存储为 `[MaybeUninit<T>; N]`，**零堆分配**——可放在静态区、
-//!   栈上或调用方提供的任何内存中（no_std 下容量由调用方承担）；
-//! - 单线程句柄（`&mut self` 方法），游标为普通 `usize`，无原子操作；
-//!   适合嵌入式单核/中断-主循环这类天然 SPSC 场景。
+//! Differences from the heap-allocated [`crate::SpscRing`]:
+//! - storage is `[MaybeUninit<T>; N]`, **zero heap allocation** — it can live in static
+//!   memory, on the stack, or in any caller-provided memory (under no_std the caller provides the capacity);
+//! - single-threaded handle (`&mut self` methods) with plain `usize` cursors and no atomics;
+//!   ideal for naturally-SPSC scenarios such as embedded single-core / interrupt-vs-main-loop designs.
 
 use core::mem::MaybeUninit;
 
-/// 存储内联的 SPSC ring，容量 `N` 必须是 2 的幂且 ≥ 2。
+/// SPSC ring with inline storage; capacity `N` must be a power of two and >= 2.
 ///
-/// `push`/`pop`/`len` 均为 O(1)、无系统调用、无堆分配。
+/// `push`/`pop`/`len` are all O(1), with no syscalls and no heap allocation.
 pub struct SpscRingN<T, const N: usize> {
     buf: [MaybeUninit<T>; N],
-    /// 消费者游标（单调递增，回绕靠掩码）。
+    /// Consumer cursor (monotonically increasing, wrapping via mask).
     head: usize,
-    /// 生产者游标。
+    /// Producer cursor.
     tail: usize,
 }
 
 impl<T, const N: usize> SpscRingN<T, N> {
-    /// 创建空 ring。
+    /// Create an empty ring.
     ///
     /// # Panics
-    /// `N < 2` 或 `N` 不是 2 的幂时 panic（构造期一次性检查）。
+    /// Panics when `N < 2` or `N` is not a power of two (one-time check at construction).
     pub fn new() -> Self {
-        assert!(N >= 2 && N.is_power_of_two(), "SpscRingN: N 必须是 >=2 的 2 的幂");
+        assert!(N >= 2 && N.is_power_of_two(), "SpscRingN: N must be a power of two >= 2");
         Self {
-            // from_fn 逐项构造，MaybeUninit 无需初始化。
+            // from_fn constructs element by element; MaybeUninit needs no initialization.
             buf: core::array::from_fn(|_| MaybeUninit::uninit()),
             head: 0,
             tail: 0,
         }
     }
 
-    /// 容量（= N）。
+    /// Capacity (= N).
     #[inline]
     pub const fn capacity(&self) -> usize {
         N
     }
 
-    /// 当前元素个数。
+    /// Current number of elements.
     #[inline]
     pub fn len(&self) -> usize {
         self.tail.wrapping_sub(self.head)
     }
 
-    /// 是否为空。
+    /// Whether the ring is empty.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// 是否已满。
+    /// Whether the ring is full.
     #[inline]
     pub fn is_full(&self) -> bool {
         self.len() >= N
     }
 
-    /// 写入一个元素；ring 满则原样退回（背压）。
+    /// Write one element; handed back unchanged when the ring is full (backpressure).
     #[inline]
     pub fn push(&mut self, v: T) -> Result<(), T> {
         if self.is_full() {
             return Err(v);
         }
         let idx = self.tail & (N - 1);
-        // SAFETY: 满检查保证槽位 idx 当前无未读数据；单线程 &mut self
-        // 保证无并发访问；idx < N 恒成立（掩码）。
+        // SAFETY: the fullness check guarantees slot idx currently holds no unread data;
+        // single-threaded &mut self guarantees no concurrent access; idx < N always holds (mask).
         unsafe { self.buf[idx].as_mut_ptr().write(v) };
         self.tail = self.tail.wrapping_add(1);
         Ok(())
     }
 
-    /// 读出一个元素；空返回 `None`。
+    /// Read one element; returns `None` when empty.
     #[inline]
     pub fn pop(&mut self) -> Option<T> {
         if self.is_empty() {
             return None;
         }
         let idx = self.head & (N - 1);
-        // SAFETY: 空检查保证槽位 idx 存有已写入且未消费的数据；
-        // 单线程 &mut self 保证无并发访问；读出即取走所有权。
+        // SAFETY: the emptiness check guarantees slot idx holds written-but-unconsumed data;
+        // single-threaded &mut self guarantees no concurrent access; reading it out takes ownership.
         let v = unsafe { self.buf[idx].as_ptr().read() };
         self.head = self.head.wrapping_add(1);
         Some(v)
@@ -95,11 +95,11 @@ impl<T, const N: usize> Default for SpscRingN<T, N> {
 
 impl<T, const N: usize> Drop for SpscRingN<T, N> {
     fn drop(&mut self) {
-        // 析构仍留在 ring 中的元素
+        // drop the elements still left in the ring
         let mut h = self.head;
         while h != self.tail {
-            // SAFETY: [head, tail) 区间内的槽位均存有已初始化的 T；
-            // 此处为最后一次访问（Drop），逐个读走即析构。
+            // SAFETY: slots in [head, tail) all hold initialized T; this is the last access
+            // (Drop): reading each one out drops it.
             unsafe { self.buf[h & (N - 1)].as_mut_ptr().drop_in_place() };
             h = h.wrapping_add(1);
         }
@@ -120,22 +120,22 @@ mod tests {
             r.push(i).unwrap();
         }
         assert!(r.is_full());
-        assert_eq!(r.push(99), Err(99), "满必须背压退回");
+        assert_eq!(r.push(99), Err(99), "a full ring must push the element back (backpressure)");
         for i in 0..8 {
-            assert_eq!(r.pop(), Some(i), "必须 FIFO");
+            assert_eq!(r.pop(), Some(i), "must be FIFO");
         }
         assert!(r.is_empty());
         assert_eq!(r.pop(), None);
     }
 
-    /// 回绕测试：多轮填满-掏空后游标回绕仍正确。
+    /// Wrap-around test: cursors stay correct after many fill-drain rounds.
     #[test]
     fn wraparound_preserves_order() {
         let mut r = SpscRingN::<u64, 4>::new();
         let mut next_in = 0u64;
         let mut next_out = 0u64;
         for _ in 0..10_000 {
-            // 随机深度的填/掏混合
+            // mixed fill/drain at random depths
             while r.push(next_in).is_ok() {
                 next_in += 1;
             }
@@ -150,7 +150,7 @@ mod tests {
         assert_eq!(next_in, next_out);
     }
 
-    /// Drop 必须恰好析构遗留元素一次。
+    /// Drop must drop leftover elements exactly once.
     #[test]
     fn drop_runs_element_destructors_once() {
         let drops = Arc::new(AtomicUsize::new(0));
@@ -166,9 +166,9 @@ mod tests {
             for _ in 0..5 {
                 r.push(Guard(Arc::clone(&drops))).unwrap();
             }
-            r.pop(); // 消费 1 个（立即析构）
+            r.pop(); // consume 1 (dropped immediately)
         }
-        assert_eq!(drops.load(Ordering::SeqCst), 5, "5 个元素各析构一次");
+        assert_eq!(drops.load(Ordering::SeqCst), 5, "each of the 5 elements is dropped exactly once");
     }
 
     #[test]

@@ -1,0 +1,19 @@
+[package]
+name = "bench-harness"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rti-db = { path = "../crates/rti-db" }
+rti-core = { path = "../crates/rti-core" }
+rti-query = { path = "../crates/rti-query" }
+hdrhistogram = "7"
+redis = "0.27"
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+debug = false
+lto = false

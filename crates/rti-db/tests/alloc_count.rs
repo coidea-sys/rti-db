@@ -1,7 +1,7 @@
-//! v0.3 热路径分配计数验证（feature `alloc-count`，独立测试二进制）。
+//! v0.3 hot-path allocation counting verification (feature `alloc-count`, standalone test binary).
 //!
-//! 用全局计数分配器验证：**Deterministic 档稳态 put 热路径 0 堆分配增长**。
-//! 独立二进制保证单测试进程，计数不受其他测试干扰。
+//! Uses a global counting allocator to verify: **zero heap-allocation growth on the Deterministic steady-state put hot path**.
+//! A standalone binary guarantees a single test process, so counts are not disturbed by other tests.
 
 #![cfg(feature = "alloc-count")]
 
@@ -15,7 +15,7 @@ fn put_retry(db: &Db, series: u32, s: Sample) {
     loop {
         match db.put(series, s) {
             Ok(()) => return,
-            Err(Error::SeriesFull) => std::thread::yield_now(), // 背压重试
+            Err(Error::SeriesFull) => std::thread::yield_now(), // backpressure retry
             Err(e) => panic!("put failed: {e}"),
         }
     }
@@ -24,13 +24,13 @@ fn put_retry(db: &Db, series: u32, s: Sample) {
 #[test]
 fn deterministic_put_steady_state_zero_alloc_growth() {
     let mut cfg = Config::deterministic();
-    // 容量足够大：预热 + 测量窗口内不触发 LRU 丢弃、序列 Vec 不再扩容。
+    // capacity large enough: no LRU eviction during warmup + measurement window, series Vecs no longer grow.
     cfg.memtable_max = 1 << 20;
     let db = Db::open(cfg).unwrap();
 
     const SERIES: i64 = 4;
-    // 预热 600k：ring 流水 / ingest 批缓冲 / 序列 Vec 容量全部进入稳态
-    // （每序列 150k 样本 → Vec 容量 262144，测量只再加 50k）。
+    // warmup 600k: ring pipeline / ingest batch buffers / series Vec capacities all reach steady state
+    // (150k samples per series -> Vec capacity 262144; measurement adds only 50k more).
     for i in 0..600_000i64 {
         put_retry(&db, (i % SERIES) as u32, Sample::new(i, 1.0));
     }
@@ -45,11 +45,11 @@ fn deterministic_put_steady_state_zero_alloc_growth() {
 
     assert_eq!(
         after, before,
-        "稳态 put 热路径必须 0 堆分配增长（before={before}, after={after}）"
+        "steady-state put hot path must show 0 heap-allocation growth (before={before}, after={after})"
     );
 
-    // 数据完好性抽查（顺带覆盖 LRU 未误触发）
-    assert_eq!(db.lru_evictions(), 0, "大容量下不应发生丢弃");
+    // data integrity spot check (also covers that LRU did not fire spuriously)
+    assert_eq!(db.lru_evictions(), 0, "no eviction should occur under large capacity");
     let got: Vec<Sample> = db.scan(3, 799_990, 800_000, None, None).unwrap().collect();
     assert!(!got.is_empty());
 }

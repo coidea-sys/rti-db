@@ -1,0 +1,92 @@
+[
+  {
+    "latency_ns": {
+      "max": 1046527,
+      "p50": 612,
+      "p99": 1322,
+      "p999": 12863
+    },
+    "notes": "Db::put 为无锁 SPSC 入队（异步应用），WAL 组提交在后台 ingest 线程；延迟为入队延迟",
+    "system": "rti-db",
+    "throughput_ops": 746178.1853956856,
+    "variant": "sync=none",
+    "workload": {
+      "n": 200000,
+      "series": 8
+    }
+  },
+  {
+    "avg_agg_pts_s": 33829426.079727024,
+    "disk_bytes": 38113733,
+    "notes": "批量=连续单点 put（ingest 线程内部批量组提交），含最终 flush; 压缩比 vs 16B/点原始 = 0.42x",
+    "rss_bytes": 42041344,
+    "scan_pts_s": 32962545.351930056,
+    "system": "rti-db",
+    "throughput_ops": 3887822.208708498,
+    "variant": "sync=none",
+    "workload": {
+      "n": 1000000,
+      "series": 8
+    }
+  },
+  {
+    "latency_ns": {
+      "max": 5238783,
+      "p50": 471,
+      "p99": 1187,
+      "p999": 17935
+    },
+    "notes": "Db::put 为无锁 SPSC 入队（异步应用），WAL 组提交在后台 ingest 线程；延迟为入队延迟",
+    "system": "rti-db",
+    "throughput_ops": 631870.180325292,
+    "variant": "sync=group1ms",
+    "workload": {
+      "n": 200000,
+      "series": 8
+    }
+  },
+  {
+    "avg_agg_pts_s": 34576918.72422096,
+    "disk_bytes": 38113733,
+    "notes": "批量=连续单点 put（ingest 线程内部批量组提交），含最终 flush; 压缩比 vs 16B/点原始 = 0.42x",
+    "rss_bytes": 57917440,
+    "scan_pts_s": 31915886.06526563,
+    "system": "rti-db",
+    "throughput_ops": 368296.6371427757,
+    "variant": "sync=group1ms",
+    "workload": {
+      "n": 1000000,
+      "series": 8
+    }
+  },
+  {
+    "latency_ns": {
+      "max": 2755657727,
+      "p50": 290,
+      "p99": 731,
+      "p999": 16799
+    },
+    "notes": "Db::put 为无锁 SPSC 入队（异步应用），WAL 组提交在后台 ingest 线程；延迟为入队延迟",
+    "system": "rti-db",
+    "throughput_ops": 1204.7286323246162,
+    "variant": "sync=always",
+    "workload": {
+      "n": 200000,
+      "series": 8
+    }
+  },
+  {
+    "avg_agg_pts_s": 31068656.137706228,
+    "disk_bytes": 3811638,
+    "notes": "批量=连续单点 put（ingest 线程内部批量组提交），含最终 flush; 压缩比 vs 16B/点原始 = 4.20x; sync=always 为逐条 fsync 受限，本变体实测 10 万点（铁律3，n 字段已修正为实测值）",
+    "rss_bytes": 57917440,
+    "scan_pts_s": 30146960.40257045,
+    "system": "rti-db",
+    "throughput_ops": 824.0467661209784,
+    "variant": "sync=always",
+    "workload": {
+      "n": 100000,
+      "series": 8
+    }
+  }
+]

@@ -1,8 +1,9 @@
 [package]
 name = "rti-raft"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "rti-db single-shard Raft replication: election, heartbeat, log replication, majority commit"
 
 [dependencies]

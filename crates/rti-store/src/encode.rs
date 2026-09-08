@@ -1,14 +1,14 @@
-//! 列式压缩编码：
-//! - 时间戳列：delta-of-delta + zigzag varint（Gorilla 简化版）；
-//! - 值列：XOR float 压缩（Gorilla 简化版：0 位 / 1+6bit 长度+有效位）。
+//! Columnar compression encoding:
+//! - timestamp column: delta-of-delta + zigzag varint (simplified Gorilla);
+//! - value column: XOR float compression (simplified Gorilla: 0 bits / 1+6bit length+significant bits).
 //!
-//! 编码写入调用方提供的缓冲；解码为流式迭代器，逐点产出、零分配。
+//! Encoding writes into caller-provided buffers; decoding is a streaming iterator — point by point, zero allocation.
 
 use rti_core::{Error, Result, Sample};
 
 // ---------------------------------------------------------------- varint
 
-/// LEB128 无符号 varint 编码，追加到 `out`。
+/// LEB128 unsigned varint encode, appended to `out`.
 pub fn write_uvarint(mut v: u64, out: &mut Vec<u8>) {
     loop {
         let b = (v & 0x7f) as u8;
@@ -21,7 +21,7 @@ pub fn write_uvarint(mut v: u64, out: &mut Vec<u8>) {
     }
 }
 
-/// 从 `buf[*pos..]` 读取一个 varint；失败（截断/溢出）返回 `None`。
+/// Read one varint from `buf[*pos..]`; returns `None` on failure (truncation/overflow).
 pub fn read_uvarint(buf: &[u8], pos: &mut usize) -> Option<u64> {
     let mut v: u64 = 0;
     let mut shift = 0u32;
@@ -39,19 +39,19 @@ pub fn read_uvarint(buf: &[u8], pos: &mut usize) -> Option<u64> {
     }
 }
 
-/// zigzag 编码：有符号 → 无符号（小绝对值 → 小整数）。
+/// zigzag encode: signed → unsigned (small absolute values → small integers).
 pub fn zigzag_encode(v: i64) -> u64 {
     ((v << 1) ^ (v >> 63)) as u64
 }
 
-/// zigzag 解码。
+/// zigzag decode.
 pub fn zigzag_decode(v: u64) -> i64 {
     ((v >> 1) as i64) ^ -((v & 1) as i64)
 }
 
 // ---------------------------------------------------------------- bit io
 
-/// 位写入器（LSB-first 字节流）。
+/// Bit writer (LSB-first byte stream).
 pub struct BitWriter {
     out: Vec<u8>,
     acc: u128,
@@ -59,12 +59,12 @@ pub struct BitWriter {
 }
 
 impl BitWriter {
-    /// 新建空写入器。
+    /// Create a new empty writer.
     pub fn new() -> Self {
         Self { out: Vec::new(), acc: 0, nbits: 0 }
     }
 
-    /// 写入 `v` 的低 `n` 位（`n <= 64`）。
+    /// Write the low `n` bits of `v` (`n <= 64`).
     pub fn write_bits(&mut self, v: u64, n: u32) {
         debug_assert!(n <= 64);
         if n == 0 {
@@ -80,7 +80,7 @@ impl BitWriter {
         }
     }
 
-    /// 冲刷（末字节零填充），返回字节流。
+    /// Flush (last byte zero-padded) and return the byte stream.
     pub fn finish(mut self) -> Vec<u8> {
         if self.nbits > 0 {
             self.out.push(self.acc as u8);
@@ -89,7 +89,7 @@ impl BitWriter {
     }
 }
 
-/// 位读取器，与 [`BitWriter`] 对应。
+/// Bit reader, the counterpart of [`BitWriter`].
 pub struct BitReader<'a> {
     buf: &'a [u8],
     pos: usize,
@@ -98,12 +98,12 @@ pub struct BitReader<'a> {
 }
 
 impl<'a> BitReader<'a> {
-    /// 从字节切片创建读取器。
+    /// Create a reader from a byte slice.
     pub fn new(buf: &'a [u8]) -> Self {
         Self { buf, pos: 0, acc: 0, nbits: 0 }
     }
 
-    /// 读取 `n` 位；流耗尽返回 `None`。
+    /// Read `n` bits; returns `None` when the stream is exhausted.
     pub fn read_bits(&mut self, n: u32) -> Option<u64> {
         debug_assert!(n <= 64);
         while self.nbits < n {
@@ -122,7 +122,7 @@ impl<'a> BitReader<'a> {
 
 // ------------------------------------------------- timestamps (delta-of-delta)
 
-/// 编码时间戳列（要求 `samples` 按 ts 排序）。
+/// Encode a timestamp column (`samples` must be sorted by ts).
 pub fn encode_ts(samples: &[Sample], out: &mut Vec<u8>) {
     if samples.is_empty() {
         return;
@@ -143,7 +143,7 @@ pub fn encode_ts(samples: &[Sample], out: &mut Vec<u8>) {
     }
 }
 
-/// 时间戳列流式解码器。
+/// Streaming timestamp-column decoder.
 pub struct TsDecoder<'a> {
     buf: &'a [u8],
     pos: usize,
@@ -153,7 +153,7 @@ pub struct TsDecoder<'a> {
 }
 
 impl<'a> TsDecoder<'a> {
-    /// 创建解码器并读出首个时间戳；空流返回 `Ok(None)`。
+    /// Create a decoder and read out the first timestamp; an empty stream returns `Ok(None)`.
     pub fn new(buf: &'a [u8]) -> Result<Option<Self>> {
         let mut pos = 0;
         match read_uvarint(buf, &mut pos) {
@@ -169,7 +169,7 @@ impl<'a> TsDecoder<'a> {
         }
     }
 
-    /// 下一个时间戳（第 `n` 次调用返回第 `n` 个点）。
+    /// Next timestamp (the `n`-th call returns the `n`-th point).
     pub fn next_ts(&mut self) -> Option<i64> {
         let ts = match self.emitted {
             0 => self.prev_ts,
@@ -191,9 +191,9 @@ impl<'a> TsDecoder<'a> {
     }
 }
 
-// -------------------------------------------- block decode (v0.2, 8 路展开)
+// -------------------------------------------- block decode (v0.2, 8-way unrolled)
 
-/// delta-of-delta 单步解码（块解码内层）。
+/// delta-of-delta single-step decode (inner step of block decode).
 #[inline(always)]
 fn dod_step(buf: &[u8], pos: &mut usize, prev_ts: &mut i64, prev_delta: &mut i64) -> Option<i64> {
     let dod = zigzag_decode(read_uvarint(buf, pos)?);
@@ -202,16 +202,16 @@ fn dod_step(buf: &[u8], pos: &mut usize, prev_ts: &mut i64, prev_delta: &mut i64
     Some(*prev_ts)
 }
 
-/// 块解码时间戳列：一次调用从 `buf`（列首）解出至多 N 个时间戳到 `out`。
+/// Block-decode a timestamp column: one call decodes up to N timestamps from `buf` (column start) into `out`.
 ///
-/// 返回实际解出的个数（`<= N`；流提前耗尽时小于 N）。语义与
-/// [`TsDecoder`] 逐点解码**完全一致**（含 wrapping 溢出行为），
-/// 供 scan/bench 热路径批量解码后自行做谓词过滤。
+/// Returns the number actually decoded (`<= N`; less than N when the stream runs out early). Semantics are
+/// **exactly identical** to point-by-point [`TsDecoder`] decoding (including wrapping overflow behavior),
+/// so scan/bench hot paths can batch-decode and then apply predicate filtering themselves.
 ///
-/// 实现说明（诚实）：delta-of-delta 存在串行数据依赖，无法真正 SIMD；
-/// 这里采用 safe Rust 8 路展开（定数内层循环 + `#[inline(always)]` 单步），
-/// 摊薄逐点调用的分支/边界检查开销，利于编译器指令级调度。
-/// 不使用 nightly `std::simd`。
+/// Implementation note (honest): delta-of-delta has a serial data dependency and cannot be truly SIMD;
+/// this uses safe-Rust 8-way unrolling (fixed-count inner loop + `#[inline(always)]` single step),
+/// amortizing the branch/bounds-check overhead of per-point calls and helping the compiler's instruction scheduling.
+/// Does not use nightly `std::simd`.
 pub fn decode_ts_block<const N: usize>(buf: &[u8], out: &mut [i64; N]) -> Result<usize> {
     if N == 0 {
         return Ok(0);
@@ -233,7 +233,7 @@ pub fn decode_ts_block<const N: usize>(buf: &[u8], out: &mut [i64; N]) -> Result
     prev_ts = prev_ts.wrapping_add(prev_delta);
     out[1] = prev_ts;
     let mut n = 2usize;
-    // 8 路展开主循环：每个 lane 一次内联单步。
+    // 8-way unrolled main loop: one inlined single step per lane.
     while n + 8 <= N {
         macro_rules! lane {
             ($l:expr) => {
@@ -247,7 +247,7 @@ pub fn decode_ts_block<const N: usize>(buf: &[u8], out: &mut [i64; N]) -> Result
         lane!(4); lane!(5); lane!(6); lane!(7);
         n += 8;
     }
-    // 尾部（N 非 8 的倍数）。
+    // tail (when N is not a multiple of 8).
     while n < N {
         match dod_step(buf, &mut pos, &mut prev_ts, &mut prev_delta) {
             Some(ts) => {
@@ -262,7 +262,7 @@ pub fn decode_ts_block<const N: usize>(buf: &[u8], out: &mut [i64; N]) -> Result
 
 // ----------------------------------------------------------- values (xor)
 
-/// 编码值列（Gorilla XOR 简化版）。
+/// Encode a value column (simplified Gorilla XOR).
 pub fn encode_vals(samples: &[Sample], out: &mut Vec<u8>) {
     if samples.is_empty() {
         return;
@@ -276,7 +276,7 @@ pub fn encode_vals(samples: &[Sample], out: &mut Vec<u8>) {
         if xor == 0 {
             bw.write_bits(0, 1);
         } else {
-            let sig = 64 - xor.leading_zeros(); // 有效位长度 1..=64
+            let sig = 64 - xor.leading_zeros(); // significant-bits length 1..=64
             bw.write_bits(1, 1);
             bw.write_bits((sig - 1) as u64, 6);
             bw.write_bits(xor, sig);
@@ -286,7 +286,7 @@ pub fn encode_vals(samples: &[Sample], out: &mut Vec<u8>) {
     *out = bw.finish();
 }
 
-/// 值列流式解码器，逐点产出 f64。
+/// Streaming value-column decoder, yielding f64 point by point.
 pub struct ValDecoder<'a> {
     br: BitReader<'a>,
     prev: u64,
@@ -294,7 +294,7 @@ pub struct ValDecoder<'a> {
 }
 
 impl<'a> ValDecoder<'a> {
-    /// 创建解码器；空流返回 `Ok(None)`。
+    /// Create a decoder; an empty stream returns `Ok(None)`.
     pub fn new(buf: &'a [u8]) -> Result<Option<Self>> {
         if buf.is_empty() {
             return Ok(None);
@@ -302,7 +302,7 @@ impl<'a> ValDecoder<'a> {
         Ok(Some(Self { br: BitReader::new(buf), prev: 0, first: true }))
     }
 
-    /// 下一个值。
+    /// Next value.
     pub fn next_val(&mut self) -> Option<f64> {
         if self.first {
             self.first = false;
@@ -322,7 +322,7 @@ impl<'a> ValDecoder<'a> {
 
 // -------------------------------------------------- value block decode (v0.2)
 
-/// XOR 单步解码（块解码内层）。
+/// XOR single-step decode (inner step of block decode).
 #[inline(always)]
 fn xor_step(br: &mut BitReader<'_>, prev: &mut u64) -> Option<f64> {
     let control = br.read_bits(1)?;
@@ -335,11 +335,11 @@ fn xor_step(br: &mut BitReader<'_>, prev: &mut u64) -> Option<f64> {
     Some(f64::from_bits(*prev))
 }
 
-/// 块解码值列：一次调用从 `buf`（列首）解出至多 N 个 f64 到 `out`。
+/// Block-decode a value column: one call decodes up to N f64 values from `buf` (column start) into `out`.
 ///
-/// 返回实际解出的个数（`<= N`）。语义与 [`ValDecoder`] 逐点解码
-/// **bit-exact 一致**。实现约束与 [`decode_ts_block`] 相同：
-/// safe Rust、8 路展开、无 nightly `std::simd`。
+/// Returns the number actually decoded (`<= N`). Semantics are **bit-exact** with point-by-point
+/// [`ValDecoder`] decoding. Same implementation constraints as [`decode_ts_block`]:
+/// safe Rust, 8-way unrolled, no nightly `std::simd`.
 pub fn decode_val_block<const N: usize>(buf: &[u8], out: &mut [f64; N]) -> Result<usize> {
     if N == 0 {
         return Ok(0);
@@ -442,7 +442,7 @@ mod tests {
             Sample::new(110, 0.0),
             Sample::new(115, 0.0),  // dod = -5
             Sample::new(150, 0.0),  // dod = +30
-            Sample::new(150, 0.0),  // 重复时间戳
+            Sample::new(150, 0.0),  // duplicate timestamps
         ];
         let mut buf = Vec::new();
         encode_ts(&s, &mut buf);
@@ -470,11 +470,11 @@ mod tests {
         }
     }
 
-    /// 块解码与标量流式解码必须逐点一致（含 N 非 8 倍数、jitter 流）。
+    /// Block decode and scalar streaming decode must agree point by point (including N not a multiple of 8, and jittered streams).
     #[test]
     fn ts_block_decode_matches_scalar() {
         let mut s = samples(1000);
-        // 加入 jitter 与重复时间戳，覆盖负 dod
+        // add jitter and duplicate timestamps to cover negative dod
         s[100].ts += 7;
         s[200].ts = s[199].ts;
         let mut buf = Vec::new();
@@ -486,19 +486,19 @@ mod tests {
             scalar.push(ts);
         }
 
-        // 整块解出全部 1000 点
+        // decode all 1000 points as one block
         let mut tmp = [0i64; 1000];
         let got = decode_ts_block::<1000>(&buf, &mut tmp).unwrap();
         assert_eq!(got, s.len());
-        assert_eq!(&tmp[..got], &scalar[..], "N=1000 整块必须与标量一致");
+        assert_eq!(&tmp[..got], &scalar[..], "N=1000 whole block must match the scalar decoder");
 
-        // 不同块大小（含非 8 倍数）解出的前缀必须与标量一致
+        // prefixes decoded at various block sizes (including non-multiples of 8) must match the scalar decoder
         macro_rules! check_prefix {
             ($n:expr) => {{
                 let mut small = [0i64; $n];
                 let g = decode_ts_block::<$n>(&buf, &mut small).unwrap();
                 assert_eq!(g, $n.min(s.len()));
-                assert_eq!(&small[..g], &scalar[..g], "N={} 前缀", $n);
+                assert_eq!(&small[..g], &scalar[..g], "N={} prefix", $n);
             }};
         }
         check_prefix!(2);
@@ -509,7 +509,7 @@ mod tests {
 
     #[test]
     fn val_block_decode_matches_scalar_bit_exact() {
-        let s = samples(777); // 非 8 倍数
+        let s = samples(777); // not a multiple of 8
         let mut buf = Vec::new();
         encode_vals(&s, &mut buf);
 
@@ -523,13 +523,13 @@ mod tests {
         let got = decode_val_block::<777>(&buf, &mut tmp).unwrap();
         assert_eq!(got, s.len());
         for (b, w) in tmp.iter().zip(scalar.iter()) {
-            assert_eq!(b.to_bits(), *w, "块解码必须 bit-exact");
+            assert_eq!(b.to_bits(), *w, "block decode must be bit-exact");
         }
     }
 
     #[test]
     fn block_decode_edge_cases() {
-        // 空流
+        // empty stream
         let mut out8 = [0i64; 8];
         assert_eq!(decode_ts_block::<8>(b"", &mut out8).unwrap(), 0);
         let mut vout = [0.0f64; 8];
@@ -537,11 +537,11 @@ mod tests {
         // N=0
         assert_eq!(decode_ts_block::<0>(b"", &mut []).unwrap(), 0);
         assert_eq!(decode_val_block::<0>(b"", &mut []).unwrap(), 0);
-        // 截断头（非空但读不出完整 varint 不可能——单字节即合法；
-        // 用全 0x80 构造非法无限延续 varint）
+        // truncated head (a nonempty-but-incomplete varint is impossible — a single byte is already valid;
+        // use all-0x80 bytes to construct an illegal infinitely-continuing varint)
         let bad = [0x80u8; 3];
         assert!(decode_ts_block::<8>(&bad, &mut out8).is_err());
-        // 单点 / 两点流
+        // single-point / two-point streams
         let one = samples(1);
         let mut b1 = Vec::new();
         encode_ts(&one, &mut b1);
@@ -553,7 +553,7 @@ mod tests {
         let n = decode_ts_block::<8>(&b2, &mut out8).unwrap();
         assert_eq!(n, 2);
         assert_eq!(&out8[..2], &[two[0].ts, two[1].ts]);
-        // N 小于流长度：恰好截断在前 N 个点
+        // N smaller than the stream length: truncates exactly at the first N points
         let many = samples(100);
         let mut bm = Vec::new();
         encode_ts(&many, &mut bm);

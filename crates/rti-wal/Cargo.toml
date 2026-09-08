@@ -1,13 +1,14 @@
 [package]
 name = "rti-wal"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "rti-db write-ahead log: append-only, CRC32, group commit, crash recovery"
 
 [features]
 default = []
-# io_uring 批量提交后端（Linux only）。unsafe 胶水隔离在 rti-wal-uring crate。
+# io_uring batched-submission backend (Linux only). The unsafe glue is isolated in the rti-wal-uring crate.
 io-uring = ["dep:rti-wal-uring"]
 
 [dependencies]
@@ -17,7 +18,7 @@ crc32fast = "1"
 [target.'cfg(target_os = "linux")'.dependencies]
 rti-wal-uring = { path = "../rti-wal-uring", optional = true }
 
-# v0.5 Stream B：uring-pipeline vs std 对比基准（需真实 ring）。
+# v0.5 Stream B: uring-pipeline vs std comparison benchmark (requires a real ring).
 [[example]]
 name = "wal_bench"
 required-features = ["io-uring"]

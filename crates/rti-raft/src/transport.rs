@@ -1,4 +1,4 @@
-//! 传输实现：内存网络（测试/仿真，支持分区）与 TCP（loopback/部署）。
+//! Transport implementations: in-memory network (test/simulation, supports partitions) and TCP (loopback/deployment).
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
@@ -10,38 +10,38 @@ use std::time::Duration;
 use crate::codec::encode_msg;
 use crate::node::{Msg, NodeId, Transport};
 
-// ------------------------------------------------------------- 内存网络
+// ------------------------------------------------------------- in-memory network
 
 #[derive(Default)]
 struct SharedNet {
     queues: BTreeMap<NodeId, VecDeque<(NodeId, Msg)>>,
-    /// 被阻断的有向边集合（partition 会同时加入两个方向）。
+    /// Set of blocked directed edges (partition adds both directions).
     blocked: Vec<(NodeId, NodeId)>,
 }
 
-/// 单线程内存网络：节点共享的投递中枢，支持双向分区（测试用）。
+/// Single-threaded in-memory network: a shared delivery hub for nodes, supports bidirectional partitions (for tests).
 ///
-/// 经 [`MemoryNetwork::transport`] 为每个节点创建端点；
-/// [`MemoryNetwork::partition`] / [`MemoryNetwork::heal`] 模拟网络分区。
-/// `Clone` 得到的句柄与所有端点共享同一份状态。
+/// Endpoints are created per node via [`MemoryNetwork::transport`];
+/// [`MemoryNetwork::partition`] / [`MemoryNetwork::heal`] simulate network partitions.
+/// Handles obtained via `Clone` share the same state with all endpoints.
 #[derive(Clone, Default)]
 pub struct MemoryNetwork {
     shared: Rc<RefCell<SharedNet>>,
 }
 
 impl MemoryNetwork {
-    /// 创建空网络。
+    /// Create an empty network.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// 为节点 `id` 注册并返回其传输端点。
+    /// Register node `id` and return its transport endpoint.
     pub fn transport(&self, id: NodeId) -> MemoryTransport {
         self.shared.borrow_mut().queues.entry(id).or_default();
         MemoryTransport { id, shared: Rc::clone(&self.shared) }
     }
 
-    /// 网络分区：阻断集合 a 与集合 b 之间的双向流量。
+    /// Partition the network: block bidirectional traffic between set a and set b.
     pub fn partition(&self, a: &[NodeId], b: &[NodeId]) {
         let mut net = self.shared.borrow_mut();
         for &x in a {
@@ -52,13 +52,13 @@ impl MemoryNetwork {
         }
     }
 
-    /// 恢复全部流量。
+    /// Restore all traffic.
     pub fn heal(&self) {
         self.shared.borrow_mut().blocked.clear();
     }
 }
 
-/// 内存传输端点（单线程测试用；与 [`MemoryNetwork`] 共享状态）。
+/// In-memory transport endpoint (single-threaded tests; shares state with [`MemoryNetwork`]).
 pub struct MemoryTransport {
     id: NodeId,
     shared: Rc<RefCell<SharedNet>>,
@@ -68,7 +68,7 @@ impl Transport for MemoryTransport {
     fn send(&mut self, to: NodeId, msg: Msg) {
         let mut net = self.shared.borrow_mut();
         if net.blocked.contains(&(self.id, to)) {
-            return; // 分区丢包
+            return; // packets dropped by the partition
         }
         net.queues.entry(to).or_default().push_back((self.id, msg));
     }
@@ -80,28 +80,28 @@ impl Transport for MemoryTransport {
 
 // ------------------------------------------------------------- TCP
 
-/// TCP 传输：每节点一个监听 socket，按需建立短连接发送帧。
+/// TCP transport: one listening socket per node; frames are sent over on-demand short connections.
 ///
-/// 线格式：`len u32` + `from u64` + payload（发送者 id 显式携带，
-/// 因为短连接的对端端口是临时端口，无法反查）。
+/// Wire format: `len u32` + `from u64` + payload (the sender id is carried explicitly,
+/// because the peer port of a short connection is ephemeral and cannot be looked up).
 ///
-/// 简化取舍（诚实声明）：`send` 为「连接-写-关闭」的短连接
-/// （无连接池），失败静默丢包（Raft 容忍，由协议层重试）；
-/// 面向 loopback 与小集群验证，不是高吞吐 RPC 层。
+/// Simplifying trade-off (honest disclosure): `send` uses connect-write-close short connections
+/// (no connection pooling), and failures silently drop the packet (Raft tolerates this; the protocol layer retries);
+/// aimed at loopback and small-cluster validation, not a high-throughput RPC layer.
 pub struct TcpTransport {
     id: NodeId,
     listener: TcpListener,
     peers: BTreeMap<NodeId, SocketAddr>,
-    /// 已接受的入站连接及其读缓冲。
+    /// Accepted inbound connections and their read buffers.
     inbound: Vec<(TcpStream, Vec<u8>)>,
     inbox: VecDeque<(NodeId, Msg)>,
 }
 
 impl TcpTransport {
-    /// 绑定 `bind` 地址并注册对等节点地址表。
+    /// Bind the `bind` address and register the peer address table.
     ///
-    /// 非阻塞 accept/read；`send` 用 100ms 连接超时，避免对端
-    /// 不存在时挂死热路径。
+    /// Non-blocking accept/read; `send` uses a 100ms connect timeout to avoid hanging the hot
+    /// path when a peer does not exist.
     pub fn new(id: NodeId, bind: SocketAddr, peers: &[(NodeId, SocketAddr)]) -> std::io::Result<Self> {
         let listener = TcpListener::bind(bind)?;
         listener.set_nonblocking(true)?;
@@ -114,22 +114,22 @@ impl TcpTransport {
         })
     }
 
-    /// 本端实际监听地址（`bind` 端口为 0 时查询分配结果）。
+    /// The actual local listening address (query the assigned port when `bind` uses port 0).
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.listener.local_addr()
     }
 
-    /// 本节点 id。
+    /// This node's id.
     pub fn id(&self) -> NodeId {
         self.id
     }
 
-    /// 追加/更新对等节点地址（构造后补注册用）。
+    /// Add/update a peer address (for post-construction registration).
     pub fn add_peer(&mut self, id: NodeId, addr: SocketAddr) {
         self.peers.insert(id, addr);
     }
 
-    /// 非阻塞收包：accept 新连接、读空各连接、切出完整帧。
+    /// Non-blocking receive: accept new connections, drain each connection, cut out complete frames.
     fn poll_io(&mut self) {
         while let Ok((stream, _)) = self.listener.accept() {
             if stream.set_nonblocking(true).is_ok() {
@@ -143,7 +143,7 @@ impl TcpTransport {
             loop {
                 match s.read(&mut chunk) {
                     Ok(0) => {
-                        alive = false; // 对端关闭
+                        alive = false; // peer closed
                         break;
                     }
                     Ok(n) => acc.extend_from_slice(&chunk[..n]),
@@ -154,14 +154,14 @@ impl TcpTransport {
                     }
                 }
             }
-            // 切帧：len u32 + from u64 + payload
+            // frame cutting: len u32 + from u64 + payload
             loop {
                 if acc.len() < 4 {
                     break;
                 }
                 let len = u32::from_le_bytes(acc[0..4].try_into().unwrap()) as usize;
                 if len > 16 << 20 {
-                    acc.clear(); // 畸形长度：丢弃缓冲（视为丢包）
+                    acc.clear(); // malformed length: discard the buffer (treated as packet loss)
                     break;
                 }
                 if acc.len() < 4 + len || len < 8 {
@@ -200,7 +200,7 @@ impl Transport for TcpTransport {
         frame.extend_from_slice(&((8 + payload.len()) as u32).to_le_bytes());
         frame.extend_from_slice(&self.id.to_le_bytes());
         frame.extend_from_slice(payload);
-        // 短连接发送；任何失败 = 丢包（协议层会重试）。
+        // short-connection send; any failure = packet loss (the protocol layer retries).
         if let Ok(mut s) = TcpStream::connect_timeout(&addr, Duration::from_millis(100)) {
             let _ = s.write_all(&frame);
         }

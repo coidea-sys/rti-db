@@ -1,12 +1,13 @@
 [package]
 name = "rti-edge"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "rti-db as an RTI-Edge data-plane component: preset profiles (safety island / cognition / planning), TSN-aligned ingest, unified health"
 
 [features]
-# 热路径分配计数（透传 rti-db/rti-mem 的全局计数分配器，仅测试用）。
+# hot-path allocation counting (forwards the rti-db/rti-mem global counting allocator, test-only).
 alloc-count = ["rti-db/alloc-count"]
 
 [dependencies]

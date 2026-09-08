@@ -1,18 +1,18 @@
-//! rti-wal-uring：rti-wal 的 io_uring 提交后端（Linux only）。
+//! rti-wal-uring: the io_uring commit backend for rti-wal (Linux only).
 //!
-//! 存在的理由（v0.2 决策，README「依赖决策」有记录）：
-//! `io-uring` crate 的 SQE 提交 API（`SubmissionQueue::push`）是
-//! `unsafe fn`，而 rti-wal 按 SPEC §1 是 `#![forbid(unsafe_code)]`。
-//! 因此把**最小必需**的 unsafe 提交胶水隔离到这个独立 crate
-//! （与 rti-mem/rti-buffer 相同的纪律：单文件 `#![allow(unsafe_code)]`
-//! + 每处 `// SAFETY:` 注释），rti-wal 本体保持 100% safe。
+//! Rationale (v0.2 decision, recorded in the README 'dependency decisions'):
+//! the `io-uring` crate's SQE submission API (`SubmissionQueue::push`) is an
+//! `unsafe fn`, while rti-wal is `#![forbid(unsafe_code)]` per SPEC §1.
+//! The **minimal necessary** unsafe submission glue is therefore isolated in this separate crate
+//! (same discipline as rti-mem/rti-buffer: a single file with `#![allow(unsafe_code)]`
+//! + a `// SAFETY:` comment at each site), keeping rti-wal itself 100% safe.
 //!
-//! 本 crate 的公开 API 全部是 safe 的：
-//! - v0.2 同步阻塞语义：[`UringFile::write_at`] 提交一批写 SQE 并
-//!   **等待全部完成**后才返回，不存在悬挂的在途 SQE；
-//! - v0.5 在途批流水：[`UringPipeline`] 提交后不等待，CQE reap 循环
-//!   增量回收完成事件；SQE 引用的批缓冲由 pipeline 自有、reap 前绝不
-//!   复用、`Drop` 时全量 drain（安全模型见 pipe.rs 模块文档）。
+//! This crate's public API is entirely safe:
+//! - v0.2 synchronous blocking semantics: [`UringFile::write_at`] submits a batch of write SQEs
+//!   and returns only after **all have completed** — no dangling in-flight SQEs;
+//! - v0.5 in-flight batch pipeline: [`UringPipeline`] does not wait after submission; a CQE reap
+//!   loop incrementally reclaims completion events; batch buffers referenced by SQEs are owned by
+//!   the pipeline, never reused before reaping, and fully drained on `Drop` (safety model: see the pipe.rs module docs).
 
 #[cfg(target_os = "linux")]
 mod pipe;
@@ -24,10 +24,10 @@ pub use pipe::{BackpressurePolicy, BatchToken, PipeError, PipelineConfig, UringP
 #[cfg(target_os = "linux")]
 pub use ring::UringFile;
 
-/// 探测当前内核/沙箱是否允许创建 io_uring 实例。
+/// Probe whether the current kernel/sandbox allows creating an io_uring instance.
 ///
-/// 非 Linux 平台恒为 `false`；Linux 上尝试创建一个最小 ring
-/// 再立即销毁（`io_uring_setup` 被 seccomp 禁用或内核过旧时返回 `false`）。
+/// Always `false` on non-Linux platforms; on Linux, tries creating a minimal ring
+/// and immediately destroying it (`false` when `io_uring_setup` is disabled by seccomp or the kernel is too old).
 pub fn probe() -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -43,7 +43,7 @@ pub fn probe() -> bool {
 mod tests {
     use super::*;
 
-    /// 探测本身不得 panic（沙箱 seccomp / 老内核都要优雅返回）。
+    /// The probe itself must not panic (seccomp sandboxes / old kernels must return gracefully).
     #[test]
     fn probe_never_panics() {
         let _ = probe();
@@ -55,7 +55,7 @@ mod tests {
         assert!(!probe());
         #[cfg(target_os = "linux")]
         {
-            // Linux 上 probe 结果依赖环境，不断言具体值，只保证可调用。
+            // probe results on Linux depend on the environment; no concrete value is asserted, only callability.
             let _ = probe();
         }
     }

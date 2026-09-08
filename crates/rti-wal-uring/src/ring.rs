@@ -1,9 +1,9 @@
-//! io_uring 提交后端的最小 unsafe 胶水（仅本文件豁免 unsafe）。
+//! Minimal unsafe glue for the io_uring commit backend (only this file is exempt from the unsafe ban).
 //!
-//! 安全模型：所有公开方法都是**同步阻塞**语义——SQE 提交后
-//! `submit_and_wait` 等待全部 CQE 返回、并核验每个写的结果字节数后才
-//! return。因此内核不会在函数返回后仍引用调用方的缓冲区或 fd，
-//! 这是每处 `unsafe { push }` 成立的核心不变量。
+//! Safety model: every public method has **synchronous blocking** semantics — after SQE submission,
+//! `submit_and_wait` waits for all CQEs and verifies each write's result byte count before returning.
+//! The kernel therefore never references the caller's buffers or fd after the function returns —
+//! the core invariant behind every `unsafe { push }`.
 
 #![allow(unsafe_code)]
 
@@ -14,43 +14,43 @@ use std::path::Path;
 
 use io_uring::{opcode, types, IoUring};
 
-/// 单个已打开文件上的 io_uring 同步写/刷盘提交器。
+/// Synchronous io_uring write/fsync submitter on a single open file.
 ///
-/// - 批量写：[`UringFile::write_at`] 一次把多段缓冲按连续偏移提交为一组
-///   SQE（一个 `io_uring_enter` 系统调用提交整批），等待全部完成；
-/// - 组提交刷盘：[`UringFile::fsync`] 提交 `IORING_OP_FSYNC` 并等待完成。
+/// - batch write: [`UringFile::write_at`] submits multiple buffers as one group of SQEs at continuous
+///   offsets starting from `offset` (the whole batch in a single `io_uring_enter` syscall), waiting for all to complete;
+/// - group-commit flush: [`UringFile::fsync`] submits `IORING_OP_FSYNC` and waits for completion.
 pub struct UringFile {
     ring: IoUring,
-    /// 保持 fd 存活；ring 中的 SQE 按裸 fd 引用它。
+    /// Keeps the fd alive; SQEs in the ring reference it by raw fd.
     file: File,
-    /// SQ 容量（`IoUring::new` 的 entries），批量写按此分块。
+    /// SQ capacity (entries of `IoUring::new`); batch writes are chunked by this.
     depth: usize,
 }
 
 impl UringFile {
-    /// 打开（不存在则创建）`path` 并创建一个 `queue_depth` 深的 ring。
+    /// Open (creating if missing) `path` and create a ring `queue_depth` deep.
     ///
-    /// `queue_depth` 会向上取整到 2 的幂（io_uring 要求）。
-    /// 内核/沙箱不允许 io_uring（`io_uring_setup` 返回 EPERM/ENOSYS）
-    /// 时返回 `Err`，调用方应回退到 std 后端（见 rti-wal 的
-    /// `WalWriter::auto`）。
+    /// `queue_depth` is rounded up to a power of two (required by io_uring).
+    /// Returns `Err` when the kernel/sandbox disallows io_uring (`io_uring_setup` returns EPERM/ENOSYS);
+    /// the caller should fall back to the std backend (see rti-wal's
+    /// `WalWriter::auto`).
     pub fn open(path: impl AsRef<Path>, queue_depth: u32) -> io::Result<Self> {
         let file = OpenOptions::new().create(true).write(true).open(path)?;
         Self::from_file(file, queue_depth)
     }
 
-    /// 用已打开的 `file` 创建提交器（ring 创建失败同样返回 `Err`）。
+    /// Create a submitter from an already-open `file` (ring creation failure also returns `Err`).
     pub fn from_file(file: File, queue_depth: u32) -> io::Result<Self> {
         let depth = queue_depth.max(1).next_power_of_two();
         let ring = IoUring::new(depth)?;
         Ok(Self { ring, file, depth: depth as usize })
     }
 
-    /// 把 `bufs` 各段按 `offset` 起的连续偏移批量提交写，等待全部完成。
+    /// Submit each buffer of `bufs` as a batch of writes at continuous offsets from `offset`, waiting for all to complete.
     ///
-    /// 返回写入的总字节数。任何一段写失败或短写（结果 < 请求长度）
-    /// 都会使整批以 `Err` 告终——WAL 帧很小且走页缓存，短写只可能
-    /// 来自 ENOSPC 等致命情况，按 fail-fast 处理。
+    /// Returns the total bytes written. Any failed or short write (result < requested length)
+    /// fails the whole batch with `Err` — WAL frames are small and go through the page cache, so a short
+    /// write can only come from something fatal like ENOSPC; treated fail-fast.
     pub fn write_at(&mut self, bufs: &[&[u8]], offset: u64) -> io::Result<usize> {
         for b in bufs {
             if b.len() > u32::MAX as usize {
@@ -60,7 +60,7 @@ impl UringFile {
         let fd = types::Fd(self.file.as_raw_fd());
         let mut total = 0usize;
         let mut off = offset;
-        // 按 SQ 容量分块，避免 PushError（队列满）。
+        // chunk by SQ capacity to avoid PushError (queue full).
         for chunk in bufs.chunks(self.depth) {
             let mut pushed = 0usize;
             {
@@ -72,12 +72,12 @@ impl UringFile {
                     let op = opcode::Write::new(fd, b.as_ptr(), b.len() as u32)
                         .offset(off)
                         .build()
-                        // user_data 携带请求长度，完成时核验短写。
+                        // user_data carries the requested length; short writes are verified at completion.
                         .user_data(b.len() as u64);
-                    // SAFETY: SQE 按裸指针引用 `b`、按裸 fd 引用 `self.file`。
-                    // 两者都活到本函数返回之后；而本函数在返回前
-                    // `submit_and_wait` 阻塞等待该 SQE 完成并核验 CQE，
-                    // 故内核持有这些引用的窗口严格在借用有效期内。
+                    // SAFETY: the SQE references `b` by raw pointer and `self.file` by raw fd.
+                    // Both outlive this function's return; and before returning, this function
+                    // blocks in `submit_and_wait` for that SQE's completion and verifies the CQE,
+                    // so the window where the kernel holds these references is strictly within the borrow lifetimes.
                     unsafe { sq.push(&op) }.map_err(|_| {
                         io::Error::new(io::ErrorKind::WouldBlock, "io_uring SQ full")
                     })?;
@@ -114,14 +114,14 @@ impl UringFile {
         Ok(total)
     }
 
-    /// 提交 `IORING_OP_FSYNC` 并等待完成（组提交的组边界）。
+    /// Submit `IORING_OP_FSYNC` and wait for completion (group boundary of group commit).
     pub fn fsync(&mut self) -> io::Result<()> {
         let fd = types::Fd(self.file.as_raw_fd());
         let op = opcode::Fsync::new(fd).build().user_data(0);
         {
             let mut sq = self.ring.submission();
-            // SAFETY: FSYNC 只引用 fd；`self.file` 活到函数返回之后，
-            // 且返回前已阻塞等待该 SQE 完成。
+            // SAFETY: FSYNC references only the fd; `self.file` outlives the function return,
+            // and this SQE's completion has been blockingly awaited before returning.
             unsafe { sq.push(&op) }
                 .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "io_uring SQ full"))?;
         }
@@ -160,7 +160,7 @@ mod tests {
         d.join("uring.log")
     }
 
-    /// 批量写 + fsync + std 读回校验。io_uring 不可用时优雅跳过。
+    /// Batch write + fsync + std read-back verification. Skipped gracefully when io_uring is unavailable.
     #[test]
     fn write_fsync_readback() {
         let p = tmpfile("roundtrip");
@@ -176,7 +176,7 @@ mod tests {
         let n = f.write_at(&[a, b], 0).unwrap();
         assert_eq!(n, a.len() + b.len());
         f.fsync().unwrap();
-        // 第二批改偏移追加，验证显式偏移语义
+        // the second batch appends at a changed offset, verifying explicit-offset semantics
         let c = b"!".as_slice();
         assert_eq!(f.write_at(&[c], n as u64).unwrap(), 1);
         f.fsync().unwrap();
@@ -185,17 +185,17 @@ mod tests {
         std::fs::remove_dir_all(p.parent().unwrap()).ok();
     }
 
-    /// 批大小超过 SQ 深度时必须正确分块提交。
+    /// Batches larger than the SQ depth must be chunked and submitted correctly.
     #[test]
     fn batch_larger_than_queue_depth_is_chunked() {
         let p = tmpfile("chunked");
         let mut f = match UringFile::open(&p, 4) {
             Ok(f) => f,
-            Err(_) => return, // 环境不支持时优雅跳过
+            Err(_) => return, // skip gracefully when the environment does not support it
         };
         let bufs: Vec<Vec<u8>> = (0..37u8).map(|i| vec![i; 16]).collect();
         let refs: Vec<&[u8]> = bufs.iter().map(|b| b.as_slice()).collect();
-        let n = f.write_at(&refs, 1024).unwrap(); // 起始偏移非 0
+        let n = f.write_at(&refs, 1024).unwrap(); // nonzero start offset
         assert_eq!(n, 37 * 16);
         f.fsync().unwrap();
         let got = std::fs::read(&p).unwrap();
@@ -206,7 +206,7 @@ mod tests {
         std::fs::remove_dir_all(p.parent().unwrap()).ok();
     }
 
-    /// 空缓冲批 = 无操作；打开即失败（非 Linux/无权限）时 Err 不 panic。
+    /// An empty buffer batch is a no-op; when opening itself fails (non-Linux/no permission), Err without panic.
     #[test]
     fn empty_batch_and_graceful_open() {
         let p = tmpfile("empty");
@@ -217,7 +217,7 @@ mod tests {
                 f.fsync().unwrap();
                 assert_eq!(std::fs::read(&p).unwrap(), b"x");
             }
-            Err(_) => { /* 优雅降级路径由 rti-wal 测试覆盖 */ }
+            Err(_) => { /* the graceful degradation path is covered by rti-wal tests */ }
         }
         std::fs::remove_dir_all(p.parent().unwrap()).ok();
     }

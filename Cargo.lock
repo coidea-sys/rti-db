@@ -42,15 +42,15 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "rti-buffer"
-version = "0.1.0"
+version = "0.6.0"
 
 [[package]]
 name = "rti-core"
-version = "0.1.0"
+version = "0.6.0"
 
 [[package]]
 name = "rti-db"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "rti-buffer",
  "rti-core",
@@ -62,7 +62,7 @@ dependencies = [
 
 [[package]]
 name = "rti-edge"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "rti-core",
  "rti-db",
@@ -78,7 +78,7 @@ version = "0.1.0"
 
 [[package]]
 name = "rti-net"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "rti-core",
  "rti-db",
@@ -87,14 +87,14 @@ dependencies = [
 
 [[package]]
 name = "rti-query"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "rti-core",
 ]
 
 [[package]]
 name = "rti-raft"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "rti-core",
  "rti-wal",
@@ -102,7 +102,7 @@ dependencies = [
 
 [[package]]
 name = "rti-store"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "crc32fast",
  "rti-core",
@@ -111,7 +111,7 @@ dependencies = [
 
 [[package]]
 name = "rti-wal"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "crc32fast",
  "rti-core",
@@ -120,7 +120,7 @@ dependencies = [
 
 [[package]]
 name = "rti-wal-uring"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "io-uring",
 ]

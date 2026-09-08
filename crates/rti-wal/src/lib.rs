@@ -1,30 +1,30 @@
-//! rti-wal：预写日志。
+//! rti-wal: write-ahead log.
 //!
-//! 帧格式（小端，定长 28 字节 + CRC，共 32 字节）：
+//! Frame format (little-endian, fixed 28 bytes + CRC, 32 bytes total):
 //!
 //! ```text
 //! ┌──────────┬────────┬───────────┬───────────┬─────────┐
 //! │ len u32  │ series │ ts   i64  │ value f64 │ crc u32 │
-//! │ (=24)    │  u32   │           │  (bits)   │ (帧体)  │
+//! │ (=24)    │  u32   │           │  (bits)   │ (frame body)  │
 //! └──────────┴────────┴───────────┴───────────┴─────────┘
 //! ```
 //!
-//! - append-only：只追加，单写者；
-//! - CRC32 覆盖 len 与帧体；恢复时遇到 CRC 不匹配或残帧即**截断**，
-//!   之前的记录全部有效；
-//! - 组提交：按 [`SyncPolicy`] 决定何时 `sync_data`。
+//! - append-only: append only, single writer;
+//! - CRC32 covers len and the frame body; on recovery, a CRC mismatch or partial frame means
+//!   **truncate** — all records before it are valid;
+//! - group commit: [`SyncPolicy`] decides when to `sync_data`.
 //!
-//! v0.2：写入路径抽象为 [`WalWriter`] trait——[`StdWalWriter`]
-//! （v0.1 默认，[`Wal`] 内部委托给它，API 不变）与 feature
-//! `io-uring`（Linux only）的 `IoUringWalWriter`（批量 SQE 提交 +
-//! 组提交）；`WalWriter::auto` 探测失败优雅回退 Std。
+//! v0.2: the write path is abstracted as the [`WalWriter`] trait — [`StdWalWriter`]
+//! (the v0.1 default, which [`Wal`] delegates to internally with an unchanged API) and, under feature
+//! `io-uring` (Linux only), `IoUringWalWriter` (batched SQE submission + group commit);
+//! `WalWriter::auto` falls back to Std gracefully when probing fails.
 //!
-//! v0.5：feature `io-uring` 下新增 [`IoUringPipelinedWalWriter`]——
-//! io_uring **在途批流水**：提交 SQE 后不等待，CQE reap 循环增量回收，
-//! `sync_now` 只等本组完成事件 + fsync；在途深度（默认 64）满时按
-//! 配置返回 [`Error::Backpressure`] 或阻塞。`WalWriter::auto` 行为不变。
-//! unsafe 的 io_uring 胶水隔离在 `rti-wal-uring` crate，本 crate
-//! 保持 `#![forbid(unsafe_code)]`。
+//! v0.5: under feature `io-uring`, adds [`IoUringPipelinedWalWriter`] — an io_uring **in-flight
+//! batch pipeline**: no waiting after submitting SQEs, an incremental CQE reap loop, `sync_now`
+//! waits only for this group's completion events + fsync; when the in-flight depth (default 64)
+//! is full, returns [`Error::Backpressure`] or blocks per configuration. `WalWriter::auto` behavior
+//! is unchanged. The unsafe io_uring glue is isolated in the `rti-wal-uring` crate; this crate
+//! stays `#![forbid(unsafe_code)]`.
 
 #![forbid(unsafe_code)]
 
@@ -41,25 +41,25 @@ pub use batch::{BatchSubmitter, BatchingWalWriter, DEFAULT_MAX_BATCH_BYTES};
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
 pub use batch::{IoUringPipelineSubmitter, IoUringPipelinedWalWriter, IoUringSubmitter, IoUringWalWriter};
 
-/// 一条 WAL 记录：序列 id + 采样点。
+/// One WAL record: series id + sample point.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Record {
-    /// 序列 id。
+    /// Series id.
     pub series: SeriesId,
-    /// 采样点。
+    /// Sample point.
     pub sample: Sample,
 }
 
 impl Record {
-    /// 构造一条记录。
+    /// Construct a record.
     pub fn new(series: SeriesId, ts: Timestamp, value: f64) -> Self {
         Self { series, sample: Sample { ts, value } }
     }
 }
 
-/// 帧长字段之后的帧体字节数：series(4) + ts(8) + value(8)。
+/// Frame-body bytes after the length field: series(4) + ts(8) + value(8).
 const BODY_LEN: u32 = 20;
-/// 整帧字节数：len(4) + body(20) + crc(4)。
+/// Whole-frame bytes: len(4) + body(20) + crc(4).
 const FRAME_LEN: usize = 28;
 
 fn encode_frame(rec: &Record, out: &mut [u8; FRAME_LEN]) {
@@ -71,7 +71,7 @@ fn encode_frame(rec: &Record, out: &mut [u8; FRAME_LEN]) {
     out[24..28].copy_from_slice(&crc.to_le_bytes());
 }
 
-/// checkpoint 临时文件路径（`wal.log` → `wal.tmp`）。
+/// Checkpoint temporary-file path (`wal.log` → `wal.tmp`).
 fn checkpoint_tmp_path(path: &Path) -> PathBuf {
     path.with_extension("tmp")
 }
@@ -96,22 +96,22 @@ fn decode_frame(buf: &[u8]) -> std::result::Result<Record, ()> {
 
 // ---------------------------------------------------------------- WalWriter
 
-/// WAL 写入后端抽象（v0.2）。
+/// WAL write-backend abstraction (v0.2).
 ///
-/// v0.1 的 std `File` 实现保留为 [`StdWalWriter`]（默认后端）；
-/// feature `io-uring`（Linux only）下另有 [`IoUringWalWriter`]
-/// （批量 SQE 提交 + 组提交 fsync）。
+/// The v0.1 std `File` implementation is kept as [`StdWalWriter`] (default backend);
+/// under feature `io-uring` (Linux only) there is also [`IoUringWalWriter`]
+/// (batched SQE submission + group-commit fsync).
 ///
-/// 后端选择用 [`WalWriter::auto`]：探测失败（老内核 / seccomp 沙箱 /
-/// 未启用 feature）自动回退 Std，永不 panic。
+/// Backend selection uses [`WalWriter::auto`]: on probe failure (old kernel / seccomp sandbox /
+/// feature disabled) it automatically falls back to Std — never panics.
 pub trait WalWriter {
-    /// 追加一条记录，返回其字节偏移。O(1) 摊销。
+    /// Append one record, returning its byte offset. Amortized O(1).
     fn append(&mut self, rec: &Record) -> Result<u64>;
 
-    /// 批量追加，返回**首条**记录的字节偏移。
+    /// Batch append, returning the byte offset of the **first** record.
     ///
-    /// 默认实现逐条 [`WalWriter::append`]；io_uring 后端覆写为
-    /// 「整批编码进同一 pending 缓冲、一次 SQE 组提交」。
+    /// The default implementation appends one by one via [`WalWriter::append`]; io_uring backends
+    /// override it to 'encode the whole batch into the same pending buffer, one SQE group commit'.
     fn append_batch(&mut self, recs: &[Record]) -> Result<u64> {
         let mut first = self.offset();
         for (i, r) in recs.iter().enumerate() {
@@ -123,24 +123,24 @@ pub trait WalWriter {
         Ok(first)
     }
 
-    /// 立即持久化边界：flush 缓冲 + 刷盘（组提交的组边界 / 关闭前调用）。
+    /// Immediate durability boundary: flush buffers + fsync (called at group boundaries of group commit / before close).
     fn sync_now(&mut self) -> Result<()>;
 
-    /// 当前写入偏移（即逻辑文件长度）。
+    /// Current write offset (i.e. logical file length).
     fn offset(&self) -> u64;
 
-    /// 本写者生效的同步策略（兼容 v0.1 [`Wal`] 语义）。
+    /// Sync policy in effect for this writer (compatible with v0.1 [`Wal`] semantics).
     fn flush_policy(&self) -> SyncPolicy;
 
-    /// 后端名（诊断/测试用）：`"std"` 或 `"io_uring"`。
+    /// Backend name (diagnostics/tests): `"std"` or `"io_uring"`.
     fn backend_name(&self) -> &'static str;
 }
 
 impl dyn WalWriter {
-    /// 自动选择后端：优先 io_uring（feature 启用 + Linux + 内核允许），
-    /// 探测失败优雅回退 [`StdWalWriter`]。
+    /// Automatic backend selection: prefer io_uring (feature enabled + Linux + kernel allows),
+    /// falling back gracefully to [`StdWalWriter`] when probing fails.
     ///
-    /// 设环境变量 `RTI_WAL_FORCE_STD=1` 可强制回退（测试/部署逃生门）。
+    /// Set environment variable `RTI_WAL_FORCE_STD=1` to force the fallback (test/deployment escape hatch).
     pub fn auto(path: impl AsRef<Path>, sync: SyncPolicy) -> Result<Box<dyn WalWriter>> {
         #[cfg(all(feature = "io-uring", target_os = "linux"))]
         {
@@ -154,23 +154,23 @@ impl dyn WalWriter {
     }
 }
 
-/// std `File` + `BufWriter` 的 WAL 写者（v0.1 默认后端，语义不变）。
+/// WAL writer over std `File` + `BufWriter` (v0.1 default backend, semantics unchanged).
 pub struct StdWalWriter {
     writer: BufWriter<File>,
     path: PathBuf,
     sync: SyncPolicy,
-    /// 下一条记录的偏移。
+    /// Offset of the next record.
     offset: u64,
     last_sync: Instant,
-    /// 批量编码暂存缓冲（复用，避免每批分配）。
+    /// Staging buffer for batch encoding (reused, avoiding per-batch allocation).
     scratch: Vec<u8>,
 }
 
 impl StdWalWriter {
-    /// 打开（不存在则创建）`path` 并定位到末尾；已有内容被视为历史有效记录。
+    /// Open (creating if missing) `path` and seek to the end; existing contents are treated as valid historical records.
     ///
-    /// v0.6：同时清理 checkpoint 中途崩溃可能遗留的临时文件（`wal.tmp`）——
-    /// rename 之前崩溃时旧 WAL 完好，临时文件可直接删除。
+    /// v0.6: also cleans up temporary files (`wal.tmp`) that a crash mid-checkpoint may have left —
+    /// the old WAL is intact when the crash happens before rename, so the temporary file can simply be deleted.
     pub fn open(path: impl AsRef<Path>, sync: SyncPolicy) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let tmp = checkpoint_tmp_path(&path);
@@ -191,17 +191,17 @@ impl StdWalWriter {
         })
     }
 
-    /// 文件路径。
+    /// File path.
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// v0.6：批量追加——整批编码进暂存缓冲、一次 `write_all`，
-    /// 随后只做一次 [`StdWalWriter::maybe_sync`] 检查。
+    /// v0.6: batch append — encode the whole batch into the staging buffer, one `write_all`,
+    /// then a single [`StdWalWriter::maybe_sync`] check.
     ///
-    /// 与逐条 [`WalWriter::append`] 语义等价（同一帧格式、同一策略），
-    /// 但把每条的 `write_all` + 时钟读取摊薄到每批一次；
-    /// [`SyncPolicy::Always`] 下整批一次 sync（调用方按批即组边界）。
+    /// Semantically equivalent to per-record [`WalWriter::append`] (same frame format, same policy),
+    /// but amortizes the per-record `write_all` + clock read into one per batch;
+    /// under [`SyncPolicy::Always`] the whole batch syncs once (callers treat a batch as a group boundary).
     pub fn append_batch_fast(&mut self, recs: &[Record]) -> Result<()> {
         if recs.is_empty() {
             return Ok(());
@@ -218,26 +218,26 @@ impl StdWalWriter {
         self.maybe_sync()
     }
 
-    /// v0.6：仅在 sync 到期时刷盘（Group：距上次 sync ≥ interval）。
+    /// v0.6: flush only when sync is due (Group: >= interval since the last sync).
     ///
-    /// 组提交的调用点（ingest 批边界）以此替代无条件 `sync_now`：
-    /// fsync 频率由策略 interval 决定，而不是由批大小决定。
-    /// `Always` 策略下等同 `sync_now`；`None` 策略下为 no-op。
+    /// Group-commit call sites (ingest batch boundaries) use this instead of unconditional `sync_now`:
+    /// fsync frequency is governed by the policy interval, not the batch size.
+    /// Equivalent to `sync_now` under `Always`; a no-op under `None`.
     pub fn sync_if_due(&mut self) -> Result<()> {
         self.maybe_sync()
     }
 
-    /// v0.6 WAL checkpoint：截断 WAL，仅保留 `keep` 中的记录。
+    /// v0.6 WAL checkpoint: truncate the WAL, keeping only the records in `keep`.
     ///
-    /// **调用方必须保证**除 `keep` 外的全部记录已被 segment 覆盖并落盘
-    /// （rti-db 在 MemTable seal 成功、segment fsync 之后调用；`keep`
-    /// 为 seal 点后进入新 MemTable、仍需 WAL 保护的记录）。
+    /// **The caller must guarantee** that all records outside `keep` are already covered by segments
+    /// and persisted (rti-db calls this after the MemTable seal succeeds and the segment is fsynced;
+    /// `keep` holds the records that entered the new MemTable after the seal point and still need WAL protection).
     ///
-    /// 崩溃安全：`keep` 先完整编码写入 `wal.tmp` 并 fsync，再原子
-    /// rename 覆盖 `wal.log`，最后 fsync 目录。rename 前崩溃 → 旧 WAL
-    /// 完好（已覆盖记录与 segment 重复，恢复时按 ts 去重）；rename 后
-    /// 崩溃 → 新 WAL（仅 `keep`）+ 已落盘 segment，两方向都无丢失。
-    /// 偏移重置为 `keep` 的字节长度，后续追加接在其后。
+    /// Crash safety: `keep` is first fully encoded into `wal.tmp` and fsynced, then atomically
+    /// renamed over `wal.log`, and finally the directory is fsynced. Crash before rename → the old WAL
+    /// is intact (covered records duplicate the segments; recovery deduplicates by ts); crash after rename →
+    /// the new WAL (only `keep`) + persisted segments — no loss in either direction.
+    /// The offset resets to `keep`'s byte length; subsequent appends follow it.
     pub fn checkpoint_keep(&mut self, keep: &[Record]) -> Result<()> {
         self.writer.flush()?;
         let tmp = checkpoint_tmp_path(&self.path);
@@ -251,8 +251,8 @@ impl StdWalWriter {
                 self.scratch.extend_from_slice(&frame);
             }
             f.write_all(&self.scratch)?;
-            // SyncPolicy::None（「不刷盘」语义）下跳过 fsync：
-            // 进程崩溃安全由页缓存保证，不为未要求的持久性付费。
+            // fsync is skipped under SyncPolicy::None ('no flushing' semantics):
+            // process-crash safety comes from the page cache; no paying for durability that was never requested.
             if self.sync != SyncPolicy::None {
                 f.sync_data()?;
             }
@@ -260,7 +260,7 @@ impl StdWalWriter {
         std::fs::rename(&tmp, &self.path)?;
         if self.sync != SyncPolicy::None {
             if let Some(dir) = self.path.parent() {
-                // 保证 rename 的目录项持久（Linux 下目录可以只读打开）。
+                // make the rename's directory entry durable (on Linux a directory can be opened read-only).
                 if let Ok(d) = File::open(dir) {
                     let _ = d.sync_data();
                 }
@@ -273,18 +273,18 @@ impl StdWalWriter {
         Ok(())
     }
 
-    /// v0.6：把已缓冲但尚未写给 OS 的字节 flush 到内核（不 fsync）。
+    /// v0.6: flush bytes that are buffered but not yet given to the OS into the kernel (no fsync).
     ///
-    /// ingest 批边界调用：保证「已应用」的记录至少离开进程地址空间——
-    /// 进程崩溃（kill -9）时 OS 页缓存仍在，这是 `put_durable`
-    /// 在 Group/None 档下的崩溃不丢语义基础；机器掉电语义仍由
-    /// [`SyncPolicy`] 的 fsync 频率决定。
+    /// Called at ingest batch boundaries: guarantees 'applied' records have at least left the process
+    /// address space — on a process crash (kill -9) the OS page cache still holds them; this is the
+    /// crash-safety basis of `put_durable` under the Group/None tiers; machine power-loss semantics
+    /// are still governed by the [`SyncPolicy`] fsync frequency.
     pub fn flush_os(&mut self) -> Result<()> {
         self.writer.flush()?;
         Ok(())
     }
 
-    /// 按同步策略决定是否刷盘。
+    /// Decide whether to fsync per the sync policy.
     fn maybe_sync(&mut self) -> Result<()> {
         match self.sync {
             SyncPolicy::Always => self.sync_now(),
@@ -332,72 +332,72 @@ impl WalWriter for StdWalWriter {
 
 impl Drop for StdWalWriter {
     fn drop(&mut self) {
-        // 尽力 flush；Drop 中忽略错误。
+        // best-effort flush; errors ignored in Drop.
         let _ = self.writer.flush();
     }
 }
 
-/// 预写日志（append-only，单写者）。
+/// Write-ahead log (append-only, single writer).
 ///
-/// v0.1 公共 API 保持不变；内部委托给 [`StdWalWriter`]。
+/// The v0.1 public API is unchanged; internally delegates to [`StdWalWriter`].
 pub struct Wal {
     inner: StdWalWriter,
 }
 
 impl Wal {
-    /// 打开（不存在则创建）`path` 并定位到末尾；已有内容被视为历史有效记录。
+    /// Open (creating if missing) `path` and seek to the end; existing contents are treated as valid historical records.
     pub fn open(path: impl AsRef<Path>, sync: SyncPolicy) -> Result<Self> {
         Ok(Self { inner: StdWalWriter::open(path, sync)? })
     }
 
-    /// 追加一条记录，返回其字节偏移。
+    /// Append one record, returning its byte offset.
     ///
-    /// O(1)：只写顺序缓冲；是否落盘由 [`SyncPolicy`] 决定。
+    /// O(1): writes only to a sequential buffer; durability is governed by [`SyncPolicy`].
     pub fn append(&mut self, rec: &Record) -> Result<u64> {
         self.inner.append(rec)
     }
 
-    /// 立即 flush 缓冲并 `sync_data`（组提交的组边界 / 关闭前调用）。
+    /// Flush the buffer and `sync_data` immediately (group boundary of group commit / before close).
     pub fn sync_now(&mut self) -> Result<()> {
         self.inner.sync_now()
     }
 
-    /// v0.6：批量追加（整批一次编码一次写，按策略检查 sync）。语义同逐条 [`Wal::append`]。
+    /// v0.6: batch append (whole batch encoded once and written once, sync checked per policy). Same semantics as per-record [`Wal::append`].
     pub fn append_batch(&mut self, recs: &[Record]) -> Result<()> {
         self.inner.append_batch_fast(recs)
     }
 
-    /// v0.6：仅在 sync 到期时刷盘（组提交的批边界调用；fsync 频率由 interval 决定）。
+    /// v0.6: fsync only when due (called at group-commit batch boundaries; fsync frequency governed by the interval).
     pub fn sync_if_due(&mut self) -> Result<()> {
         self.inner.sync_if_due()
     }
 
-    /// v0.6 WAL checkpoint：截断 WAL，仅保留 `keep` 中的记录
-    /// （调用方保证其余记录已全部被 segment 覆盖并落盘）。
+    /// v0.6 WAL checkpoint: truncate the WAL, keeping only the records in `keep`
+    /// (the caller guarantees all other records are covered by segments and persisted).
     pub fn checkpoint_keep(&mut self, keep: &[Record]) -> Result<()> {
         self.inner.checkpoint_keep(keep)
     }
 
-    /// v0.6：flush 用户态缓冲到 OS（不 fsync）；ingest 批边界调用。
+    /// v0.6: flush user-space buffers to the OS (no fsync); called at ingest batch boundaries.
     pub fn flush_os(&mut self) -> Result<()> {
         self.inner.flush_os()
     }
 
-    /// 当前写入偏移（即逻辑文件长度）。
+    /// Current write offset (i.e. logical file length).
     pub fn offset(&self) -> u64 {
         self.inner.offset()
     }
 
-    /// 文件路径。
+    /// File path.
     pub fn path(&self) -> &Path {
         self.inner.path()
     }
 
-    /// 崩溃恢复：顺序扫描，返回迭代有效记录的迭代器。
+    /// Crash recovery: sequential scan returning an iterator over valid records.
     ///
-    /// 遇到 CRC 不匹配、长度字段非法或残帧时停止——即"损坏截断"语义：
-    /// 损坏点之后的字节（崩溃半写）被忽略。整个文件预读入内存，
-    /// 迭代本身零拷贝、零分配。
+    /// Stops at a CRC mismatch, illegal length field, or partial frame — the 'truncate at corruption' semantics:
+    /// bytes after the corruption point (crash-torn writes) are ignored. The whole file is pre-read into
+    /// memory; iteration itself is zero-copy and zero-allocation.
     pub fn recover(path: impl AsRef<Path>) -> Result<RecoverIter> {
         let mut buf = Vec::new();
         let mut file = match File::open(path.as_ref()) {
@@ -411,14 +411,14 @@ impl Wal {
     }
 }
 
-/// WAL 恢复迭代器：逐帧产出有效记录，损坏处停止。
+/// WAL recovery iterator: yields valid records frame by frame, stopping at corruption.
 pub struct RecoverIter {
     buf: Vec<u8>,
     pos: usize,
 }
 
 impl RecoverIter {
-    /// 遇到损坏帧时的字节偏移（若因损坏而终止）。
+    /// Byte offset of the corrupt frame (if terminated due to corruption).
     pub fn corrupt_offset(&self) -> Option<u64> {
         if self.pos < self.buf.len() {
             Some(self.pos as u64)
@@ -433,7 +433,7 @@ impl Iterator for RecoverIter {
 
     fn next(&mut self) -> Option<Record> {
         if self.pos + FRAME_LEN > self.buf.len() {
-            // 残帧：视为此处截断
+            // partial frame: treat as truncated here
             return None;
         }
         match decode_frame(&self.buf[self.pos..self.pos + FRAME_LEN]) {
@@ -441,7 +441,7 @@ impl Iterator for RecoverIter {
                 self.pos += FRAME_LEN;
                 Some(rec)
             }
-            Err(()) => None, // CRC 损坏：截断
+            Err(()) => None, // CRC corruption: truncate
         }
     }
 }
@@ -481,7 +481,7 @@ mod tests {
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// SPEC §5 点名：CRC 损坏截断恢复测试。
+    /// Named by SPEC §5: CRC-corruption truncation recovery test.
     #[test]
     fn recover_truncates_on_crc_corruption() {
         let d = tmpdir("corrupt");
@@ -493,7 +493,7 @@ mod tests {
             }
             w.sync_now().unwrap();
         }
-        // 破坏第 3 条记录（offset = 2*FRAME_LEN）的一个 payload 字节
+        // corrupt one payload byte of the 3rd record (offset = 2*FRAME_LEN)
         {
             use std::io::{Seek, SeekFrom, Write};
             let mut f = OpenOptions::new().write(true).open(&p).unwrap();
@@ -502,7 +502,7 @@ mod tests {
         }
         let mut it = Wal::recover(&p).unwrap();
         let recs: Vec<Record> = it.by_ref().collect();
-        assert_eq!(recs.len(), 2, "损坏点后的记录必须被截断");
+        assert_eq!(recs.len(), 2, "records after the corruption point must be truncated");
         assert_eq!(recs[0], Record::new(0, 0, 0.0));
         assert_eq!(recs[1], Record::new(1, 10, 1.0));
         assert_eq!(it.corrupt_offset(), Some((2 * FRAME_LEN) as u64));
@@ -518,7 +518,7 @@ mod tests {
             w.append(&Record::new(7, 70, 7.0)).unwrap();
             w.sync_now().unwrap();
         }
-        // 模拟崩溃半写：追加半帧垃圾
+        // simulate a crash-torn write: append half a frame of garbage
         {
             use std::io::Write;
             let mut f = OpenOptions::new().append(true).open(&p).unwrap();
@@ -537,10 +537,10 @@ mod tests {
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// 环境变量是进程全局状态，触环境变量的测试必须串行。
+    /// Environment variables are process-global state; tests touching them must run serially.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// v0.1 API 不变：Wal 委托 StdWalWriter，语义逐字节一致。
+    /// v0.1 API unchanged: Wal delegates to StdWalWriter, byte-for-byte identical semantics.
     #[test]
     fn wal_delegates_to_std_writer_unchanged() {
         let d = tmpdir("delegate");
@@ -556,7 +556,7 @@ mod tests {
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// 通过 trait object 使用 StdWalWriter（v0.2 多态写路径）。
+    /// Use StdWalWriter through a trait object (v0.2 polymorphic write path).
     #[test]
     fn std_wal_writer_via_trait_object() {
         let d = tmpdir("traitobj");
@@ -578,9 +578,9 @@ mod tests {
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// SPEC 点名：降级路径测试。`RTI_WAL_FORCE_STD=1` 强制回退 Std，
-    /// 模拟 io_uring 不可用（seccomp 沙箱/老内核/未启用 feature）的场景；
-    /// 回退后写读必须完整可用。
+    /// Named by SPEC: degradation-path test. `RTI_WAL_FORCE_STD=1` forces the Std fallback,
+    /// simulating io_uring being unavailable (seccomp sandbox / old kernel / feature disabled);
+    /// after the fallback, writing and reading must work fully.
     #[test]
     fn auto_falls_back_to_std_when_forced() {
         let _g = ENV_LOCK.lock().unwrap();
@@ -590,7 +590,7 @@ mod tests {
         let res = <dyn WalWriter>::auto(&p, SyncPolicy::Always);
         std::env::remove_var("RTI_WAL_FORCE_STD");
         let mut w = res.unwrap();
-        assert_eq!(w.backend_name(), "std", "强制回退后必须是 Std 后端");
+        assert_eq!(w.backend_name(), "std", "must be the Std backend after the forced fallback");
         w.append(&Record::new(1, 1, 1.0)).unwrap();
         w.sync_now().unwrap();
         drop(w);
@@ -598,8 +598,8 @@ mod tests {
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// 未强制时：feature on + 内核允许 → io_uring；否则优雅回退 std。
-    /// 两种结果都必须可写可读（永不 panic / 永不 Err）。
+    /// When not forced: feature on + kernel allows → io_uring; otherwise a graceful std fallback.
+    /// Both outcomes must be writable and readable (never panic / never Err).
     #[test]
     fn auto_picks_available_backend_and_works() {
         let _g = ENV_LOCK.lock().unwrap();
@@ -613,7 +613,7 @@ mod tests {
             assert_eq!(w.backend_name(), expect);
         }
         #[cfg(not(all(feature = "io-uring", target_os = "linux")))]
-        assert_eq!(w.backend_name(), "std", "无 feature/非 Linux 必须回退 Std");
+        assert_eq!(w.backend_name(), "std", "no feature / non-Linux must fall back to Std");
         for i in 0..4u32 {
             w.append(&Record::new(i, i as i64, i as f64)).unwrap();
         }
@@ -623,8 +623,8 @@ mod tests {
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// v0.6：checkpoint 截断——截断后 offset 归零、旧记录不可恢复、
-    /// 新写入正常追加且恢复只见新记录。
+    /// v0.6: checkpoint truncation — after truncation the offset is zero, old records are unrecoverable,
+    /// new writes append normally and recovery sees only new records.
     #[test]
     fn checkpoint_truncates_and_recovers_only_new_records() {
         let d = tmpdir("checkpoint");
@@ -637,23 +637,23 @@ mod tests {
             w.sync_now().unwrap();
             assert_eq!(w.offset(), 10 * FRAME_LEN as u64);
             w.checkpoint_keep(&[]).unwrap();
-            assert_eq!(w.offset(), 0, "checkpoint 后偏移归零");
-            assert_eq!(std::fs::metadata(&p).unwrap().len(), 0, "checkpoint 后文件为空");
-            // 截断后继续写入
+            assert_eq!(w.offset(), 0, "offset resets to zero after checkpoint");
+            assert_eq!(std::fs::metadata(&p).unwrap().len(), 0, "file is empty after checkpoint");
+            // keep writing after truncation
             for i in 100..105u32 {
                 w.append(&Record::new(i, i as i64, i as f64)).unwrap();
             }
             w.sync_now().unwrap();
         }
         let recs: Vec<Record> = Wal::recover(&p).unwrap().collect();
-        assert_eq!(recs.len(), 5, "恢复只能看到 checkpoint 之后的记录");
+        assert_eq!(recs.len(), 5, "recovery must only see records after the checkpoint");
         assert_eq!(recs[0], Record::new(100, 100, 100.0));
         assert_eq!(recs[4], Record::new(104, 104, 104.0));
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// v0.6：checkpoint 保留尾巴——seal 点后进入新 MemTable 的记录
-    /// 必须留在 WAL 中，截断只丢弃已被 segment 覆盖的前缀。
+    /// v0.6: checkpoint keeps the tail — records that entered the new MemTable after the seal point
+    /// must stay in the WAL; truncation only discards the prefix already covered by segments.
     #[test]
     fn checkpoint_keep_preserves_uncovered_tail() {
         let d = tmpdir("checkpoint-keep");
@@ -665,22 +665,22 @@ mod tests {
                 w.append(&Record::new(i, i as i64, i as f64)).unwrap();
             }
             w.sync_now().unwrap();
-            // 前 50 条已被 segment 覆盖，保留 50..53
+            // the first 50 records are covered by segments; keep 50..53
             w.checkpoint_keep(&tail).unwrap();
             assert_eq!(w.offset(), 3 * FRAME_LEN as u64);
-            // 截断后追加的新记录接在保留尾巴之后
+            // new records appended after truncation follow the retained tail
             w.append(&Record::new(60, 60, 60.0)).unwrap();
             w.sync_now().unwrap();
         }
         let recs: Vec<Record> = Wal::recover(&p).unwrap().collect();
-        assert_eq!(recs.len(), 4, "保留尾巴 3 条 + 新追加 1 条");
+        assert_eq!(recs.len(), 4, "retained tail of 3 + 1 newly appended");
         assert_eq!(recs[0], Record::new(50, 50, 50.0));
         assert_eq!(recs[3], Record::new(60, 60, 60.0));
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// v0.6：checkpoint 中途崩溃模拟——rename 前留下 wal.tmp，
-    /// 旧 WAL 完好；再次打开时临时文件被清理，数据无损。
+    /// v0.6: simulated crash mid-checkpoint — a wal.tmp is left before rename,
+    /// the old WAL intact; reopening cleans up the temporary file with no data loss.
     #[test]
     fn stale_checkpoint_tmp_is_cleaned_on_open() {
         let d = tmpdir("checkpoint-stale");
@@ -690,20 +690,20 @@ mod tests {
             w.append(&Record::new(1, 10, 1.5)).unwrap();
             w.sync_now().unwrap();
         }
-        // 模拟 rename 前崩溃：留下非空 wal.tmp
+        // simulate a crash before rename: leave a non-empty wal.tmp
         std::fs::write(d.join("wal.tmp"), b"garbage").unwrap();
         {
             let mut w = Wal::open(&p, SyncPolicy::Always).unwrap();
-            assert!(!d.join("wal.tmp").exists(), "open 必须清理遗留临时文件");
+            assert!(!d.join("wal.tmp").exists(), "open must clean up leftover temporary files");
             w.append(&Record::new(2, 20, 2.5)).unwrap();
             w.sync_now().unwrap();
         }
         let recs: Vec<Record> = Wal::recover(&p).unwrap().collect();
-        assert_eq!(recs.len(), 2, "旧 WAL 不受遗留临时文件影响");
+        assert_eq!(recs.len(), 2, "the old WAL is unaffected by leftover temporary files");
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// v0.6：批量追加与逐条追加帧格式逐字节一致。
+    /// v0.6: batch append and per-record append produce byte-identical frame formats.
     #[test]
     fn append_batch_matches_per_record_encoding() {
         let d = tmpdir("batch");
@@ -723,7 +723,7 @@ mod tests {
             assert_eq!(w.offset(), 50 * FRAME_LEN as u64);
             w.sync_now().unwrap();
         }
-        assert_eq!(std::fs::read(&p1).unwrap(), std::fs::read(&p2).unwrap(), "批量与逐条编码必须一致");
+        assert_eq!(std::fs::read(&p1).unwrap(), std::fs::read(&p2).unwrap(), "batch and per-record encodings must be identical");
         assert_eq!(Wal::recover(&p2).unwrap().count(), 50);
         std::fs::remove_dir_all(&d).ok();
     }

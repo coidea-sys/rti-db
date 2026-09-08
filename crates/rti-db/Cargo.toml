@@ -1,14 +1,15 @@
 [package]
 name = "rti-db"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "rti-db facade: Db::open/put/scan, ingest pipeline, benches"
 
 [features]
-# 热路径分配计数测试接口（全局计数分配器，仅测试用）。
+# hot-path allocation counting test hook (global counting allocator, test-only).
 alloc-count = ["rti-mem/alloc-count"]
-# v0.5：S3 冷层端到端（透传 rti-store 的 s3 feature；纯 std HTTP，零新增依赖）。
+# v0.5: S3 cold tier end-to-end (forwards rti-store's s3 feature; pure-std HTTP, zero new dependencies).
 s3 = ["rti-store/s3"]
 
 [dependencies]

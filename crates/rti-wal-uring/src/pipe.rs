@@ -1,20 +1,20 @@
-//! io_uring **在途批流水**（v0.5 Stream B，仅本文件豁免 unsafe）。
+//! io_uring **in-flight batch pipeline** (v0.5 Stream B; only this file is exempt from the unsafe ban).
 //!
-//! 与 [`crate::UringFile`]（v0.2，同步阻塞）的差异：
+//! Differences from [`crate::UringFile`] (v0.2, synchronous blocking):
 //!
-//! - [`UringPipeline::push`] 提交写 SQE 后**不等待**完成即返回批令牌
-//!   （`BatchToken`），多批可同时在内核在途；
-//! - 完成事件由 CQE reap 循环增量回收（[`UringPipeline::reap_available`] /
-//!   阻塞版），回收即释放对应槽位；
-//! - [`UringPipeline::flush`] 只等待**本批（令牌）及之前**的完成事件，
-//!   不 drain 整个 ring；[`UringPipeline::sync`] = flush(最新批) + fsync；
-//! - 在途深度上限可配（[`PipelineConfig::max_in_flight`]，默认 64）；
-//!   深度满时按 [`BackpressurePolicy`] 返回 [`PipeError::Backpressure`]
-//!   或阻塞等待槽位。
+//! - [`UringPipeline::push`] returns a batch token (`BatchToken`) **without waiting** for completion
+//!   after submitting write SQEs; multiple batches can be in flight in the kernel at once;
+//! - completion events are reclaimed incrementally by a CQE reap loop ([`UringPipeline::reap_available`] /
+//!   the blocking variant); reclaiming frees the corresponding slot;
+//! - [`UringPipeline::flush`] waits only for the completion events of **this batch (token) and earlier**,
+//!   without draining the whole ring; [`UringPipeline::sync`] = flush(latest batch) + fsync;
+//! - the in-flight depth cap is configurable ([`PipelineConfig::max_in_flight`], default 64);
+//!   when the depth is full, returns [`PipeError::Backpressure`] or blocks waiting for a slot,
+//!   per [`BackpressurePolicy`].
 //!
-//! 安全模型：每批数据先**拷贝**进 pipeline 自有的槽位缓冲，SQE 按裸指针
-//! 引用槽位；槽位只有在对应 CQE 被 reap 后才复用，且 `Drop` 会 drain
-//! 全部在途 SQE——因此内核持有裸指针的窗口严格在缓冲有效期内。
+//! Safety model: each batch's data is first **copied** into a pipeline-owned slot buffer, and SQEs
+//! reference the slot by raw pointer; a slot is reused only after its CQE has been reaped, and `Drop`
+//! drains all in-flight SQEs — so the window where the kernel holds raw pointers is strictly within the buffer's lifetime.
 
 #![allow(unsafe_code)]
 
@@ -26,30 +26,30 @@ use std::path::Path;
 
 use io_uring::{opcode, types, IoUring};
 
-/// FSYNC SQE 的 user_data 标记（写 SQE 的 user_data 是槽位下标，远小于此值）。
+/// user_data marker for FSYNC SQEs (write SQEs use the slot index as user_data, far smaller than this).
 const FSYNC_TAG: u64 = u64::MAX;
 
-/// 批令牌：`push` 返回的单调递增批号，`flush(token)` 只等 ≤ token 的批完成。
+/// Batch token: the monotonically increasing batch number returned by `push`; `flush(token)` waits only for batches <= token.
 pub type BatchToken = u64;
 
-/// 在途深度满时的背压策略。
+/// Backpressure policy when the in-flight depth is full.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackpressurePolicy {
-    /// 立即返回 [`PipeError::Backpressure`]，由调用方决定重试时机
-    /// （fail-fast，时延有界，硬实时场景推荐）。
+    /// Return [`PipeError::Backpressure`] immediately, letting the caller decide when to retry
+    /// (fail-fast, bounded latency, recommended for hard real-time scenarios).
     Error,
-    /// 阻塞 reap CQE 直到有空闲槽位（吞吐优先）。
+    /// Block in reap CQE until a slot is free (throughput-first).
     Block,
 }
 
-/// 流水配置。
+/// Pipeline configuration.
 #[derive(Clone, Copy, Debug)]
 pub struct PipelineConfig {
-    /// 同时在途的最大批数（默认 64；SPEC-wave45 Stream B 点名默认值）。
+    /// Maximum number of batches in flight at once (default 64; the default named by SPEC-wave45 Stream B).
     pub max_in_flight: usize,
-    /// 每批槽位缓冲字节数（默认 64 KiB，与 rti-wal 默认攒批上限一致）。
+    /// Bytes per batch slot buffer (default 64 KiB, matching rti-wal's default batching cap).
     pub slot_bytes: usize,
-    /// 背压策略（默认 [`BackpressurePolicy::Block`]）。
+    /// Backpressure policy (default [`BackpressurePolicy::Block`]).
     pub backpressure: BackpressurePolicy,
 }
 
@@ -63,12 +63,12 @@ impl Default for PipelineConfig {
     }
 }
 
-/// 流水错误：I/O 失败或背压。
+/// Pipeline error: I/O failure or backpressure.
 #[derive(Debug)]
 pub enum PipeError {
-    /// 底层 I/O 错误（含 CQE 返回的负 errno、短写）。
+    /// Underlying I/O error (including negative errnos returned by CQEs, short writes).
     Io(io::Error),
-    /// 在途深度已满且策略为 [`BackpressurePolicy::Error`]。
+    /// In-flight depth full with policy [`BackpressurePolicy::Error`].
     Backpressure,
 }
 
@@ -96,45 +96,45 @@ impl From<io::Error> for PipeError {
     }
 }
 
-/// 槽位：pipeline 自有的批缓冲；CQE reap 前绝不复用。
+/// Slot: a pipeline-owned batch buffer; never reused before its CQE is reaped.
 struct Slot {
     buf: Box<[u8]>,
-    /// 当前占用该槽位的批号（仅在槽位被占用时有效）。
+    /// Batch number currently occupying the slot (valid only while the slot is occupied).
     batch: BatchToken,
-    /// 本批有效字节数（CQE 短写核验基准）。
+    /// Valid bytes of this batch (baseline for CQE short-write verification).
     len: u32,
 }
 
-/// io_uring 在途批流水提交器（Linux only）。
+/// io_uring in-flight batch pipeline submitter (Linux only).
 ///
-/// 单写者、append-only：写入偏移由内部单调推进，与 rti-wal 的
-/// `BatchingWalWriter` 的连续提交一一对应。
+/// Single writer, append-only: the write offset advances monotonically internally, corresponding
+/// one-to-one with the continuous commits of rti-wal's `BatchingWalWriter`.
 pub struct UringPipeline {
     ring: IoUring,
-    /// 保持 fd 存活；ring 中的 SQE 按裸 fd 引用它。
+    /// Keeps the fd alive; SQEs in the ring reference it by raw fd.
     file: File,
     slots: Vec<Slot>,
-    /// 空闲槽位下标栈。
+    /// Stack of free slot indices.
     free: Vec<usize>,
-    /// 已提交未 reap 的写 SQE 数。
+    /// Write SQEs submitted but not yet reaped.
     in_flight: usize,
-    /// 下一批写入偏移（= 已 push 字节数 + 起始偏移）。
+    /// Write offset of the next batch (= pushed bytes + start offset).
     offset: u64,
-    /// 已派发的最大批号（最新批令牌）。
+    /// Highest batch number issued (latest batch token).
     next_batch: BatchToken,
-    /// 连续完成水位：≤ done_batch 的批全部 reap 完毕。
+    /// Continuous completion watermark: all batches <= done_batch have been reaped.
     done_batch: BatchToken,
-    /// 批完成标志，按下标 `batch % max_in_flight` 复用
-    /// （在途批数 < max_in_flight，无混叠）。
+    /// Batch completion flags, reused by index `batch % max_in_flight`
+    /// (fewer than max_in_flight batches in flight, so no aliasing).
     done: Vec<bool>,
     cfg: PipelineConfig,
 }
 
 impl UringPipeline {
-    /// 打开（不存在则创建）`path` 并按 `cfg` 创建流水。
+    /// Open (creating if missing) `path` and create the pipeline per `cfg`.
     ///
-    /// 已有内容长度作为续写起始偏移。`io_uring_setup` 被拒绝时返回
-    /// `Err`（调用方回退 std 后端）。
+    /// The existing content length is the resume offset. Returns `Err` when `io_uring_setup` is rejected
+    /// (the caller falls back to the std backend).
     pub fn open(path: impl AsRef<Path>, cfg: PipelineConfig) -> io::Result<Self> {
         let path = path.as_ref();
         let start = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
@@ -142,10 +142,10 @@ impl UringPipeline {
         Self::from_file(file, cfg, start)
     }
 
-    /// 用已打开的 `file` 构造；`start_offset` 为已有日志长度（续写场景）。
+    /// Construct from an already-open `file`; `start_offset` is the existing log length (resume scenario).
     pub fn from_file(file: File, cfg: PipelineConfig, start_offset: u64) -> io::Result<Self> {
         let max_in_flight = cfg.max_in_flight.max(1);
-        // ring 条目需容纳全部在途写 SQE + 1 个 FSYNC，向上取 2 的幂。
+        // ring entries must hold all in-flight write SQEs + 1 FSYNC; rounded up to a power of two.
         let entries = (max_in_flight as u32 + 2).next_power_of_two();
         let ring = IoUring::new(entries)?;
         let slot_bytes = cfg.slot_bytes.max(1);
@@ -166,43 +166,43 @@ impl UringPipeline {
         })
     }
 
-    /// 当前写入偏移（下一批起点）。
+    /// Current write offset (start of the next batch).
     pub fn offset(&self) -> u64 {
         self.offset
     }
 
-    /// 当前在途批数（诊断/测试用）。
+    /// Current number of in-flight batches (diagnostics/tests).
     pub fn in_flight(&self) -> usize {
         self.in_flight
     }
 
-    /// 空闲槽位数（诊断/背压预检用）。
+    /// Number of free slots (diagnostics / backpressure pre-check).
     pub fn available_slots(&self) -> usize {
         self.free.len()
     }
 
-    /// 槽位字节上限（单批数据超过此值时 `push` 内部按槽拆分）。
+    /// Slot byte cap (`push` internally splits a batch larger than this into slots).
     pub fn slot_bytes(&self) -> usize {
         self.slots.first().map(|s| s.buf.len()).unwrap_or(0)
     }
 
-    /// 生效的背压策略。
+    /// Backpressure policy in effect.
     pub fn backpressure_policy(&self) -> BackpressurePolicy {
         self.cfg.backpressure
     }
 
-    /// 把 `data` 提交为一批写 SQE（按槽位拆分可超过槽位大小），
-    /// **不等待完成**即返回最新批令牌。
+    /// Submit `data` as a batch of write SQEs (split into slots if larger than a slot),
+    /// returning the latest batch token **without waiting for completion**.
     ///
-    /// 背压：无空闲槽位时按策略 [`BackpressurePolicy::Error`] 立即返回
-    /// [`PipeError::Backpressure`]（本批一字节未提交，可整体重试），
-    /// 或 [`BackpressurePolicy::Block`] 阻塞 reap 至有槽位。
+    /// Backpressure: with no free slot, returns [`PipeError::Backpressure`] immediately under
+    /// [`BackpressurePolicy::Error`] (not a single byte of this batch is submitted; the whole batch can
+    /// be retried), or blocks in reap until a slot is free under [`BackpressurePolicy::Block`].
     pub fn push(&mut self, data: &[u8]) -> Result<BatchToken, PipeError> {
         if data.is_empty() {
             return Ok(self.next_batch);
         }
         let slot_bytes = self.slot_bytes();
-        // Error 策略：预检，保证整批要么全部提交要么一字节未提交。
+        // Error policy: pre-check, guaranteeing the whole batch is either fully submitted or not submitted at all.
         if self.cfg.backpressure == BackpressurePolicy::Error
             && (data.len() + slot_bytes - 1) / slot_bytes > self.free.len()
         {
@@ -215,10 +215,10 @@ impl UringPipeline {
         Ok(token)
     }
 
-    /// 提交单个不超过槽位大小的 chunk 为一批。
+    /// Submit a single chunk no larger than a slot as one batch.
     fn push_one(&mut self, data: &[u8]) -> Result<BatchToken, PipeError> {
         debug_assert!(data.len() <= self.slot_bytes());
-        // 取槽位：Error 策略此处必然有（push 已预检）；Block 策略阻塞 reap。
+        // take a slot: the Error policy always has one here (push pre-checked); the Block policy blocks in reap.
         while self.free.is_empty() {
             match self.cfg.backpressure {
                 BackpressurePolicy::Error => return Err(PipeError::Backpressure),
@@ -243,10 +243,10 @@ impl UringPipeline {
             .user_data(idx as u64);
         {
             let mut sq = self.ring.submission();
-            // SAFETY: SQE 按裸指针引用 `slot.buf`、按裸 fd 引用 `self.file`。
-            // 两者均为 self 所有；槽位在该 SQE 的 CQE 被 reap 之前绝不复用
-            // （free 栈只在 reap 时回收该下标），`Drop` 会 drain 全部在途
-            // SQE，故内核持有引用的窗口严格在缓冲/fd 有效期内。
+            // SAFETY: the SQE references `slot.buf` by raw pointer and `self.file` by raw fd.
+            // Both are owned by self; a slot is never reused before that SQE's CQE is reaped
+            // (the free stack recycles an index only at reap time), and `Drop` drains all in-flight
+            // SQEs — so the window where the kernel holds these references is strictly within the buffer/fd lifetimes.
             unsafe { sq.push(&op) }
                 .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "io_uring SQ full"))?;
         }
@@ -257,13 +257,13 @@ impl UringPipeline {
         Ok(batch)
     }
 
-    /// 批号到完成标志下标（在途批数 < max_in_flight，取模无混叠）。
+    /// Batch number to completion-flag index (fewer than max_in_flight batches in flight, so modulo never aliases).
     fn done_idx(&self, batch: BatchToken) -> usize {
         (batch % self.cfg.max_in_flight as u64) as usize
     }
 
-    /// 处理一个 CQE（内联以便在 `completion()` 借用期间更新槽位状态）。
-    /// 返回 Err 时槽位已照常回收，避免泄漏死锁。
+    /// Process one CQE (inlined so slot state can be updated during the `completion()` borrow).
+    /// On Err the slot is recycled as usual, avoiding leak-deadlocks.
     fn handle_cqe(&mut self, user_data: u64, res: i32) -> Result<(), PipeError> {
         if user_data == FSYNC_TAG {
             if res < 0 {
@@ -296,9 +296,9 @@ impl UringPipeline {
         Ok(())
     }
 
-    /// 非阻塞 reap： drain 当前已就绪的全部 CQE，释放槽位。
+    /// Non-blocking reap: drain all currently ready CQEs, freeing slots.
     pub fn reap_available(&mut self) -> Result<(), PipeError> {
-        // 先收集 user_data/result，再在 borrow 结束后统一更新状态。
+        // collect user_data/result first, then update state after the borrow ends.
         let mut pending: Vec<(u64, i32)> = Vec::new();
         for cqe in self.ring.completion() {
             pending.push((cqe.user_data(), cqe.result()));
@@ -317,15 +317,15 @@ impl UringPipeline {
         }
     }
 
-    /// 阻塞 reap：至少等 `want` 个 CQE 后 drain 全部就绪事件。
+    /// Blocking reap: wait for at least `want` CQEs, then drain all ready events.
     fn reap_blocking(&mut self, want: usize) -> Result<(), PipeError> {
         self.ring.submit_and_wait(want)?;
         self.reap_available()
     }
 
-    /// 等待 **token 及之前** 的批完成（只等本批，不 drain 全环）。
+    /// Wait for the completion of **token and earlier** batches (this batch only; the ring is not drained).
     ///
-    /// token 之后的批（更晚 push 的）允许继续在途。
+    /// Batches after token (pushed later) may stay in flight.
     pub fn flush(&mut self, token: BatchToken) -> Result<(), PipeError> {
         while self.done_batch < token {
             self.reap_blocking(1)?;
@@ -333,16 +333,16 @@ impl UringPipeline {
         Ok(())
     }
 
-    /// 持久化边界：等待当前全部在途批完成（= flush(最新令牌)），
-    /// 再提交 `IORING_OP_FSYNC` 并等其完成（组提交的组边界）。
+    /// Durability boundary: wait for all currently in-flight batches to complete (= flush(latest token)),
+    /// then submit `IORING_OP_FSYNC` and wait for its completion (group boundary of group commit).
     pub fn sync(&mut self) -> Result<(), PipeError> {
         self.flush(self.next_batch)?;
         let fd = types::Fd(self.file.as_raw_fd());
         let op = opcode::Fsync::new(fd).build().user_data(FSYNC_TAG);
         {
             let mut sq = self.ring.submission();
-            // SAFETY: FSYNC 只按裸 fd 引用 `self.file`；返回前已阻塞等待
-            // 该 SQE 的 CQE，fd 活到函数返回之后。
+            // SAFETY: FSYNC references only `self.file` by raw fd; the CQE of this SQE has been
+            // blockingly awaited before returning, and the fd outlives the function return.
             unsafe { sq.push(&op) }
                 .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "io_uring SQ full"))?;
         }
@@ -368,7 +368,7 @@ impl UringPipeline {
         }
     }
 
-    /// 等待全部在途批完成（不 fsync；关闭前调用）。
+    /// Wait for all in-flight batches to complete (no fsync; call before close).
     pub fn drain(&mut self) -> Result<(), PipeError> {
         self.flush(self.next_batch)
     }
@@ -376,7 +376,7 @@ impl UringPipeline {
 
 impl Drop for UringPipeline {
     fn drop(&mut self) {
-        // 尽力 drain：保证内核不再引用槽位缓冲后再释放。忽略错误。
+        // best-effort drain: ensure the kernel no longer references slot buffers before freeing them. Errors ignored.
         while self.in_flight > 0 {
             if self.ring.submit_and_wait(1).is_err() {
                 break;
@@ -416,7 +416,7 @@ mod tests {
         }
     }
 
-    /// 流水下顺序性：批数远超在途深度，中途穿插 flush/sync，读回逐字节一致。
+    /// Ordering under the pipeline: far more batches than the in-flight depth, flush/sync interleaved, read back byte-identical.
     #[test]
     fn pipeline_roundtrip_ordering_beyond_depth() {
         let p = tmpfile("roundtrip");
@@ -429,7 +429,7 @@ mod tests {
             Some(f) => f,
             None => return,
         };
-        // 每批 64 B = 槽位大小；共 500 批 >> 深度 8。
+        // 64 B per batch = slot size; 500 batches >> depth 8.
         let batches: Vec<Vec<u8>> = (0..500u32)
             .map(|i| (0..64).map(|j| ((i * 64 + j) % 251) as u8).collect())
             .collect();
@@ -437,7 +437,7 @@ mod tests {
         for (i, b) in batches.iter().enumerate() {
             tokens.push(pipe.push(b).unwrap());
             if i % 97 == 0 {
-                // 只等本批：不 drain 全环。
+                // wait only for this batch: the ring is not drained.
                 pipe.flush(tokens[i]).unwrap();
             }
         }
@@ -447,12 +447,12 @@ mod tests {
         let got = std::fs::read(&p).unwrap();
         let want: Vec<u8> = batches.concat();
         assert_eq!(got.len(), want.len());
-        assert_eq!(got, want, "流水多批在途下写回读必须逐字节一致");
+        assert_eq!(got, want, "write-then-read under multiple in-flight pipeline batches must be byte-identical");
         drop(pipe);
         std::fs::remove_dir_all(p.parent().unwrap()).ok();
     }
 
-    /// 单批数据超过槽位大小时内部拆分提交，读回一致。
+    /// A single batch larger than a slot is split and submitted internally; read back identical.
     #[test]
     fn pipeline_oversize_batch_is_split() {
         let p = tmpfile("split");
@@ -472,8 +472,8 @@ mod tests {
         std::fs::remove_dir_all(p.parent().unwrap()).ok();
     }
 
-    /// 背压（Error 策略）：深度满后 push 立即返回 Backpressure 且
-    /// 一字节未提交；flush 后槽位回收可继续提交。
+    /// Backpressure (Error policy): after the depth fills, push returns Backpressure immediately with
+    /// not a single byte committed; after flush, slots are reclaimed and submission can continue.
     #[test]
     fn pipeline_backpressure_error_policy_is_fail_fast() {
         let p = tmpfile("backpressure");
@@ -491,14 +491,14 @@ mod tests {
         let t2 = pipe.push(&b(2)).unwrap();
         assert_eq!(pipe.in_flight(), 2);
         let off_before = pipe.offset();
-        // 深度满：Error 策略下 push 不做隐式 reap，确定性触发背压。
+        // depth full: under the Error policy push does no implicit reap, so backpressure fires deterministically.
         assert!(matches!(pipe.push(&b(3)), Err(PipeError::Backpressure)));
-        assert_eq!(pipe.offset(), off_before, "背压拒绝的批必须一字节未提交");
-        // flush 本批后槽位回收，可继续。
+        assert_eq!(pipe.offset(), off_before, "a batch rejected by backpressure must not have committed a single byte");
+        // slots are reclaimed after flushing this batch; submission can continue.
         pipe.flush(t2).unwrap();
         assert_eq!(pipe.in_flight(), 0);
         let t3 = pipe.push(&b(3)).unwrap();
-        assert!(t3 > t2 && t2 > t1, "批令牌必须单调递增");
+        assert!(t3 > t2 && t2 > t1, "batch tokens must increase monotonically");
         pipe.sync().unwrap();
         let got = std::fs::read(&p).unwrap();
         let mut want = b(1);
@@ -508,7 +508,7 @@ mod tests {
         std::fs::remove_dir_all(p.parent().unwrap()).ok();
     }
 
-    /// 背压（Block 策略）：深度 1 也能连续提交多批（内部阻塞回收）。
+    /// Backpressure (Block policy): even depth 1 can submit many batches in a row (internally blocks to reclaim).
     #[test]
     fn pipeline_backpressure_block_policy_reaps_inline() {
         let p = tmpfile("block");
@@ -532,7 +532,7 @@ mod tests {
         std::fs::remove_dir_all(p.parent().unwrap()).ok();
     }
 
-    /// 关闭时全部 drain：不显式 flush/sync，Drop 后文件内容完整。
+    /// Everything drains on close: no explicit flush/sync; the file contents are complete after Drop.
     #[test]
     fn pipeline_drop_drains_all_in_flight() {
         let p = tmpfile("drain");
@@ -552,13 +552,13 @@ mod tests {
                 pipe.push(&b).unwrap();
                 want.extend_from_slice(&b);
             }
-            assert!(pipe.in_flight() > 0, "Drop 前必须仍有在途批");
-        } // Drop：drain 全部在途 SQE
-        assert_eq!(std::fs::read(&p).unwrap(), want, "Drop 必须 drain 全部在途写");
+            assert!(pipe.in_flight() > 0, "there must still be in-flight batches before Drop");
+        } // Drop: drain all in-flight SQEs
+        assert_eq!(std::fs::read(&p).unwrap(), want, "Drop must drain all in-flight writes");
         std::fs::remove_dir_all(p.parent().unwrap()).ok();
     }
 
-    /// flush 只等本批：旧令牌在已完成时立即返回；续写偏移正确。
+    /// flush waits only for its own batch: old tokens return immediately once completed; resume offsets are correct.
     #[test]
     fn flush_with_stale_token_and_resume_offset() {
         let p = tmpfile("stale");
@@ -574,10 +574,10 @@ mod tests {
             };
             let t = pipe.push(&[7u8; 16]).unwrap();
             pipe.sync().unwrap();
-            // 水位已过：旧令牌 flush 必须立即返回（不等待任何事件）。
+            // watermark already passed: flushing an old token must return immediately (not waiting for any event).
             pipe.flush(t).unwrap();
         }
-        // 续写：已有 16 B，新 push 必须落在 offset 16。
+        // resume: 16 B already exist; a new push must land at offset 16.
         let mut pipe = match open_or_skip(&p, cfg) {
             Some(f) => f,
             None => return,
@@ -590,7 +590,7 @@ mod tests {
         std::fs::remove_dir_all(p.parent().unwrap()).ok();
     }
 
-    /// 默认配置：深度 64（SPEC 点名默认值）。
+    /// Default configuration: depth 64 (the SPEC-named default).
     #[test]
     fn pipeline_config_defaults() {
         let cfg = PipelineConfig::default();

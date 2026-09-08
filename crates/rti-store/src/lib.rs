@@ -1,9 +1,9 @@
-//! rti-store：列式存储引擎。
+//! rti-store: columnar storage engine.
 //!
-//! 写入路径：`MemTable`（内存，slab 池化）→ 满则 seal →
-//! `SegmentWriter` 落盘为不可变列式 segment。
-//! 读取路径：`SegmentReader` 用 zone map 跳过无关段，
-//! 时间戳列 delta-of-delta + varint、值列 XOR 压缩，流式解码零分配。
+//! Write path: `MemTable` (in-memory, slab-pooled) → seal when full →
+//! `SegmentWriter` persists it as an immutable columnar segment.
+//! Read path: `SegmentReader` skips irrelevant segments via zone maps;
+//! timestamp column delta-of-delta + varint, value column XOR compression; streaming decode with zero allocation.
 
 #![forbid(unsafe_code)]
 
