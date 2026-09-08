@@ -67,6 +67,14 @@ that are non-scalar require an explicit `FieldSelector`; backpressure policy is
 drop-oldest on the ROS side with a counter — the bridge must never block DDS.
 Replay publishes at `speed ×` original timing using stored nanosecond timestamps.
 
+**Implementation note (v0.7.0).** The bridge core is transport-agnostic: all public
+contracts above (`TopicBinding`, `Ros2Bridge`, `replay`, stats, backpressure) are
+implemented against a `Transport` trait. The production `rclrs`/DDS backend ships
+behind the non-default `ros2-rclrs` feature (requires a system ROS 2 installation);
+the default build uses an in-process transport so the full contract — including the
+100-topic/50 kHz acceptance logic — is testable without ROS 2. The public API is
+identical across backends.
+
 ## 3. `rti-export` — LeRobot episode exporter
 
 **Why.** Training-time role: episodes recorded by the flight recorder must land in the
