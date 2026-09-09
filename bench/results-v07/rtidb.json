@@ -1,0 +1,92 @@
+[
+  {
+    "latency_ns": {
+      "max": 138623,
+      "p50": 380,
+      "p99": 680,
+      "p999": 6471
+    },
+    "notes": "Db::put 为无锁 SPSC 入队（异步应用），WAL 组提交在后台 ingest 线程；延迟为入队延迟",
+    "system": "rti-db",
+    "throughput_ops": 1415168.2387735252,
+    "variant": "sync=none",
+    "workload": {
+      "n": 200000,
+      "series": 8
+    }
+  },
+  {
+    "avg_agg_pts_s": 41982497.49679359,
+    "disk_bytes": 10113733,
+    "notes": "批量=连续单点 put（ingest 线程内部批量组提交），含最终 flush; 压缩比 vs 16B/点原始 = 1.58x",
+    "rss_bytes": 42217472,
+    "scan_pts_s": 38916631.041734,
+    "system": "rti-db",
+    "throughput_ops": 8736586.881971113,
+    "variant": "sync=none",
+    "workload": {
+      "n": 1000000,
+      "series": 8
+    }
+  },
+  {
+    "latency_ns": {
+      "max": 33308671,
+      "p50": 240,
+      "p99": 620,
+      "p999": 900
+    },
+    "notes": "Db::put 为无锁 SPSC 入队（异步应用），WAL 组提交在后台 ingest 线程；延迟为入队延迟",
+    "system": "rti-db",
+    "throughput_ops": 1336809.8588764588,
+    "variant": "sync=group1ms",
+    "workload": {
+      "n": 200000,
+      "series": 8
+    }
+  },
+  {
+    "avg_agg_pts_s": 42086973.48827905,
+    "disk_bytes": 10113733,
+    "notes": "批量=连续单点 put（ingest 线程内部批量组提交），含最终 flush; 压缩比 vs 16B/点原始 = 1.58x",
+    "rss_bytes": 56197120,
+    "scan_pts_s": 36498773.4039716,
+    "system": "rti-db",
+    "throughput_ops": 1064963.3636947928,
+    "variant": "sync=group1ms",
+    "workload": {
+      "n": 1000000,
+      "series": 8
+    }
+  },
+  {
+    "latency_ns": {
+      "max": 22817013759,
+      "p50": 250,
+      "p99": 450,
+      "p999": 6631
+    },
+    "notes": "Db::put 为无锁 SPSC 入队（异步应用），WAL 组提交在后台 ingest 线程；延迟为入队延迟",
+    "system": "rti-db",
+    "throughput_ops": 656.018946753376,
+    "variant": "sync=always",
+    "workload": {
+      "n": 200000,
+      "series": 8
+    }
+  },
+  {
+    "avg_agg_pts_s": 39905264.90112473,
+    "disk_bytes": 1011638,
+    "notes": "批量=连续单点 put（ingest 线程内部批量组提交），含最终 flush; sync=always 为逐条 fsync 受限，本变体缩减为 100000 点（铁律3）; 压缩比 vs 16B/点原始 = 15.82x",
+    "rss_bytes": 56197120,
+    "scan_pts_s": 38116830.37210031,
+    "system": "rti-db",
+    "throughput_ops": 436.6560995652594,
+    "variant": "sync=always",
+    "workload": {
+      "n": 100000,
+      "series": 8
+    }
+  }
+]

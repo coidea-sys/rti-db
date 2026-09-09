@@ -7,6 +7,7 @@
 //! | safety island (functional safety / hard real-time) | [`EdgeConfig::safety_island`] | Deterministic (pure in-memory, LRU, zero-allocation hot path) + UDP mirror |
 //! | cognition (perception/fusion) | [`EdgeConfig::cognition`] | Balanced + 3-node in-memory Raft replica |
 //! | planning (long-horizon analytics) | [`EdgeConfig::planning`] | Balanced + cold-tier archiving |
+//! | AI working memory (VLA/robotics cognition) | [`EdgeConfig::ai_working_memory`] | Balanced group-commit persistence for `rti-vla` / `rti-ros2` / `rti-export` compositions |
 //!
 //! Unified interface: [`EdgeNode::open`] → [`EdgeNode::ingest`] (optionally grid-aligned
 //! via [`TsAligner`]) → [`EdgeNode::scan`] → [`EdgeNode::health`].
@@ -132,6 +133,26 @@ impl EdgeConfig {
             mirror: None,
             raft: None,
             cold_tier: Some(ColdTierConfig::LocalFs { dir: PathBuf::from("rti-edge-planning-cold") }),
+            tsn_align_ns: None,
+        }
+    }
+
+    /// AI working-memory preset: Balanced group-commit persistence with no mirror,
+    /// Raft simulation, or cold tier on the cognition hot path.
+    ///
+    /// This is the v0.7 composition point for the AI-integration crates: open an
+    /// [`EdgeNode`] with this config, feed it through `rti-ros2`, serve S1/S2 reads
+    /// through `rti-vla`, and export training episodes through `rti-export`. The
+    /// integrations stay outside `rti-edge` so the core reflex path remains optional
+    /// and dependency-free.
+    pub fn ai_working_memory() -> Self {
+        Self {
+            profile: Profile::Balanced,
+            data_dir: Some(PathBuf::from("rti-edge-ai-working-memory")),
+            memtable_max: 1 << 16,
+            mirror: None,
+            raft: None,
+            cold_tier: None,
             tsn_align_ns: None,
         }
     }

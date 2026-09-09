@@ -1,0 +1,24 @@
+[package]
+name = "rti-ros2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "rti-db as the flight recorder of any ROS 2 robot: topic → series bridge with an explicit registry, drop-oldest backpressure, and timed replay (transport-agnostic core; rclrs behind the ros2-rclrs feature)"
+
+[features]
+# Real rclrs/DDS transport backend. Non-default on purpose: it requires a system
+# ROS 2 installation (the rcl client library discoverable by the linker) and is
+# currently a documented placeholder — the public API is identical across backends.
+ros2-rclrs = []
+
+[dependencies]
+rti-core = { path = "../rti-core" }
+rti-db = { path = "../rti-db" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+
+[dev-dependencies]
+rti-export = { path = "../rti-export" }
+rti-vla = { path = "../rti-vla" }

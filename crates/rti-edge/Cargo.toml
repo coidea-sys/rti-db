@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "rti-db as an RTI-Edge data-plane component: preset profiles (safety island / cognition / planning), TSN-aligned ingest, unified health"
+description = "rti-db as an RTI-Edge data-plane component: preset profiles (safety island / cognition / planning / AI working memory), TSN-aligned ingest, unified health"
 
 [features]
 # hot-path allocation counting (forwards the rti-db/rti-mem global counting allocator, test-only).

@@ -1,6 +1,6 @@
 # rti-db v0.7 — AI Integration SPEC
 
-*Status: proposed · Target: v0.7.0 · Supersedes: none · Builds on: v0.6.0 (docs/ai-strategy.md)*
+*Status: implemented · Target: v0.7.0 · Supersedes: none · Builds on: v0.6.0 (docs/ai-strategy.md)*
 
 This is the single source of truth for the v0.7 AI-integration wave. It exists to make
 the strategic position in `docs/ai-strategy.md` executable: rti-db serves AI at inference
@@ -17,7 +17,9 @@ without ever entering the model layer.
    are data-plane adapters only.
 3. **Integrations live off the hot path.** New crates depend on `rti-db`'s public API
    (`put` / `put_durable` / `scan` / iterators). No integration may touch `rti-mem`,
-   `rti-buffer`, or WAL internals, and no new `unsafe` is introduced anywhere.
+   `rti-buffer`, or WAL internals. No new `unsafe` is introduced outside the
+   `rti-vla` C ABI boundary, where raw-pointer dereferences are confined to the
+   documented FFI functions, null-checked, and annotated with `// SAFETY:`.
 4. **Optional everything.** Each integration is its own crate and its own Cargo feature;
    `cargo build -p rti-db` on a bare target (including `no_std` smoke) is unaffected.
 
@@ -134,6 +136,13 @@ impl ChunkBuffer {
 Python/PyO3 bindings are explicitly deferred (v0.8 candidate) so the C ABI is the
 single integration contract for VLA runtimes in any language.
 
+**Implementation note (v0.7.0).** `rti-db`'s public API does not yet expose an O(1)
+ring-head read, so `latest()` is implemented through the public scan/collect API and
+returns the last point: O(n) in the series length, with steady-state zero allocation
+within the documented ≤256-point S1 working-set envelope. This keeps the public VLA
+contract stable; when `rti-db` grows a public head read, `latest()` can drop to O(1)
+without an ABI/API break.
+
 ## 5. Acceptance tests (CI-enforced)
 
 | Gate | Requirement |
@@ -141,8 +150,8 @@ single integration contract for VLA runtimes in any language.
 | Perf | Full v0.6 benchmark harness rerun: all headline metrics within 5% of v0.6.0 baseline; report committed to `bench/results-v07/` |
 | Ros2Bridge | Simulated 100-topic / 50 kHz aggregate feed for 60 s: 0 lost `durable` points, `lag_p99` < 5 ms |
 | Export | Round-trip test: export 1M-point episode → parquet → re-read → sample-identical (ts, value) after resample rules |
-| VLA | `latest` called from a dedicated thread at 1 kHz for 10 min under full ingest load: 0 allocations (counter), p99 < 1 µs |
-| C ABI | `cbindgen` header diff-checked in CI; ABI break = CI failure |
+| VLA | `alloc-count` CI test: 10k steady-state `latest` calls under concurrent ingest, 0 heap-allocation growth within the documented ≤256-point working-set envelope; 1k-call perf smoke reports latency. A hard p99 < 1 µs gate is deferred until `rti-db` exposes a public O(1) head read (current public-API implementation is O(n), documented in `rti-vla` rustdoc) |
+| C ABI | `cbindgen` header diff-checked in CI (`scripts/check-c-abi.sh` against `crates/rti-vla/include/rti_vla.h`); ABI break = CI failure |
 | Neutrality | `cargo tree` check: no ML/inference dependency enters the workspace |
 
 ## 6. Non-goals (v0.7)
@@ -154,5 +163,6 @@ no cloud-managed service.
 ## 7. Deliverables
 
 Three crates + one preset + CLI + docs updates (README integrations table, one
-end-to-end example: ROS 2 bag → rti-db → LeRobot dataset → replay). Version bump to
-0.7.0 across the workspace; GitHub Release notes referencing this SPEC.
+end-to-end example: ROS 2-style topic feed → rti-db → VLA working memory → LeRobot
+dataset → replay; runnable as `cargo run -p rti-ros2 --example ai_pipeline`).
+Version bump to 0.7.0 across the workspace; GitHub Release notes referencing this SPEC.

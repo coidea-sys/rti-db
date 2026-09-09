@@ -5,8 +5,8 @@
 [中文版 README](README.zh-CN.md)
 
 [![CI](https://github.com/coidea-sys/rti-db/actions/workflows/ci.yml/badge.svg)](https://github.com/coidea-sys/rti-db/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.6.0-blue)](https://github.com/coidea-sys/rti-db)
-[![Tests](https://img.shields.io/badge/tests-132%20passing-brightgreen)](#testing--reproducibility)
+[![Version](https://img.shields.io/badge/version-0.7.0-blue)](https://github.com/coidea-sys/rti-db)
+[![Tests](https://img.shields.io/badge/tests-179%20passing-brightgreen)](#testing--reproducibility)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-lightgrey)](LICENSE-MIT)
 
 ```text
@@ -40,7 +40,7 @@ The design follows TRIZ separation principles: instead of compromising between "
 - **Durability as an explicit API choice.** `put()` = lowest latency, best-effort persistence; `put_durable()` = survives `kill -9` (waits for MemTable apply + WAL append + OS flush, returns a durable watermark). Like Kafka's `acks=0/1/all`, but explicit per call.
 - **Crash recovery in ~23 ms.** WAL checkpointing keeps the invariant "the WAL protects exactly the current MemTable" — recovery replays one tail, not the whole log.
 - **Real compression: 1.58×** end-to-end on disk (delta-of-delta timestamps + XOR floats + WAL truncation), beating ClickHouse's 1.22× on the same workload.
-- **Memory safety with an auditable unsafe surface.** `#![forbid(unsafe_code)]` everywhere except three small crates (`rti-mem`, `rti-buffer`, `rti-wal-uring`), every `unsafe` block annotated with `// SAFETY:`. ~70% of severe CVEs in C/C++ systems are memory bugs — Rust eliminates that class at compile time.
+- **Memory safety with an auditable unsafe surface.** `#![forbid(unsafe_code)]` everywhere except four small crates (`rti-mem`, `rti-buffer`, `rti-wal-uring`, and the documented `rti-vla` C ABI boundary), every `unsafe` block annotated with `// SAFETY:`. ~70% of severe CVEs in C/C++ systems are memory bugs — Rust eliminates that class at compile time.
 - **no_std subset.** `rti-core`, `rti-mem`, `rti-buffer` compile for `no_std` (core + alloc) — the same engine runs from an MCU safety island to a cloud server.
 - **io_uring pipelined WAL** (Linux, feature-gated, graceful fallback), **single-shard Raft replication** (snapshot, membership change, PreVote — all deterministically tested with a virtual clock), **S3 cold tier** (pure-std HTTP client, zero external dependencies), **TSN time alignment** for deterministic networks.
 - **Deterministic everything.** Raft tests run on a virtual clock with an in-memory transport — leader election, failover, log consistency and partition scenarios are 100% reproducible (30/30 runs green).
@@ -96,7 +96,7 @@ Full methodology, raw JSON and a one-command reproduction harness (`run_all.sh`,
 
 ## Architecture & Strategy (Design philosophy)
 
-12 crates, layered by the same separation principles:
+15 crates, layered by the same separation principles:
 
 | Crate | Role |
 |---|---|
@@ -109,7 +109,10 @@ Full methodology, raw JSON and a one-command reproduction harness (`run_all.sh`,
 | `rti-raft` | Single-shard Raft: election, replication, snapshot, membership, PreVote |
 | `rti-net` | Minimal TCP line protocol |
 | `rti-db` | Facade: `Db::open / put / put_durable / scan` |
-| `rti-edge` | RTI-Edge integration: three presets (safety island / cognition / planning) |
+| `rti-edge` | RTI-Edge integration: four presets (safety island / cognition / planning / AI working memory) |
+| `rti-vla` | VLA working-memory adapter: `latest` / `window` / `ChunkBuffer` + frozen C ABI |
+| `rti-export` | LeRobot episode exporter (Parquet, LVCF resampling, O(chunk) streaming) + CLI |
+| `rti-ros2` | ROS 2 flight-recorder bridge (transport-agnostic core; rclrs behind `ros2-rclrs`) |
 
 The strategy in one sentence: **don't fight incumbents on their home turf (general SQL, analytics) — occupy the hard-real-time data plane they collectively absent, with structural (not tuned) advantages.**
 
@@ -139,26 +142,28 @@ let watermark = db.put_durable(1, Sample { ts: 1_700_000_000_000_001_000, value:
 for s in db.scan(1, 0, i64::MAX, None, None)? { /* zero-copy iteration */ }
 ```
 
-Run the three-tier edge demo (safety island / cognition / planning):
+Run the three-tier edge demo (safety island / cognition / planning), or the v0.7 end-to-end AI pipeline (ROS 2-style ingest → flight recorder → VLA working memory → LeRobot export → replay):
 
 ```bash
-cargo run --release --example edge_demo
+cargo run -p rti-edge --release --example edge_demo
+cargo run -p rti-ros2 --example ai_pipeline
 ```
 
 Feature flags: `io-uring` (pipelined WAL backend), `s3` (S3 cold tier), `alloc-count` (allocation auditing), `std` (default; disable for `no_std` subset crates).
 
 ## Testing & reproducibility
 
-- **121 tests green** (`cargo test --workspace`), 132 with all features
+- **156 tests green** (`cargo test --workspace`), 179 with all features
 - Deterministic Raft protocol tests (virtual clock + memory transport)
 - Steady-state zero-allocation proof test
 - Benchmark harness: `bench/run_all.sh` (~35 min full, `--smoke` 2 min) — every number in this README is reproducible
 
 ## Roadmap
 
-- **v0.1–v0.6 (done)**: core engine → io_uring + block decode + TSN align → deterministic profile + no_std + mirror → Raft + cold tier → pipelined WAL + S3 + edge integration → durability semantics + WAL checkpoint (this release)
-- **v0.7**: multi-shard Raft, fast conflict backtracking, segment compaction
-- **v0.8**: formal WCET analysis tooling, more `no_std` coverage, TSN hardware timestamping
+- **v0.1–v0.6 (done)**: core engine → io_uring + block decode + TSN align → deterministic profile + no_std + mirror → Raft + cold tier → pipelined WAL + S3 + edge integration → durability semantics + WAL checkpoint
+- **v0.7 (this release)**: AI integration per [docs/v07-ai-integration-spec.md](docs/v07-ai-integration-spec.md) — `rti-ros2` flight recorder, `rti-export` LeRobot episodes, `rti-vla` working memory + C ABI
+- **v0.8**: multi-shard Raft, fast conflict backtracking, segment compaction
+- **v0.9**: formal WCET analysis tooling, more `no_std` coverage, TSN hardware timestamping, Python bindings
 
 ## License
 

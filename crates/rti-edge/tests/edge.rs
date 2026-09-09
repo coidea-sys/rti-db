@@ -203,3 +203,31 @@ fn tsn_align_applies_on_ingest() {
     bad.tsn_align_ns = Some(0);
     assert!(EdgeNode::open(bad).is_err());
 }
+
+/// Scenario 4: AI working-memory preset — Balanced group-commit persistence with
+/// no mirror/Raft/cold-tier machinery on the cognition hot path.
+#[test]
+fn ai_working_memory_roundtrip() {
+    let tmp = TmpDir::new("ai-working-memory");
+    let mut cfg = EdgeConfig::ai_working_memory();
+    assert_eq!(cfg.profile, Profile::Balanced);
+    assert!(cfg.mirror.is_none());
+    assert!(cfg.raft.is_none());
+    assert!(cfg.cold_tier.is_none());
+    cfg.data_dir = Some(tmp.0.join("data"));
+
+    let mut node = EdgeNode::open(cfg).unwrap();
+    const N: i64 = 64;
+    samples(&mut node, 11, 0..N);
+    node.flush().unwrap();
+
+    let out: Vec<Sample> = node.scan(11, 0, N, None, None).unwrap().collect();
+    assert_eq!(out.len(), N as usize);
+    assert_eq!(out[42], Sample::new(42, 42.0));
+
+    let h = node.health();
+    assert_eq!(h.profile, Profile::Balanced);
+    assert_eq!(h.mirror_stats, None);
+    assert_eq!(h.raft_role, None);
+    assert!(h.alloc_ok);
+}

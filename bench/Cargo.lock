@@ -470,15 +470,15 @@ dependencies = [
 
 [[package]]
 name = "rti-buffer"
-version = "0.6.0"
+version = "0.7.0"
 
 [[package]]
 name = "rti-core"
-version = "0.6.0"
+version = "0.7.0"
 
 [[package]]
 name = "rti-db"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "rti-buffer",
  "rti-core",
@@ -494,14 +494,14 @@ version = "0.1.0"
 
 [[package]]
 name = "rti-query"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "rti-core",
 ]
 
 [[package]]
 name = "rti-store"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "crc32fast",
  "rti-core",
@@ -510,7 +510,7 @@ dependencies = [
 
 [[package]]
 name = "rti-wal"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "crc32fast",
  "rti-core",

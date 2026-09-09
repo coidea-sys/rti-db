@@ -1,0 +1,18 @@
+[package]
+name = "rti-vla"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Working-memory adapter for VLA runtimes: S1 latest-state reads, S2 episodic windows, action-chunk buffering, frozen C ABI"
+
+[features]
+# hot-path allocation counting (forwards the rti-db/rti-mem global counting allocator, test-only).
+alloc-count = ["rti-db/alloc-count"]
+
+[dependencies]
+rti-core = { path = "../rti-core" }
+rti-db = { path = "../rti-db" }
+# ScanSource::collect is the only public read path of Db that does not box an iterator per
+# call; latest() needs it to honour the zero-allocation S1 budget.
+rti-query = { path = "../rti-query" }

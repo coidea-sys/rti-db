@@ -125,8 +125,8 @@ us.
 
 | Horizon | AI-facing commitment |
 |---|---|
-| v0.7 (next) | Episode/segment compaction tuned for flight-recorder workloads; multi-shard Raft for fleet-scale capture |
-| Mid | Reference integrations: ROS 2 topic bridge, LeRobot episode exporter, VLA runtime working-memory adapter |
+| v0.7 (this release) | Reference integrations: ROS 2 topic bridge, LeRobot episode exporter, VLA runtime working-memory adapter + frozen C ABI |
+| v0.8 (next) | Episode/segment compaction tuned for flight-recorder workloads; multi-shard Raft for fleet-scale capture |
 | Long | Certified-replay profiles for safety audit; edge-to-cloud flywheel tooling (curate, version, export) |
 
 Two invariants govern everything above: **the reflex path never regresses**

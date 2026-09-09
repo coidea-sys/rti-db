@@ -5,8 +5,8 @@
 [English README](README.md)
 
 [![CI](https://github.com/coidea-sys/rti-db/actions/workflows/ci.yml/badge.svg)](https://github.com/coidea-sys/rti-db/actions/workflows/ci.yml)
-[![版本](https://img.shields.io/badge/version-0.6.0-blue)](https://github.com/coidea-sys/rti-db)
-[![测试](https://img.shields.io/badge/tests-132%20passing-brightgreen)](#测试与可复现性)
+[![版本](https://img.shields.io/badge/version-0.7.0-blue)](https://github.com/coidea-sys/rti-db)
+[![测试](https://img.shields.io/badge/tests-179%20passing-brightgreen)](#测试与可复现性)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-lightgrey)](LICENSE-MIT)
 
 ```text
@@ -40,7 +40,7 @@
 - **持久性是显式的 API 选择。** `put()` = 最低延迟、尽力持久；`put_durable()` = 返回即抗 `kill -9`（等待 MemTable 应用 + WAL append + OS flush，返回 durable 水位）。类似 Kafka 的 acks=0/1/all，但逐次调用显式可选。
 - **崩溃恢复 ~23ms。** WAL 检查点机制维持不变式"WAL 恰好保护当前 MemTable"——恢复只重放一个尾巴，而非整段日志。
 - **真压缩 1.58×**（端到端落盘口径：delta-of-delta 时间戳 + XOR 浮点 + WAL 截断），同工作负载下反超 ClickHouse 的 1.22×。
-- **内存安全 + 可审计的 unsafe 面。** 除三个小 crate（`rti-mem`、`rti-buffer`、`rti-wal-uring`）外全部 `#![forbid(unsafe_code)]`，每处 unsafe 配 `// SAFETY:` 注释。C/C++ 系统约 70% 的高危 CVE 源于内存错误——Rust 在编译期消除这一类。
+- **内存安全 + 可审计的 unsafe 面。** 除四个小 crate（`rti-mem`、`rti-buffer`、`rti-wal-uring`，以及文档化的 `rti-vla` C ABI 边界）外全部 `#![forbid(unsafe_code)]`，每处 unsafe 配 `// SAFETY:` 注释。C/C++ 系统约 70% 的高危 CVE 源于内存错误——Rust 在编译期消除这一类。
 - **no_std 子集。** `rti-core`、`rti-mem`、`rti-buffer` 可编译为 no_std（core+alloc）——同一引擎可从 MCU 安全岛跑到云端服务器。
 - **io_uring 流水化 WAL**（Linux，feature 门控，优雅降级）、**单分片 Raft 副本**（快照、成员变更、预投票——全部用虚拟时钟确定性测试）、**S3 冷层**（纯 std HTTP 客户端，零外部依赖）、**TSN 时间对齐**（面向确定性网络）。
 - **一切皆可确定性复现。** Raft 协议测试运行在虚拟时钟 + 内存传输上——选主、故障切换、日志一致性、网络分区场景 100% 可复现（连跑 30 次全绿）。
@@ -94,7 +94,7 @@ Helix S1/S2、GR00T、pi0 等双系统架构）以 10–100 ms 的节拍推理�
 
 ## 架构与策略（设计哲学）
 
-12 个 crate，按同一套分离原理分层：
+15 个 crate，按同一套分离原理分层：
 
 | Crate | 职责 |
 |---|---|
@@ -107,7 +107,10 @@ Helix S1/S2、GR00T、pi0 等双系统架构）以 10–100 ms 的节拍推理�
 | `rti-raft` | 单分片 Raft：选主、复制、快照、成员变更、预投票 |
 | `rti-net` | 最小 TCP 行协议 |
 | `rti-db` | 门面：`Db::open / put / put_durable / scan` |
-| `rti-edge` | RTI-Edge 集成：三档预设（安全岛/认知层/规划层） |
+| `rti-edge` | RTI-Edge 集成：四档预设（安全岛/认知层/规划层/AI 工作记忆） |
+| `rti-vla` | VLA 工作记忆适配器：`latest` / `window` / `ChunkBuffer` + 冻结 C ABI |
+| `rti-export` | LeRobot episode 导出器（Parquet、LVCF 重采样、O(chunk) 流式）+ CLI |
+| `rti-ros2` | ROS 2 飞行记录器桥（传输无关核心；rclrs 位于 `ros2-rclrs` feature 后） |
 
 策略一句话：**不在在位者的主场（通用 SQL、分析）硬碰硬——占领它们集体缺席的硬实时数据面，用结构性（而非调参）优势立足。**
 
@@ -137,26 +140,28 @@ let watermark = db.put_durable(1, Sample { ts: 1_700_000_000_000_001_000, value:
 for s in db.scan(1, 0, i64::MAX, None, None)? { /* 零拷贝迭代 */ }
 ```
 
-运行三层边缘演示（安全岛 / 认知层 / 规划层）：
+运行三层边缘演示（安全岛 / 认知层 / 规划层），或 v0.7 端到端 AI 管线（ROS 2 风格摄入 → 飞行记录器 → VLA 工作记忆 → LeRobot 导出 → 回放）：
 
 ```bash
-cargo run --release --example edge_demo
+cargo run -p rti-edge --release --example edge_demo
+cargo run -p rti-ros2 --example ai_pipeline
 ```
 
 Feature 开关：`io-uring`（流水化 WAL 后端）、`s3`（S3 冷层）、`alloc-count`（分配审计）、`std`（默认；关闭后核心三 crate 进入 no_std）。
 
 ## 测试与可复现性
 
-- **121 个测试全绿**（`cargo test --workspace`），全 feature 132 个
+- **156 个测试全绿**（`cargo test --workspace`），全 feature 179 个
 - Raft 协议确定性测试（虚拟时钟 + 内存传输）
 - 稳态零分配证明测试
 - 评测台：`bench/run_all.sh`（全量约 35 分钟，`--smoke` 2 分钟）——本 README 每个数字都可复现
 
 ## 路线图
 
-- **v0.1–v0.6（已完成）**：核心引擎 → io_uring+块解码+TSN 对齐 → 确定性档+no_std+镜像 → Raft+冷层 → 流水 WAL+S3+边缘集成 → 持久性语义+WAL 检查点（本版本）
-- **v0.7**：多分片 Raft、快速冲突回溯、segment 压实
-- **v0.8**：形式化 WCET 分析工具链、更广 no_std 覆盖、TSN 硬件时间戳
+- **v0.1–v0.6（已完成）**：核心引擎 → io_uring+块解码+TSN 对齐 → 确定性档+no_std+镜像 → Raft+冷层 → 流水 WAL+S3+边缘集成 → 持久性语义+WAL 检查点
+- **v0.7（本版本）**：AI 集成，见 [docs/v07-ai-integration-spec.md](docs/v07-ai-integration-spec.md)——`rti-ros2` 飞行记录器、`rti-export` LeRobot episode 导出、`rti-vla` 工作记忆 + C ABI
+- **v0.8**：多分片 Raft、快速冲突回溯、segment 压实
+- **v0.9**：形式化 WCET 分析工具链、更广 no_std 覆盖、TSN 硬件时间戳、Python 绑定
 
 ## 许可证
 
