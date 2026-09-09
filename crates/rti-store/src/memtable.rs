@@ -93,26 +93,34 @@ impl MemTable {
 
     /// Insert one sample; when the table is full, evict the oldest series by LRU (counted) first.
     ///
-    /// Returns whether an eviction happened. Never returns [`Error::SeriesFull`]
+    /// Returns the evicted series, if any (v0.8 reporting variant, SPEC §3: rti-db's latest
+    /// index must drop the victim series). Never returns [`Error::SeriesFull`]
     /// (except for the degenerate `max_samples == 0` configuration) — this implements the
     /// deterministic profile's 'evict the oldest series when full' semantics for rti-db.
     ///
     /// Eviction granularity is a whole series: all samples of the evicted series are removed
     /// from the table and its buffer goes to the spare pool for reuse. The LRU clock is updated on **write** touches.
-    pub fn insert_lru(&mut self, series: SeriesId, sample: Sample) -> Result<bool> {
-        let mut evicted_now = false;
+    pub fn insert_lru_report(&mut self, series: SeriesId, sample: Sample) -> Result<Option<SeriesId>> {
+        let mut victim = None;
         if self.len >= self.max_samples {
-            self.evict_lru()?;
-            evicted_now = true;
+            victim = Some(self.evict_lru()?);
         }
         // the eviction freed sample space and a slot; reuse insert's regular path here
         // (SeriesFull is impossible at this point, unless max_samples == 0).
         self.insert(series, sample)?;
-        Ok(evicted_now)
+        Ok(victim)
     }
 
-    /// Evict the series with the smallest last_used (bounded O(#series) scan).
-    fn evict_lru(&mut self) -> Result<()> {
+    /// Existing compatibility wrapper (v0.3): returns whether an eviction happened.
+    ///
+    /// Semantics are identical to [`MemTable::insert_lru_report`]; use that variant when the
+    /// evicted series id is needed.
+    pub fn insert_lru(&mut self, series: SeriesId, sample: Sample) -> Result<bool> {
+        Ok(self.insert_lru_report(series, sample)?.is_some())
+    }
+
+    /// Evict the series with the smallest last_used (bounded O(#series) scan), returning its id.
+    fn evict_lru(&mut self) -> Result<SeriesId> {
         let (&victim, _) = self
             .index
             .iter()
@@ -130,7 +138,7 @@ impl MemTable {
         }
         let _ = self.pool.free(entry.slot);
         self.evicted += 1;
-        Ok(())
+        Ok(victim)
     }
 
     /// Total number of series evicted by LRU (v0.3).
@@ -254,6 +262,29 @@ mod tests {
         assert_eq!(mt.range(2, 0, 100).count(), 0, "series 2 has been evicted as a whole");
         assert_eq!(mt.range(1, 0, 100).count(), 2, "series 1 data is intact");
         assert_eq!(mt.range(3, 0, 100).count(), 2);
+    }
+
+    /// v0.8: `insert_lru_report` returns the evicted series id; `insert_lru` stays a compatible bool wrapper.
+    #[test]
+    fn insert_lru_report_returns_evicted_series() {
+        let mut mt = MemTable::new(4, 4); // capacity 4 samples
+        assert_eq!(mt.insert_lru_report(1, Sample::new(1, 1.0)).unwrap(), None); // tick 1
+        assert_eq!(mt.insert_lru_report(2, Sample::new(1, 2.0)).unwrap(), None); // tick 2
+        assert_eq!(mt.insert_lru_report(1, Sample::new(2, 1.5)).unwrap(), None); // tick 3 -> series 1 newer
+        assert_eq!(mt.insert_lru_report(3, Sample::new(1, 3.0)).unwrap(), None); // tick 4, table full
+        assert!(mt.is_full());
+
+        // the 5th sample evicts series 2 (smallest last_used) and reports it
+        assert_eq!(mt.insert_lru_report(3, Sample::new(2, 3.5)).unwrap(), Some(2));
+        assert_eq!(mt.lru_evictions(), 1);
+        assert_eq!(mt.range(2, 0, 100).count(), 0, "series 2 evicted as a whole");
+
+        // the bool wrapper keeps the old contract (true iff an eviction happened)
+        assert!(mt.insert_lru(4, Sample::new(1, 4.0)).unwrap()); // evicts series 1 (last_used 3)
+        assert!(!mt.insert_lru(4, Sample::new(2, 4.5)).unwrap(), "not full: no eviction");
+        assert_eq!(mt.lru_evictions(), 2);
+        assert_eq!(mt.range(1, 0, 100).count(), 0, "series 1 evicted as a whole");
+        assert_eq!(mt.range(4, 0, 100).count(), 2);
     }
 
     /// v0.3: continuous writes never hit SeriesFull; spare-pool reuse keeps capacity bounded.

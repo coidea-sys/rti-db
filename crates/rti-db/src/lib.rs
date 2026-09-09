@@ -34,6 +34,10 @@ use rti_query::{Agg, Pred, ScanSource};
 use rti_store::{ColdTier, MemTable, SegmentReader, SegmentWriter, ZoneMap};
 use rti_wal::{Record, Wal};
 
+mod latest;
+
+pub use latest::{latest, LatestIndex};
+
 #[cfg(feature = "alloc-count")]
 pub use rti_mem::alloc_count::{alloc_count, CountingAllocator};
 
@@ -60,6 +64,9 @@ struct Shared {
     seg_seq: Mutex<u64>,
     /// Cold-tier storage (v0.4; injected via `set_cold_tier`).
     cold: Mutex<Option<Arc<dyn ColdTier>>>,
+    /// Per-series O(1) latest index (v0.8). Kept in its own mutex so `latest()` never
+    /// blocks on the WAL/segment I/O performed under `state`.
+    latest: Mutex<LatestIndex>,
     config: Config,
 }
 
@@ -136,9 +143,9 @@ impl Db {
             config.wal_sync = SyncPolicy::None;
         }
 
-        let (wal, segments, seg_seq) = if deterministic {
+        let (wal, segments, seg_seq, latest) = if deterministic {
             // Pure in-memory: no directories, no WAL, no segment loading.
-            (None, Vec::new(), 0)
+            (None, Vec::new(), 0, LatestIndex::new())
         } else {
             let dir = config
                 .data_dir
@@ -148,7 +155,13 @@ impl Db {
 
             // Load existing segments (file-name order == time order)
             let mut segments = Vec::new();
+            // v0.8 SPEC §1 pre-fix: the next sequence number is max(parsed NNNNNN) + 1 over both
+            // local segment names and archive.catalog names — never the file count, which would
+            // reuse numbers once compaction or archiving deletes local files.
             let mut seg_seq = 0u64;
+            // v0.8: rebuild the per-series latest index by decoding each pre-read segment
+            // forward once (SPEC §3; archived catalog entries are not pre-read, see Db::latest).
+            let mut latest = LatestIndex::new();
             let mut names: Vec<PathBuf> = fs::read_dir(dir)?
                 .filter_map(|e| e.ok())
                 .map(|e| e.path())
@@ -157,19 +170,27 @@ impl Db {
             names.sort();
             for p in names {
                 let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                segments.push(SegEntry::local(name, SegmentReader::open(&p)?));
-                seg_seq += 1;
+                if let Some(n) = parse_seg_seq(&name) {
+                    seg_seq = seg_seq.max(n + 1);
+                }
+                let reader = SegmentReader::open(&p)?;
+                latest.apply_segment(&reader)?;
+                segments.push(SegEntry::local(name, reader));
             }
             // Read back the archive catalog: cold-tier segments are registered as Archived (lazy read-back).
             // If a same-named file still exists locally (crash between archive and delete), the local one wins and the entry is skipped.
             for entry in load_catalog(dir)? {
+                // Cataloged names also advance the sequence (collision with cold-tier object keys).
+                if let Some(n) = parse_seg_seq(&entry.name) {
+                    seg_seq = seg_seq.max(n + 1);
+                }
                 if !segments.iter().any(|e: &SegEntry| e.name == entry.name) {
                     segments.push(entry);
                 }
             }
 
             let wal = Wal::open(dir.join("wal.log"), config.wal_sync)?;
-            (Some(wal), segments, seg_seq)
+            (Some(wal), segments, seg_seq, latest)
         };
 
         let shared = Arc::new(Shared {
@@ -180,6 +201,7 @@ impl Db {
             buf_pool: Arc::new(Mutex::new(Vec::new())),
             seg_seq: Mutex::new(seg_seq),
             cold: Mutex::new(None),
+            latest: Mutex::new(latest),
             config: config.clone(),
         });
 
@@ -192,6 +214,8 @@ impl Db {
                     seal_memtable(&shared, &mut state)?;
                 }
                 state.mem.insert(rec.series, rec.sample)?;
+                // v0.8: recovered samples become visible to latest() as they are applied.
+                shared.latest.lock().unwrap().apply(rec.series, rec.sample);
             }
         }
 
@@ -445,6 +469,29 @@ impl Db {
         }
     }
 
+    /// Newest visible sample for `series`, or `None` if the series is absent (v0.8, SPEC §3).
+    ///
+    /// O(1): a single hash lookup against the per-series head index — no flush, no
+    /// filesystem access, no segment decode, no allocation on the read path. The head
+    /// updates only on a strictly larger timestamp; the value at an equal maximum
+    /// timestamp is unspecified across layers (the index keeps the first known sample,
+    /// matching scan's first-writer-wins rule within one layer).
+    ///
+    /// Visibility follows the ingest pipeline, not the enqueue: after [`Db::put_durable`]
+    /// returns the sample is guaranteed visible here; a bare [`Db::put`] becomes visible
+    /// once the ingest thread has applied it. `latest()` never blocks waiting for the
+    /// queue or WAL sync. In the Deterministic profile a series evicted as a whole by LRU
+    /// reports `None`, matching scan visibility.
+    ///
+    /// Rebuild note: at open the index is rebuilt from the pre-read local segments plus
+    /// WAL replay. Segments present only in the cold tier (`archive.catalog`, never read
+    /// back) are not decoded at open — a series whose samples are exclusively archived
+    /// reports `None` until it is rewritten.
+    pub fn latest(&self, series: SeriesId) -> Result<Option<Sample>> {
+        self.check_err()?;
+        Ok(self.shared.latest.lock().unwrap().get(series))
+    }
+
     /// Current number of segments (loaded at open plus sealed at runtime).
     pub fn segment_count(&self) -> usize {
         self.shared.state.lock().unwrap().segments.len()
@@ -688,7 +735,13 @@ fn apply_batch(shared: &Shared, batch: &[Record]) -> Result<()> {
     for (j, rec) in batch.iter().enumerate() {
         if deterministic {
             // Pure in-memory: evict the oldest series by LRU when full (counted internally); never seal.
-            state.mem.insert_lru(rec.series, rec.sample)?;
+            // v0.8: latest() follows scan visibility — an evicted series is dropped from the index.
+            let victim = state.mem.insert_lru_report(rec.series, rec.sample)?;
+            let mut latest = shared.latest.lock().unwrap();
+            if let Some(v) = victim {
+                latest.remove(v);
+            }
+            latest.apply(rec.series, rec.sample);
             continue;
         }
         if state.mem.is_full() {
@@ -705,6 +758,10 @@ fn apply_batch(shared: &Shared, batch: &[Record]) -> Result<()> {
             }
             Err(e) => return Err(e),
         }
+        // v0.8: applied (== visible) records update the head index before the watermark
+        // advances, so put_durable's post-return visibility guarantee holds. Sealing does
+        // not change visibility, so heads stay valid across seals.
+        shared.latest.lock().unwrap().apply(rec.series, rec.sample);
     }
     // v0.6 WAL checkpoint: a seal occurred within this batch, so all WAL records before the last seal
     // point are already covered by segments (segments are fsynced to disk); atomically truncate while
@@ -756,6 +813,22 @@ fn seal_memtable(shared: &Shared, state: &mut DbState) -> Result<()> {
 
 /// Catalog file name (inside data_dir).
 const CATALOG_FILE: &str = "archive.catalog";
+
+/// Parse a `seg-NNNNNN-sSSSSSS.seg` segment name, returning the sequence number `NNNNNN`
+/// (v0.8 SPEC §1 pre-fix: sequence allocation is `max(NNNNNN) + 1` over local files and
+/// cataloged names, so reopening after file deletion never reuses a number).
+///
+/// Returns `None` for any name that does not exactly match the writer's format.
+fn parse_seg_seq(name: &str) -> Option<u64> {
+    let rest = name.strip_prefix("seg-")?;
+    let (seq, rest) = rest.split_once('-')?;
+    let series = rest.strip_prefix('s')?.strip_suffix(".seg")?;
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if !digits(seq) || !digits(series) {
+        return None;
+    }
+    seq.parse().ok()
+}
 
 /// Catalog line: `A <name> <series> <min_ts> <max_ts> <min_val_bits> <max_val_bits> <count>`.
 fn format_catalog_line(e: &SegEntry) -> String {
