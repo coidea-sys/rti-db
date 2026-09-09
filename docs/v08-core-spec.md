@@ -233,7 +233,11 @@ pub fn latest(db: &Db, series: SeriesId) -> Result<Option<Sample>>;
 - The latest index survives memtable sealing and reopen/recovery for persistent
   profiles. Rebuilding it at open may decode each pre-read segment forward once: this
   is O(total persisted samples) at open, but no extra file I/O beyond the existing
-  segment preload, and steady-state reads remain O(1).
+  segment preload, and steady-state reads remain O(1). Archived segments recorded only
+  in `archive.catalog` are not pre-read at open, so a series whose samples are
+  exclusively in the cold tier may return `None` from `latest()` after a reopen even
+  though `scan` reads them back transparently; this limitation must be disclosed in
+  the `Db::latest` and `rti-vla` rustdoc.
 - In `Profile::Deterministic`, if LRU eviction removes an entire series, `latest()`
   follows current scan visibility and returns `None` for that series. Add a reporting
   LRU API in `rti-store` rather than changing the existing method signature:

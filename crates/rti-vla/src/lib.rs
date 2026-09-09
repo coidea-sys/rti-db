@@ -13,17 +13,15 @@
 //! language, semver-frozen from v0.7.0 (`rti_latest`, `rti_window_open/next/close`,
 //! `rti_chunk_push/seal` plus handle lifecycle functions).
 //!
-//! ## Honest complexity disclosure
+//! ## Complexity and visibility disclosure (v0.8)
 //!
-//! rti-db's public API has no O(1) ring-head read, so [`latest`] is implemented as a
-//! full-range [`rti_query::ScanSource::collect`] over the series followed by taking the
-//! last point: **O(n) in the number of samples of that series** (memtable + segment
-//! merge, mutex-protected inside rti-db — the "lock-free ring head" wording of SPEC §4
-//! describes the target, not what rti-db exposes today). Steady-state calls perform zero
-//! heap allocations thanks to a thread-local reusable result buffer. If rti-db later
-//! grows a public head-read, [`latest`] drops to O(1) without an API change.
+//! Since v0.8, [`latest`] delegates to [`Db::latest`] (SPEC §3), rti-db's per-series
+//! head index: **O(1)** per call — a single hash lookup with no scan, no segment
+//! decode, no flush, no filesystem access, and zero heap allocation on the read path.
+//! The v0.7 O(n) full-range scan and its "≤256-point zero-allocation envelope" are
+//! gone. See the [`latest`] rustdoc for the exact visibility and duplicate-timestamp
+//! semantics.
 
-use std::cell::RefCell;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -54,35 +52,32 @@ impl TimeSpan {
 
 // --------------------------------------------------------------- S1: latest
 
-thread_local! {
-    /// Reusable result buffer for [`latest`] (one per thread; allocated on first use,
-    /// steady-state calls only `clear()` it, so the S1 hot path performs 0 mallocs).
-    static LATEST_BUF: RefCell<Vec<Sample>> = const { RefCell::new(Vec::new()) };
-}
-
 /// S1 reflex path: latest value for a series.
 ///
-/// Budget contract (SPEC §4): steady-state calls reuse a thread-local result buffer
-/// and are callable from a real-time thread — no I/O is triggered beyond rti-db's
-/// in-memory merge of already-loaded data. **Zero-allocation envelope:** for series of
-/// at most 256 samples (the intended S1 working set; the threshold is the standard
-/// library's stable-sort small-slice limit inside rti-db's collect path, measured on
-/// rustc 1.98.1) steady-state calls perform no heap allocation, even under concurrent
-/// ingest; larger series cost one rti-db-internal sort-scratch allocation per call.
+/// Delegates to [`Db::latest`] (v0.8, SPEC §3): **O(1)** per call — a single lookup in
+/// rti-db's per-series head index. No scan, no segment decode, no sort, no flush, no
+/// filesystem access, and **zero heap allocation** on the read path, independent of the
+/// series' sample count; callable from a real-time thread. Returns `Ok(None)` when the
+/// series has no visible samples.
 ///
-/// Complexity disclosure: rti-db exposes no O(1) head read through its public API, so
-/// this is currently a full-range scan of the series (O(n) in its sample count,
-/// mutex-protected inside rti-db) returning the last point. Returns `Ok(None)` when the
-/// series has no samples.
+/// Semantics (SPEC §3, inherited from [`Db::latest`]):
+///
+/// - "Latest" is a sample with the maximum timestamp. At an **equal maximum timestamp
+///   the value is unspecified across layer boundaries**: the head keeps the first known
+///   sample at the current maximum ts and updates only on a strictly larger ts.
+///   Unique-timestamp workloads — the real-time contract — match
+///   `scan(...).last()` exactly.
+/// - Visibility is tied to the ingest pipeline: after [`Db::put_durable`] returns the
+///   sample is guaranteed visible; a bare [`Db::put`] becomes visible once the ingest
+///   thread applies it. `latest()` never blocks waiting for the queue or a WAL sync.
+/// - The head survives memtable sealing and reopen/recovery for persistent profiles.
+/// - Under `Profile::Deterministic`, an entire series evicted by LRU reports `None`,
+///   mirroring scan visibility.
+/// - **Cold-tier limitation:** segments that have been archived to the cold tier are
+///   not pre-read at open, so a series whose samples are *only* in archived segments
+///   can report `None` after a reopen even though `scan` reads them back transparently.
 pub fn latest(db: &Db, series: SeriesId) -> Result<Option<Sample>> {
-    LATEST_BUF.with(|b| {
-        let mut buf = b.borrow_mut();
-        buf.clear();
-        db.collect(series, Timestamp::MIN, Timestamp::MAX, None, &mut buf)?;
-        // `collect` guarantees ascending-ts order (memtable + segment merge), so the
-        // last element is the latest point.
-        Ok(buf.last().copied())
-    })
+    db.latest(series)
 }
 
 // --------------------------------------------------------------- S2: window
@@ -272,11 +267,38 @@ mod tests {
         for i in 0..10 {
             put(&db, 1, i * 100, i as f64);
         }
-        put(&db, 2, 5, 999.0); // another series must not interfere
+        // another series must not interfere
+        put(&db, 2, 5, 999.0);
+        // v0.8 visibility: a bare put() becomes visible once the ingest thread applies
+        // it; flush() waits for the pipeline to drain (read-your-writes).
+        db.flush().unwrap();
         let s = latest(&db, 1).unwrap().expect("series 1 has points");
         assert_eq!(s, Sample::new(900, 9.0));
         let s2 = latest(&db, 2).unwrap().expect("series 2 has one point");
         assert_eq!(s2, Sample::new(5, 999.0));
+    }
+
+    /// SPEC §4 (v0.8): for unique timestamps `latest()` must match `scan(...).last()`
+    /// exactly. (Seal/reopen/durable coverage lives in `tests/latest.rs`, which uses a
+    /// persistent profile; the deterministic profile's whole-series LRU eviction would
+    /// otherwise evict the series under test.)
+    #[test]
+    fn latest_matches_scan_last_unique_ts() {
+        let db = db();
+        for i in 0..500i64 {
+            put(&db, 1, i, i as f64 * 0.5);
+            put(&db, 2, i * 3, 1000.0 - i as f64);
+        }
+        db.flush().unwrap();
+        for s in [1u32, 2] {
+            let scan_last = db.scan(s, 0, i64::MAX, None, None).unwrap().last();
+            assert_eq!(
+                latest(&db, s).unwrap(),
+                scan_last,
+                "series {s}: latest must match scan.last"
+            );
+        }
+        assert_eq!(latest(&db, 9).unwrap(), None, "unknown series");
     }
 
     #[test]
@@ -293,7 +315,11 @@ mod tests {
         // [1, 8): must exclude ts=0 and ts=8, include everything between.
         let got: Vec<Sample> = window(&db, &[1, 2], TimeSpan::new(1, 8)).unwrap().collect();
         let ts: Vec<Timestamp> = got.iter().map(|s| s.ts).collect();
-        assert_eq!(ts, vec![1, 2, 3, 4, 5, 5, 6, 7], "merged, ordered, half-open");
+        assert_eq!(
+            ts,
+            vec![1, 2, 3, 4, 5, 5, 6, 7],
+            "merged, ordered, half-open"
+        );
         // tie at ts=5: series 1 (first in the slice) comes before series 2.
         let tie: Vec<f64> = got.iter().filter(|s| s.ts == 5).map(|s| s.value).collect();
         assert_eq!(tie, vec![105.0, 202.0], "ties broken by series order");
@@ -303,14 +329,26 @@ mod tests {
 
         // full coverage: [start, end) includes start, excludes end
         let got: Vec<Sample> = window(&db, &[1], TimeSpan::new(0, 9)).unwrap().collect();
-        assert_eq!(got.iter().map(|s| s.ts).collect::<Vec<_>>(), vec![0, 2, 4, 5, 6, 8]);
+        assert_eq!(
+            got.iter().map(|s| s.ts).collect::<Vec<_>>(),
+            vec![0, 2, 4, 5, 6, 8]
+        );
 
         // empty series slice and unknown series yield empty iterators
         assert_eq!(window(&db, &[], TimeSpan::new(0, 100)).unwrap().count(), 0);
-        assert_eq!(window(&db, &[42], TimeSpan::new(0, 100)).unwrap().count(), 0);
+        assert_eq!(
+            window(&db, &[42], TimeSpan::new(0, 100)).unwrap().count(),
+            0
+        );
         // degenerate span rejected
-        assert!(matches!(window(&db, &[1], TimeSpan::new(5, 5)), Err(Error::Corrupt(_))));
-        assert!(matches!(window(&db, &[1], TimeSpan::new(9, 5)), Err(Error::Corrupt(_))));
+        assert!(matches!(
+            window(&db, &[1], TimeSpan::new(5, 5)),
+            Err(Error::Corrupt(_))
+        ));
+        assert!(matches!(
+            window(&db, &[1], TimeSpan::new(9, 5)),
+            Err(Error::Corrupt(_))
+        ));
     }
 
     #[test]
@@ -327,10 +365,16 @@ mod tests {
         }
         assert_eq!(cb.pending(), 4);
         // a full chunk rejects further pushes without blocking (backpressure)
-        assert!(matches!(cb.push(Sample::new(4, 2.0)), Err(Error::SeriesFull)));
+        assert!(matches!(
+            cb.push(Sample::new(4, 2.0)),
+            Err(Error::SeriesFull)
+        ));
 
         let wm1 = cb.seal_chunk().unwrap();
-        assert!(wm1 >= wm0 + 4, "watermark must cover the sealed batch ({wm0} -> {wm1})");
+        assert!(
+            wm1 >= wm0 + 4,
+            "watermark must cover the sealed batch ({wm0} -> {wm1})"
+        );
         assert_eq!(cb.pending(), 0);
 
         // all staged points landed and are readable back
