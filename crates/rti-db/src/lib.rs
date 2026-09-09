@@ -504,11 +504,13 @@ impl Db {
     /// segments removed.
     ///
     /// Only local, never-archived same-series segments participate (any name present in
-    /// `archive.catalog` is skipped); inputs merge in catalog order with first-writer-wins
-    /// on duplicate timestamps, so scan results are sample-identical before/after. The
+    /// `archive.catalog` is skipped); inputs merge in catalog order and the output preserves
+    /// duplicate timestamps in `(ts, catalog-index)` order, so scan results — including
+    /// predicated scans — are sample-identical before/after. The
     /// output is a single same-series `RTISEG01` segment written via the existing
     /// write-temp/atomic-rename/SyncPolicy-fsync discipline and installed in one short
-    /// critical section; superseded inputs are deleted best-effort afterwards. This is an
+    /// critical section; superseded inputs are deleted best-effort afterwards, newest first
+    /// with a directory fsync per delete (per `SyncPolicy`). This is an
     /// explicit operations API — it never runs inside the ingest batch loop.
     ///
     /// Deterministic profile: returns `Ok(0)` and does not touch the filesystem.

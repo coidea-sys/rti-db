@@ -5,9 +5,12 @@
 //! - Only **local, never-archived** segments participate: any segment whose name appears in
 //!   `archive.catalog` (or whose catalog entry is `Archived`) is skipped, so a compaction delete
 //!   can never resurrect a cold-tier copy via the append-only catalog.
-//! - Inputs are processed in existing catalog (in-memory segment list) order. Within one merge,
-//!   the **first** sample at a duplicate timestamp wins — the exact rule the scan layer applies
-//!   (stable sort + `dedup_by_key`), so scan results are sample-identical before/after a merge.
+//! - Inputs are processed in existing catalog (in-memory segment list) order. The merge
+//!   **preserves every sample at a duplicate timestamp**, ordered by `(ts, input catalog
+//!   index)` inside the output segment. Scan collects entries in catalog order, applies
+//!   predicates at the decode layer, then stable-sorts by ts and dedups — so a plain scan
+//!   still yields the first writer, a predicated scan still yields the first *matching*
+//!   writer, and both are sample-identical before/after a merge under arbitrary predicates.
 //! - The policy prefers time-adjacent, same-series segments: catalog order equals seal order,
 //!   so a maximal run of eligible same-series entries is already time-adjacent. Runs are broken
 //!   at any ineligible same-series entry (archived or catalog-listed), because merging across
@@ -22,12 +25,18 @@
 //! 2. the in-memory `SegEntry` set is swapped in one short critical section, after
 //!    re-validating that every selected input is still present, local, and unchanged
 //!    (same zone map) — a concurrent seal/archive cannot be compacted away;
-//! 3. superseded input files are deleted best-effort after the swap.
+//! 3. superseded input files are deleted best-effort after the swap, **newest first**
+//!    (reverse catalog order), with a directory fsync after each delete per [`SyncPolicy`]
+//!    (`Group`/`Always` fsync; `None` skips it — the same durability tier as
+//!    `SegmentWriter::write_unsynced`, where the page cache already survives a process crash).
 //!
 //! A crash before the rename leaves only old data (the `.seg.tmp` file is ignored at open);
 //! a crash after the rename but before the deletes leaves old+new files side by side, which
 //! reopen tolerates (name order keeps the older inputs first, and scan dedups by timestamp).
-//! All file I/O happens outside the `state` lock.
+//! A crash mid-delete can only have durably removed a *suffix* of the newest inputs: the
+//! remaining oldest inputs still precede the output segment in name order, and the output
+//! preserves the inputs' internal (ts, catalog-index) order, so duplicate-timestamp winners
+//! are unchanged. All file I/O happens outside the `state` lock.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
@@ -178,7 +187,8 @@ fn select_plans(
     plans
 }
 
-/// Execute one merge plan: open inputs by name → k-way merge (first-writer-wins) → write the
+/// Execute one merge plan: open inputs by name → k-way merge (duplicates preserved in
+/// `(ts, catalog-index)` order) → write the
 /// output segment (tmp + rename + policy fsync) → short critical-section swap → best-effort
 /// delete of the inputs. No file I/O is performed while holding the `state` lock.
 ///
@@ -282,7 +292,7 @@ fn merge_group(
     } else {
         SegmentWriter::write(&out_path, series, &merged)?;
     }
-    let out_bytes = fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
+    let out_bytes = fs::metadata(&out_path)?.len();
     // Pre-open the output reader outside the critical section (I/O stays out of the lock).
     let out_reader = match SegmentReader::open(&out_path) {
         Ok(r) => r,
@@ -334,17 +344,36 @@ fn merge_group(
         st.output_bytes += out_bytes;
     }
 
-    // Write order step 4: best-effort delete of superseded inputs after the swap. A crash here
-    // leaves old+new files on disk; reopen tolerates the overlap and scan dedups by ts.
-    for input in inputs {
-        let _ = fs::remove_file(dir.join(&input.name));
+    // Write order step 4: best-effort delete of superseded inputs after the swap, **newest
+    // first** (reverse catalog order), fsyncing the directory after each durable delete. A
+    // crash mid-delete then leaves the oldest inputs plus the output: name order keeps the
+    // oldest input ahead of the output, and the output preserves (ts, catalog-index) order,
+    // so duplicate-timestamp winners are exactly the pre-compaction ones. Deleting oldest
+    // first would be wrong: a crash could leave only a *newer* input ahead of the output,
+    // promoting its duplicate-losing samples to winners on reopen.
+    let sync_dir = shared.config.wal_sync != SyncPolicy::None;
+    for input in inputs.iter().rev() {
+        if fs::remove_file(dir.join(&input.name)).is_ok() && sync_dir {
+            // SyncPolicy::None skips this on purpose: same durability tier as the unsynced
+            // segment write above (process-crash safe via the page cache, no power-loss
+            // guarantee was requested).
+            let _ = fsync_dir(dir);
+        }
     }
     Ok(inputs.len())
 }
 
-/// K-way merge over same-series segment iterators, ordered by timestamp; at a duplicate
-/// timestamp the sample from the earliest input in catalog order wins (SPEC §1: this is the
-/// existing scan rule, not a last-writer-wins change).
+/// Directory fsync making a just-performed segment-file delete durable (SPEC §1 crash
+/// semantics: deletion order newest→oldest must survive a crash).
+fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+    fs::File::open(dir)?.sync_data()
+}
+
+/// K-way merge over same-series segment iterators, ordered by `(ts, input catalog index)`
+/// (SPEC §1): **all** samples are preserved, including duplicate timestamps — losers are not
+/// dropped. Scan's decode-time predicate filtering plus stable-sort + `dedup_by_key` then
+/// reproduce the pre-compaction result exactly: the first writer for a plain scan, the first
+/// *matching* writer for a predicated scan.
 fn kway_merge(readers: &[SegmentReader]) -> Result<Vec<Sample>> {
     let mut iters = Vec::with_capacity(readers.len());
     let mut total = 0usize;
@@ -354,7 +383,8 @@ fn kway_merge(readers: &[SegmentReader]) -> Result<Vec<Sample>> {
     }
     let mut out = Vec::with_capacity(total);
     loop {
-        // Lowest head timestamp; the lowest iterator index wins ties.
+        // Lowest head timestamp; the lowest iterator index (== catalog order) wins ties, so
+        // equal timestamps are emitted adjacent and in input order.
         let mut pick: Option<(Timestamp, usize)> = None;
         for (i, it) in iters.iter_mut().enumerate() {
             if let Some(s) = it.peek() {
@@ -363,17 +393,8 @@ fn kway_merge(readers: &[SegmentReader]) -> Result<Vec<Sample>> {
                 }
             }
         }
-        let Some((ts, i)) = pick else { break };
+        let Some((_, i)) = pick else { break };
         out.push(iters[i].next().expect("peeked above"));
-        // Drop the losing duplicates at this timestamp from every other input.
-        for (j, it) in iters.iter_mut().enumerate() {
-            if j == i {
-                continue;
-            }
-            while matches!(it.peek(), Some(s) if s.ts == ts) {
-                it.next();
-            }
-        }
     }
     Ok(out)
 }
@@ -435,10 +456,9 @@ mod tests {
     }
 
     /// SPEC §4 gate: merging N overlapping same-series segments leaves scan sample-identical,
-    /// including a predicate and aggregations. Overlapping prefixes rewrite the same values, so
-    /// the gate holds for *every* predicate (a predicate that matched a losing duplicate but not
-    /// the winner would legitimately change results — that is pre-existing scan semantics, not
-    /// a compaction regression; the first-writer-wins rule itself is pinned by the next test).
+    /// including a predicate and aggregations. Overlapping prefixes rewrite the same values;
+    /// the discriminating-predicate case (loser matches, winner does not) is covered by
+    /// `compact_discriminating_predicate_scan_identical`.
     #[test]
     fn compact_merge_scan_sample_identical() {
         let d = tmpdir("merge-identical");
@@ -599,6 +619,143 @@ mod tests {
         std::fs::remove_dir_all(&d).ok();
     }
 
+    /// SPEC §4: a **discriminating** predicate — one that matches the duplicate *loser* but
+    /// not the winner — must be sample-identical across compaction. The output segment
+    /// preserves duplicates in `(ts, catalog-index)` order, so decode-time predicate filtering
+    /// plus the scan layer's stable-sort dedup see exactly the same candidates as before.
+    #[test]
+    fn compact_discriminating_predicate_scan_identical() {
+        let d = tmpdir("pred-discriminating");
+        let db = Db::open(config(d.clone())).unwrap();
+        // seg-000000 wins duplicates at ts 50..99 with values 50..99 (never match Gt(500));
+        // seg-000001 loses with values 1050..1099 (always match).
+        seal_batch(&db, 1, &(0..100).map(|t| (t, t as f64)).collect::<Vec<_>>());
+        seal_batch(
+            &db,
+            1,
+            &(50..150)
+                .map(|t| (t, 1000.0 + t as f64))
+                .collect::<Vec<_>>(),
+        );
+        let full_before = scan_all(&db, 1);
+        assert_eq!(full_before.len(), 150);
+        let pred = Some(Pred::Gt(500.0));
+        let pred_before: Vec<Sample> = db
+            .scan(1, i64::MIN, i64::MAX, pred, None)
+            .unwrap()
+            .collect();
+        assert_eq!(
+            pred_before,
+            (50..150)
+                .map(|t| Sample::new(t, 1000.0 + t as f64))
+                .collect::<Vec<_>>(),
+            "baseline: predicated scan sees the duplicate losers"
+        );
+        let sum_before: Vec<Sample> = db
+            .scan(1, i64::MIN, i64::MAX, pred, Some(Agg::Sum))
+            .unwrap()
+            .collect();
+
+        assert_eq!(db.compact().unwrap(), 2);
+        assert_eq!(db.segment_count(), 1);
+        // The output segment physically preserves both duplicates at ts 50..99.
+        let out = SegmentReader::open(d.join("seg-000002-s000001.seg")).unwrap();
+        assert_eq!(
+            out.iter().unwrap().count(),
+            200,
+            "duplicates must be preserved in the output"
+        );
+
+        assert_eq!(
+            scan_all(&db, 1),
+            full_before,
+            "plain scan still first-writer"
+        );
+        let pred_after: Vec<Sample> = db
+            .scan(1, i64::MIN, i64::MAX, pred, None)
+            .unwrap()
+            .collect();
+        assert_eq!(
+            pred_after, pred_before,
+            "discriminating predicate scan must be sample-identical"
+        );
+        let sum_after: Vec<Sample> = db
+            .scan(1, i64::MIN, i64::MAX, pred, Some(Agg::Sum))
+            .unwrap()
+            .collect();
+        assert_eq!(
+            sum_after, sum_before,
+            "predicated aggregation must be identical"
+        );
+
+        drop(db);
+        let db = Db::open(config(d.clone())).unwrap();
+        assert_eq!(scan_all(&db, 1), full_before);
+        let p: Vec<Sample> = db
+            .scan(1, i64::MIN, i64::MAX, pred, None)
+            .unwrap()
+            .collect();
+        assert_eq!(
+            p, pred_before,
+            "reopen keeps the predicated result identical"
+        );
+        drop(db);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// Swap revalidation: an input that changed (or was archived/removed) between the catalog
+    /// snapshot and the swap aborts the merge — the uninstalled output is cleaned up, inputs
+    /// stay intact, stats are untouched, and a fresh compact() still succeeds.
+    #[test]
+    fn compact_swap_revalidation_aborts_on_changed_input() {
+        let d = tmpdir("revalidate-abort");
+        let db = Db::open(config(d.clone())).unwrap();
+        seal_batch(&db, 1, &(0..50).map(|t| (t, 1.0)).collect::<Vec<_>>());
+        seal_batch(&db, 1, &(50..100).map(|t| (t, 2.0)).collect::<Vec<_>>());
+
+        // Take the same snapshot the executor would...
+        let policy = CompactPolicy::default();
+        let plan = {
+            let state = db.shared.state.lock().unwrap();
+            select_plans(&policy, &state.segments, &HashSet::new(), None)
+                .into_iter()
+                .next()
+                .expect("two eligible segments form a plan")
+        };
+        // ...then simulate a concurrent change to an input entry (a racing op replaced it):
+        // the unchanged-proof (zone equality) must fail at swap time.
+        {
+            let mut state = db.shared.state.lock().unwrap();
+            let e = state
+                .segments
+                .iter_mut()
+                .find(|e| e.name == plan.inputs[0].name)
+                .unwrap();
+            e.zone.count += 1;
+        }
+        let removed = run_plan(&db.shared, &d, &policy, plan).unwrap();
+        assert_eq!(
+            removed, 0,
+            "a changed input must abort the merge at swap time"
+        );
+        assert_eq!(
+            seg_files(&d).len(),
+            2,
+            "the uninstalled output is rolled back, inputs intact"
+        );
+        assert_eq!(
+            db.compaction_stats(),
+            CompactionStats::default(),
+            "aborts move no counters"
+        );
+        // A fresh snapshot revalidates against the current state and compacts normally.
+        assert_eq!(db.compact().unwrap(), 2);
+        assert_eq!(db.segment_count(), 1);
+        assert_eq!(scan_all(&db, 1).len(), 100);
+        drop(db);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
     /// SPEC §0.5 / §4: Deterministic profile compaction is Ok(0) and touches no filesystem.
     #[test]
     fn compact_deterministic_noop() {
@@ -689,6 +846,18 @@ mod tests {
         std::fs::remove_dir_all(&d).ok();
     }
 
+    /// Hand-build a compaction output exactly as the executor does (k-way over the named
+    /// inputs in catalog order, **all** samples preserved, ordered by `(ts, input index)`).
+    fn hand_merged(dir: &Path, names: &[&str]) -> Vec<Sample> {
+        let mut merged: Vec<Sample> = Vec::new();
+        for name in names {
+            let r = SegmentReader::open(dir.join(name)).unwrap();
+            merged.extend(r.iter().unwrap());
+        }
+        merged.sort_by_key(|s| s.ts); // stable: equal ts stay in input (catalog) order
+        merged
+    }
+
     /// SPEC §1 crash windows: simulate a crash after the output rename but before the swap's
     /// deletes (old inputs and new output coexist) plus a crash before a rename (stale
     /// `*.seg.tmp`). Reopen must lose nothing and keep the logical scan correct, and a later
@@ -698,6 +867,12 @@ mod tests {
         let d = tmpdir("crash-coexist");
         let expected: Vec<Sample> = (0..150)
             .map(|t| Sample::new(t, if t < 100 { t as f64 } else { 1000.0 + t as f64 }))
+            .collect();
+        // Discriminating predicate: the duplicate winner (v = ts) never matches, the loser
+        // (v = 1000+ts) always does — pre-compaction predicated scans see the *losers*.
+        let pred = Some(Pred::Gt(500.0));
+        let pred_expected: Vec<Sample> = (50..150)
+            .map(|t| Sample::new(t, 1000.0 + t as f64))
             .collect();
         {
             let db = Db::open(config(d.clone())).unwrap();
@@ -710,22 +885,21 @@ mod tests {
                     .collect::<Vec<_>>(),
             );
             assert_eq!(scan_all(&db, 1), expected);
+            let p: Vec<Sample> = db
+                .scan(1, i64::MIN, i64::MAX, pred, None)
+                .unwrap()
+                .collect();
+            assert_eq!(p, pred_expected);
         }
 
-        // Hand-build the compaction output exactly as the executor would (k-way, first-wins),
-        // name it with the next sequence number, and leave the inputs in place.
-        let mut merged: Vec<Sample> = Vec::new();
-        for name in ["seg-000000-s000001.seg", "seg-000001-s000001.seg"] {
-            let r = SegmentReader::open(d.join(name)).unwrap();
-            merged.extend(r.iter().unwrap());
-        }
-        merged.sort_by_key(|s| s.ts); // stable: first writer stays first at equal ts
-        merged.dedup_by_key(|s| s.ts); // first writer wins
-        assert_eq!(merged, expected);
+        // Hand-build the compaction output, name it with the next sequence number, and leave
+        // the inputs in place (crash after rename, before swap/deletes).
+        let merged = hand_merged(&d, &["seg-000000-s000001.seg", "seg-000001-s000001.seg"]);
+        assert_eq!(merged.len(), 200, "duplicates are preserved, not deduped");
         SegmentWriter::write(d.join("seg-000002-s000001.seg"), 1, &merged).unwrap();
         // Stale temp file from a crash before an even later rename: must be ignored by open.
         fs::write(
-            d.join("seg-000003-s000001.seg.tmp"),
+            d.join("seg-000004-s000001.seg.tmp"),
             b"RTISEG01-partial-garbage",
         )
         .unwrap();
@@ -743,16 +917,108 @@ mod tests {
                 expected,
                 "duplicate old/new segments reopen correctly"
             );
+            let p: Vec<Sample> = db
+                .scan(1, i64::MIN, i64::MAX, pred, None)
+                .unwrap()
+                .collect();
+            assert_eq!(
+                p, pred_expected,
+                "predicated scan is unchanged with old+new coexisting"
+            );
             // A real compaction now merges all three; the output takes seq 3 (the stale .tmp
             // never reserved it) and all superseded files are deleted.
             assert_eq!(db.compact().unwrap(), 3);
             assert_eq!(seg_files(&d), vec!["seg-000003-s000001.seg".to_string()]);
             assert_eq!(scan_all(&db, 1), expected);
+            let p: Vec<Sample> = db
+                .scan(1, i64::MIN, i64::MAX, pred, None)
+                .unwrap()
+                .collect();
+            assert_eq!(p, pred_expected);
         }
         // Final reopen over the compacted directory.
         {
             let db = Db::open(config(d.clone())).unwrap();
             assert_eq!(scan_all(&db, 1), expected);
+            let p: Vec<Sample> = db
+                .scan(1, i64::MIN, i64::MAX, pred, None)
+                .unwrap()
+                .collect();
+            assert_eq!(p, pred_expected);
+        }
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// SPEC §1 crash window: crash **mid-delete**. Superseded inputs are deleted newest →
+    /// oldest with a directory fsync per delete, so the only durable mid-delete state is
+    /// "oldest inputs + output". Simulate exactly that: the output is present and only the
+    /// NEWER input was durably deleted. Reopen must keep duplicate-timestamp winners (plain
+    /// and predicated) identical to the pre-compaction scan.
+    #[test]
+    fn compact_crash_mid_delete_keeps_duplicate_winners() {
+        let d = tmpdir("crash-mid-delete");
+        let expected: Vec<Sample> = (0..150)
+            .map(|t| Sample::new(t, if t < 100 { t as f64 } else { 1000.0 + t as f64 }))
+            .collect();
+        let pred = Some(Pred::Gt(500.0));
+        let pred_expected: Vec<Sample> = (50..150)
+            .map(|t| Sample::new(t, 1000.0 + t as f64))
+            .collect();
+        {
+            let db = Db::open(config(d.clone())).unwrap();
+            seal_batch(&db, 1, &(0..100).map(|t| (t, t as f64)).collect::<Vec<_>>());
+            seal_batch(
+                &db,
+                1,
+                &(50..150)
+                    .map(|t| (t, 1000.0 + t as f64))
+                    .collect::<Vec<_>>(),
+            );
+            assert_eq!(scan_all(&db, 1), expected);
+        }
+
+        // Output written and renamed; newest-first deletion completed exactly one step
+        // (seg-000001 gone, directory fsynced) before the crash.
+        let merged = hand_merged(&d, &["seg-000000-s000001.seg", "seg-000001-s000001.seg"]);
+        SegmentWriter::write(d.join("seg-000002-s000001.seg"), 1, &merged).unwrap();
+        fs::remove_file(d.join("seg-000001-s000001.seg")).unwrap();
+        fsync_dir(&d).unwrap();
+
+        {
+            let db = Db::open(config(d.clone())).unwrap();
+            assert_eq!(
+                seg_files(&d),
+                vec![
+                    "seg-000000-s000001.seg".to_string(),
+                    "seg-000002-s000001.seg".to_string(),
+                ]
+            );
+            // Winner at the duplicated ts 50..99 is still seg-000000's sample: name order puts
+            // it ahead of the output, and the output's internal (ts, catalog-index) order keeps
+            // the older input's sample first as well.
+            assert_eq!(
+                scan_all(&db, 1),
+                expected,
+                "mid-delete crash must not change winners"
+            );
+            assert_eq!(scan_all(&db, 1)[60].value, 60.0);
+            let p: Vec<Sample> = db
+                .scan(1, i64::MIN, i64::MAX, pred, None)
+                .unwrap()
+                .collect();
+            assert_eq!(
+                p, pred_expected,
+                "mid-delete crash must not change predicated results"
+            );
+            // Recovery compaction finishes the job.
+            assert_eq!(db.compact().unwrap(), 2);
+            assert_eq!(seg_files(&d), vec!["seg-000003-s000001.seg".to_string()]);
+            assert_eq!(scan_all(&db, 1), expected);
+            let p: Vec<Sample> = db
+                .scan(1, i64::MIN, i64::MAX, pred, None)
+                .unwrap()
+                .collect();
+            assert_eq!(p, pred_expected);
         }
         std::fs::remove_dir_all(&d).ok();
     }
