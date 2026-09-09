@@ -53,3 +53,30 @@ fn deterministic_put_steady_state_zero_alloc_growth() {
     let got: Vec<Sample> = db.scan(3, 799_990, 800_000, None, None).unwrap().collect();
     assert!(!got.is_empty());
 }
+
+/// v0.8 SPEC §4: 100k-point series, 10k `latest()` calls — zero heap-allocation growth
+/// on the O(1) read path (a single hash lookup; no flush, no decode, no I/O).
+#[test]
+fn latest_read_path_zero_alloc_growth() {
+    let mut cfg = Config::deterministic();
+    cfg.memtable_max = 1 << 17; // fits the whole 100k-point series; no LRU eviction
+    let db = Db::open(cfg).unwrap();
+
+    for i in 0..100_000i64 {
+        put_retry(&db, 1, Sample::new(i, i as f64));
+    }
+    db.flush().unwrap();
+    let want = Some(Sample::new(99_999, 99_999.0));
+    assert_eq!(db.latest(1).unwrap(), want); // warm-up (first call)
+
+    let before = alloc_count();
+    for _ in 0..10_000 {
+        assert_eq!(db.latest(1).unwrap(), want);
+    }
+    let after = alloc_count();
+
+    assert_eq!(
+        after, before,
+        "latest() read path must show 0 heap-allocation growth (before={before}, after={after})"
+    );
+}

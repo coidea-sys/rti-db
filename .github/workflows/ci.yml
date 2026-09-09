@@ -30,6 +30,9 @@ jobs:
       - name: no_std smoke check
         run: bash scripts/check-no-std.sh
 
+      - name: neutrality check (no ML/inference deps)
+        run: bash scripts/check-neutrality.sh
+
       - name: C ABI header diff check
         run: |
           cargo install cbindgen --locked --version 0.29.4
