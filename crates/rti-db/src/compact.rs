@@ -11,10 +11,14 @@
 //!   predicates at the decode layer, then stable-sorts by ts and dedups — so a plain scan
 //!   still yields the first writer, a predicated scan still yields the first *matching*
 //!   writer, and both are sample-identical before/after a merge under arbitrary predicates.
-//! - The policy prefers time-adjacent, same-series segments: catalog order equals seal order,
-//!   so a maximal run of eligible same-series entries is already time-adjacent. Runs are broken
-//!   at any ineligible same-series entry (archived or catalog-listed), because merging across
-//!   such an entry could reorder duplicate-timestamp winners relative to scan.
+//! - The policy merges only each series' **complete eligible tail run** (catalog order equals
+//!   seal order, so the tail is also the time-adjacent end). Collection stops at the first
+//!   ineligible same-series entry (archived or catalog-listed), and a tail shorter than
+//!   `min_segments` yields no plan. Tail-only is required for correctness, not just locality:
+//!   the swap installs the output at the run's first-input position, while reopen sorts by
+//!   file name — with a fresh maximal sequence number the output sorts last. Only when no
+//!   same-series entry follows the run do the live catalog order and the reopen name order
+//!   agree, keeping duplicate-timestamp winners (plain and predicated) stable across restart.
 //! - Merge eligibility requires `min_segments`; `max_input_bytes` greedily splits long runs.
 //!   Both are deterministic functions of the catalog snapshot plus on-disk file sizes.
 //!
@@ -51,6 +55,8 @@ use crate::{load_catalog, SegEntry, SegLoc, Shared};
 ///
 /// `runs` counts executed merge runs (one per emitted output segment); a `compact()` call
 /// that finds nothing eligible adds nothing. Byte counters use on-disk file sizes.
+/// Counters are process-local and cumulative since `Db::open`; they reset on restart
+/// (nothing is persisted).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CompactionStats {
     /// Merge runs executed so far.
@@ -65,20 +71,18 @@ pub struct CompactionStats {
     pub output_bytes: u64,
 }
 
-/// Deterministic selection policy: a run needs at least `min_segments` inputs; when
-/// `max_input_bytes` is `Some`, runs are greedily split so one merge's inputs stay under it
-/// (deterministic: file sizes are read from a quiesced-name snapshot, inputs in catalog order).
+/// Deterministic selection policy: a series' eligible tail run needs at least `min_segments`
+/// inputs to be merged. (A `max_input_bytes` split was considered and removed: committing only
+/// a front slice of a tail run would leave same-series inputs after the merged group and
+/// reintroduce the live-order vs reopen-order winner flip — merges are always whole tail runs.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CompactPolicy {
     pub min_segments: usize,
-    pub max_input_bytes: Option<u64>,
 }
 
 impl Default for CompactPolicy {
     fn default() -> Self {
-        Self {
-            min_segments: 2,
-            max_input_bytes: None,
-        }
+        Self { min_segments: 2 }
     }
 }
 
@@ -126,15 +130,23 @@ pub(crate) fn compact(shared: &Shared, series_filter: Option<SeriesId>) -> Resul
     };
     let mut removed = 0usize;
     for plan in plans {
-        removed += run_plan(shared, &dir, &policy, plan)?;
+        removed += run_plan(shared, &dir, plan)?;
     }
     Ok(removed)
 }
 
-/// Snapshot-only selection (no I/O): maximal runs of eligible same-series entries in catalog
-/// order. An entry is eligible iff it is local and its name is absent from `cataloged`.
-/// Runs break at ineligible same-series entries so the merge never reorders duplicate-ts
-/// winners relative to a skipped segment (scan-order preservation).
+/// Snapshot-only selection (no I/O): for each series, the **complete eligible tail run** of
+/// its catalog subsequence — walking backwards from the series' last entry and collecting
+/// while entries are eligible (local and absent from `cataloged`), stopping at the first
+/// ineligible same-series entry. A plan exists only when that tail run reaches
+/// `min_segments`.
+///
+/// Why tail-only: the swap installs the output at the run's first-input position, but the
+/// output's *file name* carries a fresh, globally maximal sequence number, so reopen (which
+/// sorts by name) places it after every pre-existing segment. If any same-series entry
+/// followed the run, live catalog order (output before that entry) and reopen name order
+/// (output after it) would disagree, flipping duplicate-timestamp winners across a restart.
+/// Restricting merges to the series tail makes the two orders identical.
 fn select_plans(
     policy: &CompactPolicy,
     segments: &[SegEntry],
@@ -143,7 +155,7 @@ fn select_plans(
 ) -> Vec<Plan> {
     // Group target-series entries by series, preserving catalog order (BTreeMap iteration is
     // series-id order; within a series, push order is catalog order — both deterministic).
-    let mut by_series: BTreeMap<SeriesId, Vec<Option<Input>>> = BTreeMap::new();
+    let mut by_series: BTreeMap<SeriesId, Vec<Input>> = BTreeMap::new();
     for e in segments {
         if let Some(s) = series_filter {
             if e.series != s {
@@ -151,50 +163,33 @@ fn select_plans(
             }
         }
         let eligible = matches!(e.loc, SegLoc::Local(_)) && !cataloged.contains(&e.name);
-        by_series
-            .entry(e.series)
-            .or_default()
-            .push(eligible.then(|| Input {
-                name: e.name.clone(),
-                zone: e.zone,
-            }));
-    }
-    let mut plans = Vec::new();
-    for (series, entries) in by_series {
-        let mut run: Vec<Input> = Vec::new();
-        for entry in entries {
-            match entry {
-                Some(input) => run.push(input),
-                None => {
-                    if run.len() >= policy.min_segments {
-                        plans.push(Plan {
-                            series,
-                            inputs: std::mem::take(&mut run),
-                        });
-                    } else {
-                        run.clear();
-                    }
-                }
-            }
+        if !eligible {
+            // An ineligible same-series entry seals the tail: anything before it is not part
+            // of this series' suffix and must not be merged.
+            by_series.insert(e.series, Vec::new());
+            continue;
         }
-        if run.len() >= policy.min_segments {
-            plans.push(Plan {
-                series,
-                inputs: run,
-            });
-        }
+        by_series.entry(e.series).or_default().push(Input {
+            name: e.name.clone(),
+            zone: e.zone,
+        });
     }
-    plans
+    by_series
+        .into_iter()
+        .filter_map(|(series, inputs)| {
+            (inputs.len() >= policy.min_segments).then_some(Plan { series, inputs })
+        })
+        .collect()
 }
 
-/// Execute one merge plan: open inputs by name → k-way merge (duplicates preserved in
-/// `(ts, catalog-index)` order) → write the
+/// Execute one merge plan (always a whole eligible tail run): open inputs by name → k-way
+/// merge (duplicates preserved in `(ts, catalog-index)` order) → write the
 /// output segment (tmp + rename + policy fsync) → short critical-section swap → best-effort
 /// delete of the inputs. No file I/O is performed while holding the `state` lock.
 ///
 /// Returns the number of input segments removed (0 when the plan aborted because an input
 /// raced away or changed between snapshot and swap — nothing was merged then).
-fn run_plan(shared: &Shared, dir: &Path, policy: &CompactPolicy, plan: Plan) -> Result<usize> {
+fn run_plan(shared: &Shared, dir: &Path, plan: Plan) -> Result<usize> {
     // Open inputs by name (fresh reads; never the cached readers — the swap must be provable
     // against the on-disk bytes that a reopen would see).
     let mut readers = Vec::with_capacity(plan.inputs.len());
@@ -215,52 +210,10 @@ fn run_plan(shared: &Shared, dir: &Path, policy: &CompactPolicy, plan: Plan) -> 
         sizes.push(meta.len());
     }
 
-    // Apply max_input_bytes by greedy deterministic split (no-op under the default policy).
-    let groups = split_by_bytes(&plan, &sizes, policy);
-    let mut removed = 0usize;
-    for (lo, hi) in groups {
-        if hi - lo < policy.min_segments {
-            continue;
-        }
-        // A group whose revalidation fails aborts just that group (its inputs raced away);
-        // earlier committed groups still count.
-        removed += merge_group(
-            shared,
-            dir,
-            plan.series,
-            &plan.inputs[lo..hi],
-            &readers[lo..hi],
-            &sizes[lo..hi],
-        )?;
-    }
-    Ok(removed)
+    merge_group(shared, dir, plan.series, &plan.inputs, &readers, &sizes)
 }
 
-/// Half-open index ranges `[lo, hi)` into the plan inputs, greedily packed under
-/// `max_input_bytes` in input order (deterministic). With no cap the whole plan is one group.
-fn split_by_bytes(plan: &Plan, sizes: &[u64], policy: &CompactPolicy) -> Vec<(usize, usize)> {
-    let n = plan.inputs.len();
-    let Some(cap) = policy.max_input_bytes else {
-        return vec![(0, n)];
-    };
-    let mut out = Vec::new();
-    let mut lo = 0usize;
-    let mut acc = 0u64;
-    for (i, &sz) in sizes.iter().enumerate() {
-        if i > lo && acc.saturating_add(sz) > cap {
-            out.push((lo, i));
-            lo = i;
-            acc = 0;
-        }
-        acc = acc.saturating_add(sz);
-    }
-    if lo < n {
-        out.push((lo, n));
-    }
-    out
-}
-
-/// Merge one input group and commit it. Returns the number of inputs removed (0 when the swap
+/// Merge one tail run and commit it. Returns the number of inputs removed (0 when the swap
 /// revalidation failed — a concurrent archive/seal changed an input; the output is cleaned up).
 fn merge_group(
     shared: &Shared,
@@ -733,7 +686,7 @@ mod tests {
                 .unwrap();
             e.zone.count += 1;
         }
-        let removed = run_plan(&db.shared, &d, &policy, plan).unwrap();
+        let removed = run_plan(&db.shared, &d, plan).unwrap();
         assert_eq!(
             removed, 0,
             "a changed input must abort the merge at swap time"
@@ -842,6 +795,205 @@ mod tests {
             d.join("seg-000005-s000001.seg").exists(),
             "reopen must allocate max(local + cataloged) + 1, never reusing a seq"
         );
+        drop(db);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// Regression (review round 2): merging a **non-tail** run is forbidden. The swap installs
+    /// the output at the first input's position, but its fresh maximal sequence number sorts it
+    /// last on reopen — with a same-series segment after the run, live catalog order and reopen
+    /// name order would disagree and duplicate winners would flip across restart.
+    ///
+    /// Layout: A1/A2 eligible, X cataloged (crash-leftover local copy), B1 a later local
+    /// segment. A1/A2 must NOT be merged. Once B2 exists, only the B tail run merges, and
+    /// plain + discriminating-predicate winners are identical before/after and after reopen.
+    #[test]
+    fn compact_only_merges_eligible_tail_run() {
+        let d = tmpdir("tail-run");
+        let db = Db::open(config(d.clone())).unwrap();
+        seal_batch(&db, 1, &(0..100).map(|t| (t, t as f64)).collect::<Vec<_>>()); // A1 = seg-000000
+        seal_batch(
+            &db,
+            1,
+            &(50..150)
+                .map(|t| (t, 1000.0 + t as f64))
+                .collect::<Vec<_>>(),
+        ); // A2 = seg-000001
+        seal_batch(
+            &db,
+            1,
+            &(100..200)
+                .map(|t| (t, 2000.0 + t as f64))
+                .collect::<Vec<_>>(),
+        ); // X = seg-000002
+        seal_batch(
+            &db,
+            1,
+            &(60..160)
+                .map(|t| (t, 3000.0 + t as f64))
+                .collect::<Vec<_>>(),
+        ); // B1 = seg-000003
+           // X becomes catalog-listed (local file still present: archive crash leftover).
+        let line = format!(
+            "A seg-000002-s000001.seg 1 100 199 {} {} 100\n",
+            2100.0f64.to_bits(),
+            2199.0f64.to_bits()
+        );
+        fs::write(d.join("archive.catalog"), line).unwrap();
+
+        // Discriminating predicate: matches only B1's values (3060..3159); every older
+        // duplicate at those timestamps is filtered out.
+        let pred = Some(Pred::Between(3060.0, 3159.0));
+        let pred_expected: Vec<Sample> = (60..160)
+            .map(|t| Sample::new(t, 3000.0 + t as f64))
+            .collect();
+        let full_before = scan_all(&db, 1);
+        assert_eq!(full_before.len(), 200);
+        assert_eq!(
+            full_before[60].value, 60.0,
+            "plain winner at a duplicated ts is A1"
+        );
+        let pred_before: Vec<Sample> = db
+            .scan(1, i64::MIN, i64::MAX, pred, None)
+            .unwrap()
+            .collect();
+        assert_eq!(
+            pred_before, pred_expected,
+            "predicated winner is B1's losing duplicate"
+        );
+
+        // B1 is a singleton tail: A1/A2 must NOT be merged while B1 sits behind X.
+        assert_eq!(db.compact().unwrap(), 0, "non-tail runs must not be merged");
+        assert_eq!(seg_files(&d).len(), 4, "nothing merged, nothing deleted");
+
+        // Extend the tail: B2 makes [B1, B2] the complete eligible tail run.
+        seal_batch(
+            &db,
+            1,
+            &(70..170)
+                .map(|t| (t, 4000.0 + t as f64))
+                .collect::<Vec<_>>(),
+        ); // B2 = seg-000004
+        assert_eq!(db.compact().unwrap(), 2, "only the B tail run merges");
+        let files = seg_files(&d);
+        assert_eq!(
+            files,
+            vec![
+                "seg-000000-s000001.seg".to_string(),
+                "seg-000001-s000001.seg".to_string(),
+                "seg-000002-s000001.seg".to_string(),
+                "seg-000005-s000001.seg".to_string(),
+            ],
+            "A1/A2/X untouched; the tail output takes the next free seq"
+        );
+        assert_eq!(
+            scan_all(&db, 1),
+            full_before,
+            "plain scan identical after tail merge"
+        );
+        let p: Vec<Sample> = db
+            .scan(1, i64::MIN, i64::MAX, pred, None)
+            .unwrap()
+            .collect();
+        assert_eq!(
+            p, pred_expected,
+            "predicated scan identical after tail merge"
+        );
+
+        // Reopen: name order equals the live catalog order (the output is the series tail),
+        // so winners cannot flip.
+        drop(db);
+        let db = Db::open(config(d.clone())).unwrap();
+        assert_eq!(scan_all(&db, 1), full_before, "reopen keeps plain winners");
+        assert_eq!(scan_all(&db, 1)[60].value, 60.0);
+        let p: Vec<Sample> = db
+            .scan(1, i64::MIN, i64::MAX, pred, None)
+            .unwrap()
+            .collect();
+        assert_eq!(p, pred_expected, "reopen keeps predicated winners");
+        drop(db);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// Two compaction rounds: a previous output segment is part of the next tail run and must
+    /// not be reordered by the second merge — scans stay identical round by round, including
+    /// across an intermediate reopen.
+    #[test]
+    fn compact_two_rounds_preserve_order() {
+        let d = tmpdir("two-rounds");
+        let pred = Some(Pred::Gt(500.0));
+        let pred_scan = |db: &Db| -> Vec<Sample> {
+            db.scan(1, i64::MIN, i64::MAX, pred, None)
+                .unwrap()
+                .collect()
+        };
+
+        let db = Db::open(config(d.clone())).unwrap();
+        seal_batch(&db, 1, &(0..100).map(|t| (t, t as f64)).collect::<Vec<_>>()); // A1 = seg-000000
+        seal_batch(
+            &db,
+            1,
+            &(50..150)
+                .map(|t| (t, 1000.0 + t as f64))
+                .collect::<Vec<_>>(),
+        ); // A2 = seg-000001
+        let base_full = scan_all(&db, 1);
+        let base_pred = pred_scan(&db);
+        assert_eq!(base_full.len(), 150);
+        assert_eq!(
+            base_full[60].value, 60.0,
+            "plain winner at a duplicated ts is A1"
+        );
+        assert_eq!(
+            base_pred[10].value, 1060.0,
+            "predicated winner at ts 60 is A2 (A1 filtered)"
+        );
+
+        assert_eq!(db.compact().unwrap(), 2, "round 1 merges the A tail");
+        assert_eq!(seg_files(&d), vec!["seg-000002-s000001.seg".to_string()]);
+        assert_eq!(scan_all(&db, 1), base_full, "after round 1");
+        assert_eq!(pred_scan(&db), base_pred, "after round 1 (pred)");
+
+        // Intermediate reopen, then extend the series and compact again.
+        drop(db);
+        let db = Db::open(config(d.clone())).unwrap();
+        assert_eq!(scan_all(&db, 1), base_full, "reopen between rounds");
+        assert_eq!(pred_scan(&db), base_pred, "reopen between rounds (pred)");
+        seal_batch(
+            &db,
+            1,
+            &(60..160)
+                .map(|t| (t, 3000.0 + t as f64))
+                .collect::<Vec<_>>(),
+        ); // B1 = seg-000003
+        seal_batch(
+            &db,
+            1,
+            &(70..170)
+                .map(|t| (t, 4000.0 + t as f64))
+                .collect::<Vec<_>>(),
+        ); // B2 = seg-000004
+        let ext_full = scan_all(&db, 1);
+        let ext_pred = pred_scan(&db);
+        assert_eq!(ext_full.len(), 170);
+        assert_eq!(ext_full[155].value, 3155.0, "ts 155 is covered only by B1");
+        assert_eq!(ext_full[165].value, 4165.0, "ts 165 is covered only by B2");
+
+        // The complete tail is [out1, B1, B2]: all three merge; the previous output's position
+        // is the merge position, so nothing is reordered.
+        assert_eq!(
+            db.compact().unwrap(),
+            3,
+            "round 2 re-merges the previous output with the new tail"
+        );
+        assert_eq!(seg_files(&d), vec!["seg-000005-s000001.seg".to_string()]);
+        assert_eq!(scan_all(&db, 1), ext_full, "after round 2");
+        assert_eq!(pred_scan(&db), ext_pred, "after round 2 (pred)");
+
+        drop(db);
+        let db = Db::open(config(d.clone())).unwrap();
+        assert_eq!(scan_all(&db, 1), ext_full, "final reopen");
+        assert_eq!(pred_scan(&db), ext_pred, "final reopen (pred)");
         drop(db);
         std::fs::remove_dir_all(&d).ok();
     }

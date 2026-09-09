@@ -55,7 +55,8 @@ impl Db {
     /// Compact eligible local segments for one series.
     pub fn compact_series(&self, series: SeriesId) -> Result<usize>;
 
-    /// Cumulative compaction counters for observability.
+    /// Cumulative compaction counters for observability. Process-local: the counters
+    /// accumulate since `Db::open` and reset on restart (nothing is persisted).
     pub fn compaction_stats(&self) -> CompactionStats;
 }
 
@@ -85,8 +86,15 @@ pub struct CompactionStats {
 - Only **local, never-archived** segments participate in v0.8. Any segment whose name
   appears in `archive.catalog` is skipped. This avoids append-only catalog rows
   resurrecting a cold-tier copy after compaction deletes a local superseded file.
-- Prefer time-adjacent, same-series segments. The first implementation may use a
-  simple `min_segments` / `max_input_bytes` policy; behavior must be deterministic.
+- Prefer time-adjacent, same-series segments. The v0.8 policy merges only each series'
+  **complete eligible tail run** (walk the series' catalog subsequence backwards from its last
+  entry, collecting local, never-cataloged segments, stopping at the first ineligible entry;
+  a tail shorter than `min_segments = 2` is not merged). Tail-only merging is a correctness
+  requirement, not just locality: the swap installs the output at the run's first-input
+  position, while reopen orders segments by file name, and the output's fresh maximal sequence
+  number sorts it last. Only when no same-series entry follows the merged run do the live
+  catalog order and the reopen name order agree, keeping duplicate-timestamp winners (plain
+  and predicated) stable across a restart. Behavior must be deterministic.
 - Compaction must not run inside the ingest batch loop. `Db::compact*()` is an
   explicit operations API. Future background scheduling is out of scope.
 - Before swapping the in-memory segment list, re-check that every selected input is
@@ -111,8 +119,9 @@ as local files.
 3. Swap the in-memory `SegEntry` set in one short critical section.
 4. Best-effort delete superseded input files after the swap, **newest first** (reverse
    catalog order), with a directory fsync after each delete per `SyncPolicy`
-   (`Group`/`Always` fsync; `None` skips it — the same durability tier as
-   `SegmentWriter::write_unsynced`).
+   (`Group`/`Always` fsync, giving a durable newest-first delete order; `None` skips it —
+   the same durability tier as `SegmentWriter::write_unsynced`, i.e. process-crash safe via
+   the page cache but with no deletion-order promise after machine power loss).
 
 A crash before step 3 leaves old data only. A crash after step 3 but before deletes
 leaves duplicate old/new files; reopen must tolerate this and scan dedup must preserve
