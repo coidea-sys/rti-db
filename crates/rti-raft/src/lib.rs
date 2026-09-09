@@ -12,15 +12,22 @@
 //!   it naturally), with [`MemoryTransport`] (test/simulation, supports network partitions) and
 //!   [`TcpTransport`] (loopback / real deployment);
 //! - [`ReplicatedWal`]: integration point with rti-wal — a log entry is a batch of WAL
-//!   [`Record`]s, **durable only after majority acknowledgment (commit)**.
+//!   [`Record`]s, **durable only after majority acknowledgment (commit)**;
+//! - v0.8 multi-shard (module-level, group-unaware `Node` unchanged): [`MultiNetwork`]
+//!   keys delivery by `(GroupId, NodeId)`, [`GroupEndpoint`] adapts each group to the
+//!   existing [`Transport`] trait, and [`Router`] hosts this physical node's per-group
+//!   nodes (see SPEC v0.8 §2; split/merge, cross-shard transactions, persistence and
+//!   multi-group TCP are non-goals).
 
 #![forbid(unsafe_code)]
 
 mod codec;
+mod group;
 mod node;
 mod transport;
 
 pub use codec::{decode_msg, encode_msg};
+pub use group::{group_seed, GroupEndpoint, GroupId, GroupMsg, MultiNetwork, Router};
 pub use node::{ConfChange, Entry, Msg, Node, NodeId, Role, Snapshot, Transport, CONF_SERIES};
 pub use transport::{MemoryNetwork, MemoryTransport, TcpTransport};
 
