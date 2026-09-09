@@ -1,22 +1,25 @@
-//! S1 perf smoke (NOT a hard gate): prints the mean latency of `latest()` over 1k
-//! calls. Run with `cargo test -p rti-vla --release --test latest_perf -- --nocapture`.
+//! S1 perf smoke (NOT a hard CI gate): reports the mean and p99 latency of `latest()`
+//! over 10k calls against a 100k-point series. Run with
+//! `cargo test -p rti-vla --release --test latest_perf -- --nocapture`.
 //!
-//! Context: `latest()` is currently O(n) in the series' sample count (see the crate
-//! rustdoc), so the < 1 µs target of SPEC §4 is only meaningful for small working
-//! series; this test uses a 64-point series as the S1 working-set proxy.
+//! Since v0.8 `latest()` is O(1) (rti-db's per-series head index, SPEC §3), so latency
+//! is independent of the series' sample count. SPEC §4 lists the p99 < 1 µs check as a
+//! **release validation** gate on the validation host — this smoke prints the numbers
+//! for the record but deliberately makes no timing assertion (shared CI hosts are too
+//! noisy for a hard sub-microsecond gate).
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rti_core::{Config, Error, Sample};
 use rti_db::Db;
 use rti_vla::latest;
 
 #[test]
-fn latest_perf_smoke_1k_calls() {
+fn latest_perf_smoke_10k_calls() {
     let mut cfg = Config::deterministic();
-    cfg.memtable_max = 1 << 16;
+    cfg.memtable_max = 1 << 20;
     let db = Db::open(cfg).unwrap();
-    for i in 0..64i64 {
+    for i in 0..100_000i64 {
         loop {
             match db.put(1, Sample::new(i, i as f64)) {
                 Ok(()) => break,
@@ -27,21 +30,24 @@ fn latest_perf_smoke_1k_calls() {
     }
     db.flush().unwrap();
 
-    // warmup (TLS buffer init + ingest pipeline steady state)
+    // warmup (ingest pipeline steady state + head-index lookups warmed)
     for _ in 0..1_000 {
         std::hint::black_box(latest(&db, 1).unwrap());
     }
 
-    const N: u32 = 1_000;
-    let t0 = Instant::now();
-    let mut p99_bound = std::time::Duration::ZERO;
+    const N: usize = 10_000;
+    let mut lat = Vec::with_capacity(N);
     for _ in 0..N {
         let c0 = Instant::now();
         std::hint::black_box(latest(&db, 1).unwrap());
-        p99_bound = p99_bound.max(c0.elapsed());
+        lat.push(c0.elapsed());
     }
-    let mean = t0.elapsed() / N;
+    lat.sort_unstable();
+    let mean: Duration = lat.iter().sum::<Duration>() / N as u32;
+    let p99 = lat[N * 99 / 100];
+    let max = lat[N - 1];
     println!(
-        "latest() perf smoke: mean = {mean:?} over {N} calls (64-point series), max = {p99_bound:?} (target: mean < 1 us, informational only)"
+        "latest() perf smoke: mean = {mean:?}, p99 = {p99:?}, max = {max:?} over {N} calls \
+         (100k-point series; release-validation target: p99 < 1 us on the validation host — informational only here)"
     );
 }

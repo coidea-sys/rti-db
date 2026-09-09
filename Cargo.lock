@@ -599,6 +599,7 @@ dependencies = [
  "rti-core",
  "rti-db",
  "rti-query",
+ "rti-store",
 ]
 
 [[package]]

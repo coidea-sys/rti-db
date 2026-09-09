@@ -1,9 +1,10 @@
-//! v0.7 S1 reflex-path allocation verification (feature `alloc-count`, standalone test binary).
+//! S1 reflex-path allocation verification (feature `alloc-count`, standalone test binary).
 //!
 //! Uses the rti-db/rti-mem global counting allocator to verify: **zero heap-allocation
-//! growth on steady-state `latest()` calls under concurrent ingest load**, within the
-//! documented envelope (series of at most 256 samples — the std stable-sort small-slice
-//! threshold inside rti-db's collect path; see the rti-vla crate rustdoc). A standalone
+//! growth on steady-state `latest()` calls under concurrent ingest load**. Since v0.8
+//! `latest()` delegates to rti-db's per-series O(1) head index (SPEC §3), the guarantee
+//! holds for a **large 100k-point series** — the v0.7 "≤256-point zero-allocation
+//! envelope" (std stable-sort scratch in the old O(n) scan path) is gone. A standalone
 //! binary guarantees a single test process, so counts are not disturbed by other tests.
 
 #![cfg(feature = "alloc-count")]
@@ -35,8 +36,10 @@ fn latest_steady_state_zero_alloc_growth_under_ingest() {
     cfg.memtable_max = 1 << 20;
     let db = Arc::new(Db::open(cfg).unwrap());
 
-    // The S1 working set under test: 128 points, well within the zero-alloc envelope.
-    for i in 0..128i64 {
+    // The series under test: 100k points (SPEC §4 gate shape). With the O(1) head
+    // index its size no longer matters for the read path — that is the point of the
+    // gate: no per-call scan buffer, sort scratch, or decode allocation.
+    for i in 0..100_000i64 {
         put_retry(&db, 0, Sample::new(i, 1.0));
     }
     // Pre-grow the ingest-side series 1..=3 (the allocation counter is process-global,
@@ -48,7 +51,7 @@ fn latest_steady_state_zero_alloc_growth_under_ingest() {
     }
     db.flush().unwrap();
 
-    // warmup: the thread-local result buffer reaches steady-state capacity.
+    // warmup: latest() reaches steady state (first-ever head-index lookups, etc.).
     for _ in 0..1_000 {
         std::hint::black_box(latest(&db, 0).unwrap());
     }

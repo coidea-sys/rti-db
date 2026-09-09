@@ -14,5 +14,10 @@ alloc-count = ["rti-db/alloc-count"]
 rti-core = { path = "../rti-core" }
 rti-db = { path = "../rti-db" }
 # ScanSource::collect is the only public read path of Db that does not box an iterator per
-# call; latest() needs it to honour the zero-allocation S1 budget.
+# call; window() uses it to fill the per-series merge lanes. (latest() has delegated to
+# Db::latest's O(1) head index since v0.8 and no longer needs this.)
 rti-query = { path = "../rti-query" }
+
+[dev-dependencies]
+# LocalFsColdTier for the cold-only archived-series latest() limitation test.
+rti-store = { path = "../rti-store" }
