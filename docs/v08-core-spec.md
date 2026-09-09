@@ -98,7 +98,11 @@ pub struct CompactionStats {
 - Compaction must not run inside the ingest batch loop. `Db::compact*()` is an
   explicit operations API. Future background scheduling is out of scope.
 - Before swapping the in-memory segment list, re-check that every selected input is
-  still present and unchanged. A concurrent seal must not be compacted away.
+  still present and unchanged **and that the run is still the series' tail** (no same-series
+  entry after the last input). A concurrent seal must not be compacted away; a compaction
+  run that races a concurrent same-series append aborts safely — no swap, the uninstalled
+  output file is rolled back, no stats move — and the caller may retry later. This is a
+  deliberately conservative correctness policy.
 
 ### Required pre-fix
 

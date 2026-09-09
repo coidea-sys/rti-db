@@ -513,6 +513,11 @@ impl Db {
     /// with a directory fsync per delete (per `SyncPolicy`). This is an
     /// explicit operations API — it never runs inside the ingest batch loop.
     ///
+    /// Only each series' complete eligible tail run is merged, and the swap re-validates that
+    /// the run is still the tail: a compaction run that races a concurrent same-series seal
+    /// aborts safely (nothing is swapped, the output file is rolled back, `0` is returned for
+    /// it) and the caller may retry — a deliberately conservative correctness policy.
+    ///
     /// Deterministic profile: returns `Ok(0)` and does not touch the filesystem.
     pub fn compact(&self) -> Result<usize> {
         self.check_err()?;

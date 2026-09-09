@@ -19,16 +19,23 @@
 //!   file name — with a fresh maximal sequence number the output sorts last. Only when no
 //!   same-series entry follows the run do the live catalog order and the reopen name order
 //!   agree, keeping duplicate-timestamp winners (plain and predicated) stable across restart.
-//! - Merge eligibility requires `min_segments`; `max_input_bytes` greedily splits long runs.
-//!   Both are deterministic functions of the catalog snapshot plus on-disk file sizes.
+//! - Merge eligibility requires `min_segments`; selection is a deterministic function of the
+//!   catalog snapshot.
+//! - A concurrent same-series seal can append a segment after the snapshot's tail run while
+//!   the merge I/O runs. The swap critical section therefore also re-validates that the run
+//!   is **still the series tail** (no same-series entry after the last input); a run that
+//!   lost this race aborts safely — the uninstalled output is rolled back, no stats move,
+//!   `0` is returned — and the caller may retry (the next snapshot includes the new segment).
 //!
 //! Crash/concurrency write order (SPEC §1):
 //!
 //! 1. the merged output is written to `*.seg.tmp` and renamed into place by
 //!    [`SegmentWriter`], honoring the configured [`SyncPolicy`] fsync discipline;
 //! 2. the in-memory `SegEntry` set is swapped in one short critical section, after
-//!    re-validating that every selected input is still present, local, and unchanged
-//!    (same zone map) — a concurrent seal/archive cannot be compacted away;
+//!    re-validating that every selected input is still present, local, unchanged
+//!    (same zone map), **and still the series tail** — a concurrent seal/archive cannot be
+//!    compacted away, and a concurrent same-series append aborts the run instead of
+//!    flipping duplicate-timestamp winners across a reopen;
 //! 3. superseded input files are deleted best-effort after the swap, **newest first**
 //!    (reverse catalog order), with a directory fsync after each delete per [`SyncPolicy`]
 //!    (`Group`/`Always` fsync; `None` skips it — the same durability tier as
@@ -265,7 +272,22 @@ fn merge_group(
             e.name == input.name && matches!(e.loc, SegLoc::Local(_)) && e.zone == input.zone
         })
     });
-    if !still_valid {
+    // Tail revalidation: the output's fresh maximal sequence number sorts it last on reopen,
+    // while the swap installs it at the first input's position. That is only consistent when
+    // no same-series entry follows the run — a concurrent same-series seal during the merge
+    // I/O must abort the run, or live catalog order and reopen name order would disagree and
+    // duplicate-timestamp winners would flip across a restart.
+    let still_tail = still_valid && {
+        let last = state
+            .segments
+            .iter()
+            .position(|e| e.name == inputs[inputs.len() - 1].name)
+            .expect("last input revalidated above");
+        !state.segments[last + 1..]
+            .iter()
+            .any(|e| e.series == series)
+    };
+    if !still_valid || !still_tail {
         drop(state);
         let _ = fs::remove_file(&out_path); // best-effort rollback of the uninstalled output
         return Ok(0);
@@ -705,6 +727,98 @@ mod tests {
         assert_eq!(db.compact().unwrap(), 2);
         assert_eq!(db.segment_count(), 1);
         assert_eq!(scan_all(&db, 1).len(), 100);
+        drop(db);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// Regression (review round 3): a same-series seal racing the merge I/O appends a segment
+    /// after the snapshotted tail run. The swap must then abort (the output's fresh maximal
+    /// seq would sort it after the new segment on reopen, flipping duplicate winners), and a
+    /// retried compact() must succeed with scans identical throughout.
+    #[test]
+    fn compact_aborts_when_tail_grows_during_merge() {
+        let d = tmpdir("tail-grows");
+        let db = Db::open(config(d.clone())).unwrap();
+        seal_batch(&db, 1, &(0..100).map(|t| (t, t as f64)).collect::<Vec<_>>()); // seg-000000
+        seal_batch(
+            &db,
+            1,
+            &(50..150)
+                .map(|t| (t, 1000.0 + t as f64))
+                .collect::<Vec<_>>(),
+        ); // seg-000001
+        let pred = Some(Pred::Gt(500.0));
+        let pred_scan = |db: &Db| -> Vec<Sample> {
+            db.scan(1, i64::MIN, i64::MAX, pred, None)
+                .unwrap()
+                .collect()
+        };
+
+        // Snapshot the plan the executor would select for the current tail [seg0, seg1]...
+        let policy = CompactPolicy::default();
+        let plan = {
+            let state = db.shared.state.lock().unwrap();
+            select_plans(&policy, &state.segments, &HashSet::new(), None)
+                .into_iter()
+                .next()
+                .expect("two eligible tail segments form a plan")
+        };
+        assert_eq!(plan.inputs.len(), 2);
+        // ...then a concurrent same-series seal appends a new segment during the merge I/O.
+        seal_batch(
+            &db,
+            1,
+            &(60..160)
+                .map(|t| (t, 2000.0 + t as f64))
+                .collect::<Vec<_>>(),
+        ); // seg-000002 lands behind the snapshotted run
+        let full_before = scan_all(&db, 1);
+        let pred_before = pred_scan(&db);
+
+        let removed = run_plan(&db.shared, &d, plan).unwrap();
+        assert_eq!(
+            removed, 0,
+            "a tail that grew during the merge must abort the swap"
+        );
+        assert_eq!(
+            seg_files(&d).len(),
+            3,
+            "the uninstalled output is rolled back, inputs intact"
+        );
+        assert_eq!(
+            db.compaction_stats(),
+            CompactionStats::default(),
+            "aborts move no counters"
+        );
+        assert_eq!(
+            scan_all(&db, 1),
+            full_before,
+            "nothing changed by the aborted run"
+        );
+
+        // Retry: the new snapshot's tail is [seg0, seg1, seg2] and compacts fully.
+        assert_eq!(db.compact().unwrap(), 3);
+        assert_eq!(seg_files(&d), vec!["seg-000004-s000001.seg".to_string()]);
+        assert_eq!(
+            scan_all(&db, 1),
+            full_before,
+            "plain scan identical after retry"
+        );
+        assert_eq!(
+            pred_scan(&db),
+            pred_before,
+            "predicated scan identical after retry"
+        );
+
+        drop(db);
+        let db = Db::open(config(d.clone())).unwrap();
+        assert_eq!(scan_all(&db, 1), full_before, "reopen keeps plain winners");
+        assert_eq!(scan_all(&db, 1)[60].value, 60.0);
+        assert_eq!(
+            pred_scan(&db),
+            pred_before,
+            "reopen keeps predicated winners"
+        );
         drop(db);
         std::fs::remove_dir_all(&d).ok();
     }
