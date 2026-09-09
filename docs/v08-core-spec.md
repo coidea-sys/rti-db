@@ -55,7 +55,8 @@ impl Db {
     /// Compact eligible local segments for one series.
     pub fn compact_series(&self, series: SeriesId) -> Result<usize>;
 
-    /// Cumulative compaction counters for observability.
+    /// Cumulative compaction counters for observability. Process-local: the counters
+    /// accumulate since `Db::open` and reset on restart (nothing is persisted).
     pub fn compaction_stats(&self) -> CompactionStats;
 }
 
@@ -75,18 +76,33 @@ pub struct CompactionStats {
   policy object. The executor opens the selected segment files by name, consumes their
   `SegmentReader` iterators, performs a k-way merge by timestamp, and emits one
   same-series `RTISEG01` segment through the existing `SegmentWriter` path.
-- Duplicate-timestamp rule: process input segments in existing catalog order and keep
-  the **first** sample at a timestamp. This is the current scan behavior and is not a
-  last-writer-wins change.
+- Duplicate-timestamp rule: process input segments in existing catalog order and emit samples
+  ordered by `(timestamp, input catalog index)`. The output segment **preserves duplicates in
+  scan order** — it does not deduplicate identical timestamps. Scan collects entries in catalog
+  order, applies predicates at the decode layer, then stable-sorts by timestamp and dedups, so
+  a plain scan still yields the first writer and a predicated scan still yields the first
+  *matching* writer; both are sample-identical before and after a merge under arbitrary
+  predicates. This is the current scan behavior and is not a last-writer-wins change.
 - Only **local, never-archived** segments participate in v0.8. Any segment whose name
   appears in `archive.catalog` is skipped. This avoids append-only catalog rows
   resurrecting a cold-tier copy after compaction deletes a local superseded file.
-- Prefer time-adjacent, same-series segments. The first implementation may use a
-  simple `min_segments` / `max_input_bytes` policy; behavior must be deterministic.
+- Prefer time-adjacent, same-series segments. The v0.8 policy merges only each series'
+  **complete eligible tail run** (walk the series' catalog subsequence backwards from its last
+  entry, collecting local, never-cataloged segments, stopping at the first ineligible entry;
+  a tail shorter than `min_segments = 2` is not merged). Tail-only merging is a correctness
+  requirement, not just locality: the swap installs the output at the run's first-input
+  position, while reopen orders segments by file name, and the output's fresh maximal sequence
+  number sorts it last. Only when no same-series entry follows the merged run do the live
+  catalog order and the reopen name order agree, keeping duplicate-timestamp winners (plain
+  and predicated) stable across a restart. Behavior must be deterministic.
 - Compaction must not run inside the ingest batch loop. `Db::compact*()` is an
   explicit operations API. Future background scheduling is out of scope.
 - Before swapping the in-memory segment list, re-check that every selected input is
-  still present and unchanged. A concurrent seal must not be compacted away.
+  still present and unchanged **and that the run is still the series' tail** (no same-series
+  entry after the last input). A concurrent seal must not be compacted away; a compaction
+  run that races a concurrent same-series append aborts safely — no swap, the uninstalled
+  output file is rolled back, no stats move — and the caller may retry later. This is a
+  deliberately conservative correctness policy.
 
 ### Required pre-fix
 
@@ -105,12 +121,22 @@ as local files.
 1. Write the merged output to `*.seg.tmp`.
 2. Rename it into place and honor `SyncPolicy` directory/fsync behavior.
 3. Swap the in-memory `SegEntry` set in one short critical section.
-4. Best-effort delete superseded input files after the swap.
+4. Best-effort delete superseded input files after the swap, **newest first** (reverse
+   catalog order), with a directory fsync after each delete per `SyncPolicy`
+   (`Group`/`Always` fsync, giving a durable newest-first delete order; `None` skips it —
+   the same durability tier as `SegmentWriter::write_unsynced`, i.e. process-crash safe via
+   the page cache but with no deletion-order promise after machine power loss).
 
 A crash before step 3 leaves old data only. A crash after step 3 but before deletes
 leaves duplicate old/new files; reopen must tolerate this and scan dedup must preserve
-correctness. Compaction and `scan` may run concurrently; readers must never observe a
-partially installed output segment.
+correctness. A crash during step 4 can only have durably removed a suffix of the newest
+inputs: the remaining oldest inputs still precede the output segment in file-name order,
+and the output preserves the inputs' `(timestamp, input catalog index)` order, so
+duplicate-timestamp winners (plain and predicated) are identical to the pre-compaction
+scan. Deleting oldest first is forbidden: a crash could leave only a newer input ahead of
+the output, promoting its duplicate-losing samples to winners on reopen. Compaction and
+`scan` may run concurrently; readers must never observe a partially installed output
+segment.
 
 ## 2. Multi-shard Raft
 
@@ -269,8 +295,8 @@ must pass without header changes.
 
 | Area | Gate |
 |---|---|
-| Compaction correctness | Merge N overlapping same-series segments; scan before/after is sample-identical, including predicates, aggregations, and duplicate timestamps |
-| Compaction crash safety | Crash windows: before rename, after rename before swap, after swap before delete; reopen preserves logical scan correctness |
+| Compaction correctness | Merge N overlapping same-series segments; scan before/after is sample-identical, including predicates (also discriminating predicates where only the duplicate loser matches), aggregations, and duplicate timestamps (outputs preserve duplicates in scan order) |
+| Compaction crash safety | Crash windows: before rename, after rename before swap, after swap before delete, and mid-delete (newest-first durable deletes); reopen preserves logical scan correctness and duplicate-timestamp winners |
 | Segment sequence | Reopen after compaction never reuses an existing local or cataloged segment sequence number |
 | Cold tier | Cataloged inputs are skipped by compaction; archive catalog remains parseable; old rows cannot resurrect superseded data |
 | Deterministic compaction | `Db::compact()` is `Ok(0)`, touches no filesystem, and does not alter hot-path allocation behavior |

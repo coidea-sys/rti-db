@@ -34,8 +34,10 @@ use rti_query::{Agg, Pred, ScanSource};
 use rti_store::{ColdTier, MemTable, SegmentReader, SegmentWriter, ZoneMap};
 use rti_wal::{Record, Wal};
 
+mod compact;
 mod latest;
 
+pub use compact::CompactionStats;
 pub use latest::{latest, LatestIndex};
 
 #[cfg(feature = "alloc-count")]
@@ -67,6 +69,10 @@ struct Shared {
     /// Per-series O(1) latest index (v0.8). Kept in its own mutex so `latest()` never
     /// blocks on the WAL/segment I/O performed under `state`.
     latest: Mutex<LatestIndex>,
+    /// Cumulative compaction counters (v0.8, SPEC §1).
+    compact_stats: Mutex<CompactionStats>,
+    /// Serializes concurrent `compact*()` calls (ingest and scans never take this lock).
+    compact_lock: Mutex<()>,
     config: Config,
 }
 
@@ -202,6 +208,8 @@ impl Db {
             seg_seq: Mutex::new(seg_seq),
             cold: Mutex::new(None),
             latest: Mutex::new(latest),
+            compact_stats: Mutex::new(CompactionStats::default()),
+            compact_lock: Mutex::new(()),
             config: config.clone(),
         });
 
@@ -490,6 +498,42 @@ impl Db {
     pub fn latest(&self, series: SeriesId) -> Result<Option<Sample>> {
         self.check_err()?;
         Ok(self.shared.latest.lock().unwrap().get(series))
+    }
+
+    /// Compact eligible local segments (v0.8, SPEC §1). Returns the number of input
+    /// segments removed.
+    ///
+    /// Only local, never-archived same-series segments participate (any name present in
+    /// `archive.catalog` is skipped); inputs merge in catalog order and the output preserves
+    /// duplicate timestamps in `(ts, catalog-index)` order, so scan results — including
+    /// predicated scans — are sample-identical before/after. The
+    /// output is a single same-series `RTISEG01` segment written via the existing
+    /// write-temp/atomic-rename/SyncPolicy-fsync discipline and installed in one short
+    /// critical section; superseded inputs are deleted best-effort afterwards, newest first
+    /// with a directory fsync per delete (per `SyncPolicy`). This is an
+    /// explicit operations API — it never runs inside the ingest batch loop.
+    ///
+    /// Only each series' complete eligible tail run is merged, and the swap re-validates that
+    /// the run is still the tail: a compaction run that races a concurrent same-series seal
+    /// aborts safely (nothing is swapped, the output file is rolled back, `0` is returned for
+    /// it) and the caller may retry — a deliberately conservative correctness policy.
+    ///
+    /// Deterministic profile: returns `Ok(0)` and does not touch the filesystem.
+    pub fn compact(&self) -> Result<usize> {
+        self.check_err()?;
+        compact::compact(&self.shared, None)
+    }
+
+    /// Compact eligible local segments for one series (v0.8, SPEC §1). Same semantics as
+    /// [`Db::compact`], restricted to `series`; other series are untouched.
+    pub fn compact_series(&self, series: SeriesId) -> Result<usize> {
+        self.check_err()?;
+        compact::compact(&self.shared, Some(series))
+    }
+
+    /// Cumulative compaction counters for observability (v0.8, SPEC §1).
+    pub fn compaction_stats(&self) -> CompactionStats {
+        *self.shared.compact_stats.lock().unwrap()
     }
 
     /// Current number of segments (loaded at open plus sealed at runtime).
