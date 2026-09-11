@@ -1,0 +1,92 @@
+[
+ {
+  "latency_ns": {
+   "max": 28031,
+   "p50": 280,
+   "p99": 480,
+   "p999": 5371
+  },
+  "notes": "Db::put 为无锁 SPSC 入队（异步应用），WAL 组提交在后台 ingest 线程；延迟为入队延迟",
+  "system": "rti-db",
+  "throughput_ops": 1734616.118958447,
+  "variant": "sync=none",
+  "workload": {
+   "n": 200000,
+   "series": 8
+  }
+ },
+ {
+  "avg_agg_pts_s": 41550177.28214141,
+  "disk_bytes": 10113733,
+  "notes": "批量=连续单点 put（ingest 线程内部批量组提交），含最终 flush; 压缩比 vs 16B/点原始 = 1.58x",
+  "rss_bytes": 42336256,
+  "scan_pts_s": 40480393.786793895,
+  "system": "rti-db",
+  "throughput_ops": 8583848.44364055,
+  "variant": "sync=none",
+  "workload": {
+   "n": 1000000,
+   "series": 8
+  }
+ },
+ {
+  "latency_ns": {
+   "max": 44991,
+   "p50": 250,
+   "p99": 610,
+   "p999": 760
+  },
+  "notes": "Db::put 为无锁 SPSC 入队（异步应用），WAL 组提交在后台 ingest 线程；延迟为入队延迟",
+  "system": "rti-db",
+  "throughput_ops": 1695191.254359142,
+  "variant": "sync=group1ms",
+  "workload": {
+   "n": 200000,
+   "series": 8
+  }
+ },
+ {
+  "avg_agg_pts_s": 41543980.36864134,
+  "disk_bytes": 10113733,
+  "notes": "批量=连续单点 put（ingest 线程内部批量组提交），含最终 flush; 压缩比 vs 16B/点原始 = 1.58x",
+  "rss_bytes": 57757696,
+  "scan_pts_s": 39807582.8827712,
+  "system": "rti-db",
+  "throughput_ops": 1275288.3299385158,
+  "variant": "sync=group1ms",
+  "workload": {
+   "n": 1000000,
+   "series": 8
+  }
+ },
+ {
+  "latency_ns": {
+   "max": 7889485823,
+   "p50": 250,
+   "p99": 510,
+   "p999": 9143
+  },
+  "notes": "Db::put 为无锁 SPSC 入队（异步应用），WAL 组提交在后台 ingest 线程；延迟为入队延迟",
+  "system": "rti-db",
+  "throughput_ops": 1683.2508743040275,
+  "variant": "sync=always",
+  "workload": {
+   "n": 200000,
+   "series": 8
+  }
+ },
+ {
+  "avg_agg_pts_s": 39391278.69211501,
+  "disk_bytes": 1011638,
+  "notes": "批量=连续单点 put（ingest 线程内部批量组提交），含最终 flush; sync=always 为逐条 fsync 受限，本变体缩减为 100000 点（铁律3）; 压缩比 vs 16B/点原始 = 15.82x",
+  "rss_bytes": 57757696,
+  "scan_pts_s": 37827276.87107897,
+  "system": "rti-db",
+  "throughput_ops": 1106.2318474551944,
+  "variant": "sync=always",
+  "workload": {
+   "n": 100000,
+   "series": 8
+  }
+ }
+]
