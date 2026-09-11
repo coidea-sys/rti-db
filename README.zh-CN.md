@@ -5,8 +5,9 @@
 [English README](README.md)
 
 [![CI](https://github.com/coidea-sys/rti-db/actions/workflows/ci.yml/badge.svg)](https://github.com/coidea-sys/rti-db/actions/workflows/ci.yml)
-[![版本](https://img.shields.io/badge/version-0.8.0-blue)](https://github.com/coidea-sys/rti-db)
-[![测试](https://img.shields.io/badge/tests-213%20passing-brightgreen)](#测试与可复现性)
+[![crates.io](https://img.shields.io/crates/v/rti-db.svg)](https://crates.io/crates/rti-db)
+[![docs.rs](https://docs.rs/rti-db/badge.svg)](https://docs.rs/rti-db)
+[![测试](https://img.shields.io/badge/tests-214%20passing-brightgreen)](#测试与可复现性)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-lightgrey)](LICENSE-MIT)
 
 ```text
@@ -118,7 +119,7 @@ Helix S1/S2、GR00T、pi0 等双系统架构）以 10–100 ms 的节拍推理�
 
 ```toml
 [dependencies]
-rti-db = { git = "https://github.com/coidea-sys/rti-db" }
+rti-db = "0.8"
 ```
 
 ```rust

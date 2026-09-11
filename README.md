@@ -5,8 +5,9 @@
 [中文版 README](README.zh-CN.md)
 
 [![CI](https://github.com/coidea-sys/rti-db/actions/workflows/ci.yml/badge.svg)](https://github.com/coidea-sys/rti-db/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.8.0-blue)](https://github.com/coidea-sys/rti-db)
-[![Tests](https://img.shields.io/badge/tests-213%20passing-brightgreen)](#testing--reproducibility)
+[![crates.io](https://img.shields.io/crates/v/rti-db.svg)](https://crates.io/crates/rti-db)
+[![docs.rs](https://docs.rs/rti-db/badge.svg)](https://docs.rs/rti-db)
+[![Tests](https://img.shields.io/badge/tests-214%20passing-brightgreen)](#testing--reproducibility)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-lightgrey)](LICENSE-MIT)
 
 ```text
@@ -120,7 +121,7 @@ The strategy in one sentence: **don't fight incumbents on their home turf (gener
 
 ```toml
 [dependencies]
-rti-db = { git = "https://github.com/coidea-sys/rti-db" }
+rti-db = "0.8"
 ```
 
 ```rust
