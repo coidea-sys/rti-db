@@ -11,13 +11,13 @@ description = "Working-memory adapter for VLA runtimes: S1 latest-state reads, S
 alloc-count = ["rti-db/alloc-count"]
 
 [dependencies]
-rti-core = { path = "../rti-core" }
-rti-db = { path = "../rti-db" }
+rti-core = { path = "../rti-core" , version = "0.8.0" }
+rti-db = { path = "../rti-db" , version = "0.8.0" }
 # ScanSource::collect is the only public read path of Db that does not box an iterator per
 # call; window() uses it to fill the per-series merge lanes. (latest() has delegated to
 # Db::latest's O(1) head index since v0.8 and no longer needs this.)
-rti-query = { path = "../rti-query" }
+rti-query = { path = "../rti-query" , version = "0.8.0" }
 
 [dev-dependencies]
 # LocalFsColdTier for the cold-only archived-series latest() limitation test.
-rti-store = { path = "../rti-store" }
+rti-store = { path = "../rti-store" , version = "0.8.0" }

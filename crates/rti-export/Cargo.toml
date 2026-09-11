@@ -7,8 +7,8 @@ repository.workspace = true
 description = "rti-db LeRobot episode exporter: Parquet dataset layout, LVCF frame-grid resampling, CLI"
 
 [dependencies]
-rti-core = { path = "../rti-core" }
-rti-db = { path = "../rti-db" }
+rti-core = { path = "../rti-core" , version = "0.8.0" }
+rti-db = { path = "../rti-db" , version = "0.8.0" }
 arrow2 = { version = "0.18", default-features = false, features = ["io_parquet"] }
 parquet2 = { version = "0.17.2", default-features = false, features = ["snappy"] }
 serde = { version = "1", features = ["derive"] }

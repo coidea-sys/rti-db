@@ -7,6 +7,6 @@ repository.workspace = true
 description = "rti-db TCP line protocol server (put/scan)"
 
 [dependencies]
-rti-core = { path = "../rti-core" }
-rti-query = { path = "../rti-query" }
-rti-db = { path = "../rti-db" }
+rti-core = { path = "../rti-core" , version = "0.8.0" }
+rti-query = { path = "../rti-query" , version = "0.8.0" }
+rti-db = { path = "../rti-db" , version = "0.8.0" }

@@ -7,4 +7,4 @@ repository.workspace = true
 description = "rti-db query engine: predicate pushdown, vectorized scan, aggregations"
 
 [dependencies]
-rti-core = { path = "../rti-core" }
+rti-core = { path = "../rti-core" , version = "0.8.0" }

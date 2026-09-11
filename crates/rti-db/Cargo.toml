@@ -13,9 +13,9 @@ alloc-count = ["rti-mem/alloc-count"]
 s3 = ["rti-store/s3"]
 
 [dependencies]
-rti-core = { path = "../rti-core" }
-rti-mem = { path = "../rti-mem" }
-rti-buffer = { path = "../rti-buffer" }
-rti-wal = { path = "../rti-wal" }
-rti-store = { path = "../rti-store" }
-rti-query = { path = "../rti-query" }
+rti-core = { path = "../rti-core" , version = "0.8.0" }
+rti-mem = { path = "../rti-mem" , version = "0.8.0" }
+rti-buffer = { path = "../rti-buffer" , version = "0.8.0" }
+rti-wal = { path = "../rti-wal" , version = "0.8.0" }
+rti-store = { path = "../rti-store" , version = "0.8.0" }
+rti-query = { path = "../rti-query" , version = "0.8.0" }

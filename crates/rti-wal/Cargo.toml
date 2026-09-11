@@ -12,11 +12,11 @@ default = []
 io-uring = ["dep:rti-wal-uring"]
 
 [dependencies]
-rti-core = { path = "../rti-core" }
+rti-core = { path = "../rti-core" , version = "0.8.0" }
 crc32fast = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-rti-wal-uring = { path = "../rti-wal-uring", optional = true }
+rti-wal-uring = { path = "../rti-wal-uring", optional = true , version = "0.8.0" }
 
 # v0.5 Stream B: uring-pipeline vs std comparison benchmark (requires a real ring).
 [[example]]

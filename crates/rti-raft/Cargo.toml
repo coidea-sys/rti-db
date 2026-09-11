@@ -7,5 +7,5 @@ repository.workspace = true
 description = "rti-db single-shard Raft replication: election, heartbeat, log replication, majority commit"
 
 [dependencies]
-rti-core = { path = "../rti-core" }
-rti-wal = { path = "../rti-wal" }
+rti-core = { path = "../rti-core" , version = "0.8.0" }
+rti-wal = { path = "../rti-wal" , version = "0.8.0" }
