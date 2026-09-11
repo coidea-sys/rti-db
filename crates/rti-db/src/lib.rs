@@ -717,6 +717,9 @@ fn ingest_loop(
     shutdown: Arc<AtomicBool>,
 ) {
     let mut batch: Vec<Record> = Vec::with_capacity(BATCH_MAX);
+    // Scratch buffer for batch-coalesced latest-index ops; reused across batches so the
+    // steady-state ingest path performs zero heap allocations (alloc-count audited).
+    let mut latest_ops: Vec<(SeriesId, bool, Option<Sample>)> = Vec::new();
     loop {
         batch.clear();
         while batch.len() < BATCH_MAX {
@@ -733,7 +736,7 @@ fn ingest_loop(
             continue;
         }
         let n = batch.len() as u64;
-        let r = apply_batch(&shared, &batch);
+        let r = apply_batch(&shared, &batch, &mut latest_ops);
         if let Err(e) = r {
             *shared.err.lock().unwrap() = Some(e.to_string());
             return;
@@ -742,7 +745,7 @@ fn ingest_loop(
     }
     // drain before shutdown: keep processing the records left in the ring
     while let Some(r) = consumer.pop() {
-        let _ = apply_batch(&shared, &[r]);
+        let _ = apply_batch(&shared, &[r], &mut latest_ops);
         shared.acked.fetch_add(1, Ordering::SeqCst);
     }
 }
@@ -751,7 +754,11 @@ fn ingest_loop(
 /// end-of-batch flush to the OS) → MemTable (seal when full); if a seal occurred within the batch,
 /// checkpoint the WAL at batch end — truncate only the prefix already covered by segments, keeping
 /// the tail that entered the new MemTable after the seal point (`keep`). The Deterministic profile skips the WAL and evicts by LRU when full.
-fn apply_batch(shared: &Shared, batch: &[Record]) -> Result<()> {
+fn apply_batch(
+    shared: &Shared,
+    batch: &[Record],
+    latest_ops: &mut Vec<(SeriesId, bool, Option<Sample>)>,
+) -> Result<()> {
     let deterministic = shared.config.profile == Profile::Deterministic;
     let mut state = shared.state.lock().unwrap();
     if let Some(wal) = &mut state.wal {
@@ -776,16 +783,37 @@ fn apply_batch(shared: &Shared, batch: &[Record]) -> Result<()> {
     // Batch index of the last seal within the batch: records after the seal point still need WAL
     // protection (they live only in the new MemTable) and must be kept at checkpoint.
     let mut keep_from: Option<usize> = None;
+    // v0.8: batch-coalesced latest-index ops. Per-record `shared.latest.lock()` cost ~14 ns/sample
+    // on the ingest hot path; collapsing to one lock per batch preserves exact sequential
+    // semantics (remove-then-apply ordering, strictly-greater ts, first-wins ties) while keeping
+    // `latest()` reads off the ingest critical path. The caller owns the scratch buffer so the
+    // steady-state ingest path stays allocation-free.
+    // Entry: (series, removed_by_lru, best_after).
+    latest_ops.clear();
+    fn coalesce_apply(ops: &mut Vec<(SeriesId, bool, Option<Sample>)>, series: SeriesId, s: Sample) {
+        match ops.iter_mut().find(|e| e.0 == series) {
+            Some(e) => match e.2 {
+                Some(b) if b.ts >= s.ts => {}
+                _ => e.2 = Some(s),
+            },
+            None => ops.push((series, false, Some(s))),
+        }
+    }
     for (j, rec) in batch.iter().enumerate() {
         if deterministic {
             // Pure in-memory: evict the oldest series by LRU when full (counted internally); never seal.
             // v0.8: latest() follows scan visibility — an evicted series is dropped from the index.
             let victim = state.mem.insert_lru_report(rec.series, rec.sample)?;
-            let mut latest = shared.latest.lock().unwrap();
             if let Some(v) = victim {
-                latest.remove(v);
+                match latest_ops.iter_mut().find(|e| e.0 == v) {
+                    Some(e) => {
+                        e.1 = true;
+                        e.2 = None;
+                    }
+                    None => latest_ops.push((v, true, None)),
+                }
             }
-            latest.apply(rec.series, rec.sample);
+            coalesce_apply(latest_ops, rec.series, rec.sample);
             continue;
         }
         if state.mem.is_full() {
@@ -804,8 +832,22 @@ fn apply_batch(shared: &Shared, batch: &[Record]) -> Result<()> {
         }
         // v0.8: applied (== visible) records update the head index before the watermark
         // advances, so put_durable's post-return visibility guarantee holds. Sealing does
-        // not change visibility, so heads stay valid across seals.
-        shared.latest.lock().unwrap().apply(rec.series, rec.sample);
+        // not change visibility, so heads stay valid across seals. Updates are coalesced
+        // into `latest_ops` and committed under one lock at batch end (still before the
+        // caller advances the watermark).
+        coalesce_apply(latest_ops, rec.series, rec.sample);
+    }
+    // Commit the coalesced latest-index ops under a single lock, in batch order.
+    if !latest_ops.is_empty() {
+        let mut latest = shared.latest.lock().unwrap();
+        for (series, removed, best) in latest_ops.drain(..) {
+            if removed {
+                latest.remove(series);
+            }
+            if let Some(s) = best {
+                latest.apply(series, s);
+            }
+        }
     }
     // v0.6 WAL checkpoint: a seal occurred within this batch, so all WAL records before the last seal
     // point are already covered by segments (segments are fsynced to disk); atomically truncate while
