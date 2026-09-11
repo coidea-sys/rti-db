@@ -162,7 +162,7 @@ Feature 开关：`io-uring`（流水化 WAL 后端）、`s3`（S3 冷层）、`a
 - **v0.1–v0.6（已完成）**：核心引擎 → io_uring+块解码+TSN 对齐 → 确定性档+no_std+镜像 → Raft+冷层 → 流水 WAL+S3+边缘集成 → 持久性语义+WAL 检查点
 - **v0.7（已完成）**：AI 集成，见 [docs/v07-ai-integration-spec.md](docs/v07-ai-integration-spec.md)——`rti-ros2` 飞行记录器、`rti-export` LeRobot episode 导出、`rti-vla` 工作记忆 + C ABI
 - **v0.8（本版本）**：核心可扩展性，见 [docs/v08-core-spec.md](docs/v08-core-spec.md)——segment 压实、多分片 Raft、公开 O(1) `latest`
-- **v0.9**：形式化 WCET 分析工具链、TSN 硬件时间戳；**no_std 覆盖（进行中）**——`rti-query` 已加入 no_std 子集；**Python 绑定（已完成）**——`crates/rti-py`（PyO3 0.26，模块 `rti_db`：`Db.put/put_durable/latest/scan/flush/seal/compact`，maturin 打包 wheel）
+- **v0.9**：TSN 硬件时间戳；**WCET 分析工具（主机端原型已完成）**——`bench/src/bin/wcet.rs`：完整分位数阶梯 + 阈值超限表 + 基于原始延迟转储（`RTI_BENCH_DUMP_LATENCIES=1`）的实验性 POT/GPD 尾部外推，预留 `--calibrate` 硬件时基标定接口；**no_std 覆盖（进行中）**——`rti-query` 已加入 no_std 子集；**Python 绑定（已完成）**——`crates/rti-py`（PyO3 0.26，模块 `rti_db`：`Db.put/put_durable/latest/scan/flush/seal/compact`，maturin 打包 wheel）
 
 ## 许可证
 

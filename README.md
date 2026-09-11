@@ -164,7 +164,7 @@ Feature flags: `io-uring` (pipelined WAL backend), `s3` (S3 cold tier), `alloc-c
 - **v0.1–v0.6 (done)**: core engine → io_uring + block decode + TSN align → deterministic profile + no_std + mirror → Raft + cold tier → pipelined WAL + S3 + edge integration → durability semantics + WAL checkpoint
 - **v0.7 (done)**: AI integration per [docs/v07-ai-integration-spec.md](docs/v07-ai-integration-spec.md) — `rti-ros2` flight recorder, `rti-export` LeRobot episodes, `rti-vla` working memory + C ABI
 - **v0.8 (this release)**: core scalability per [docs/v08-core-spec.md](docs/v08-core-spec.md) — segment compaction, multi-shard Raft, public O(1) `latest`
-- **v0.9**: formal WCET analysis tooling, TSN hardware timestamping; **`no_std` coverage (in progress)** — `rti-query` joins the `no_std` subset; **Python bindings (done)** — `crates/rti-py` (PyO3 0.26, module `rti_db`: `Db.put/put_durable/latest/scan/flush/seal/compact`, maturin wheel)
+- **v0.9**: TSN hardware timestamping; **WCET analysis tooling (host prototype done)** — `bench/src/bin/wcet.rs`: full percentile ladder + exceedance table + experimental POT/GPD tail extrapolation over raw dumped latencies (`RTI_BENCH_DUMP_LATENCIES=1`), with a reserved `--calibrate` hardware-timebase seam; **`no_std` coverage (in progress)** — `rti-query` joins the `no_std` subset; **Python bindings (done)** — `crates/rti-py` (PyO3 0.26, module `rti_db`: `Db.put/put_durable/latest/scan/flush/seal/compact`, maturin wheel)
 
 ## License
 

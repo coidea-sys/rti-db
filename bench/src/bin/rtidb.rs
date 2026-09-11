@@ -59,6 +59,16 @@ fn main() {
             let wall = t0.elapsed().as_secs_f64();
             db.flush().unwrap();
             drop(db);
+            if std::env::var_os("RTI_BENCH_DUMP_LATENCIES").is_some() {
+                let p = format!("{RESULT_DIR}/latencies-rtidb-sync-{name}-r{r}.csv");
+                let mut out = String::with_capacity(lats.len() * 8);
+                for v in &lats {
+                    out.push_str(&v.to_string());
+                    out.push('\n');
+                }
+                std::fs::write(&p, out).unwrap();
+                eprintln!("[dump] {} samples -> {}", lats.len(), p);
+            }
             round_lats.push(hdr_stats(&lats));
             round_tput.push(data.len() as f64 / wall);
             rm_rf(&dir);
