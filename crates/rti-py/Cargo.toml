@@ -1,0 +1,32 @@
+[package]
+name = "rti-py"
+version = "0.8.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/coidea-sys/rti-db"
+homepage = "https://github.com/coidea-sys/rti-db"
+description = "Python bindings for rti-db, the hard-real-time embedded time-series data engine"
+keywords = ["time-series", "real-time", "embedded", "python", "database"]
+categories = ["database", "api-bindings"]
+
+[lib]
+# cdylib: the Python extension module (.so/.pyd); rlib: for cargo test.
+name = "rti_db"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rti-core = { path = "../rti-core", version = "0.8.0" }
+rti-db-rs = { package = "rti-db", path = "../rti-db", version = "0.8.0" }
+rti-query = { path = "../rti-query", version = "0.8.0" }
+pyo3 = "0.26"
+
+[dev-dependencies]
+pyo3 = { version = "0.26", features = ["auto-initialize"] }
+
+[features]
+# maturin builds the wheel with `--features extension-module`; cargo test links libpython.
+default = []
+extension-module = ["pyo3/extension-module"]
+
+[package.metadata.maturin]
+name = "rti_db"

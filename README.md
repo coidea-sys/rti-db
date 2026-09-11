@@ -153,7 +153,7 @@ Feature flags: `io-uring` (pipelined WAL backend), `s3` (S3 cold tier), `alloc-c
 
 ## Testing & reproducibility
 
-- **190 tests green** (`cargo test --workspace`), 213 with all features
+- **191 tests green** (`cargo test --workspace`), 214 with all features
 - Deterministic Raft protocol tests (virtual clock + memory transport)
 - Steady-state zero-allocation proof test
 - Benchmark harness: `bench/run_all.sh` (~35 min full, `--smoke` 2 min) — every number in this README is reproducible
@@ -163,7 +163,7 @@ Feature flags: `io-uring` (pipelined WAL backend), `s3` (S3 cold tier), `alloc-c
 - **v0.1–v0.6 (done)**: core engine → io_uring + block decode + TSN align → deterministic profile + no_std + mirror → Raft + cold tier → pipelined WAL + S3 + edge integration → durability semantics + WAL checkpoint
 - **v0.7 (done)**: AI integration per [docs/v07-ai-integration-spec.md](docs/v07-ai-integration-spec.md) — `rti-ros2` flight recorder, `rti-export` LeRobot episodes, `rti-vla` working memory + C ABI
 - **v0.8 (this release)**: core scalability per [docs/v08-core-spec.md](docs/v08-core-spec.md) — segment compaction, multi-shard Raft, public O(1) `latest`
-- **v0.9**: formal WCET analysis tooling, more `no_std` coverage, TSN hardware timestamping, Python bindings
+- **v0.9**: formal WCET analysis tooling, more `no_std` coverage, TSN hardware timestamping; **Python bindings (done)** — `crates/rti-py` (PyO3 0.26, module `rti_db`: `Db.put/put_durable/latest/scan/flush/seal/compact`, maturin wheel)
 
 ## License
 

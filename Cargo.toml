@@ -16,7 +16,7 @@ members = [
     "crates/rti-export",
     "crates/rti-ros2",
 ]
-exclude = ["bench"]
+exclude = ["bench", "crates/rti-py"]
 
 [workspace.package]
 version = "0.8.0"
