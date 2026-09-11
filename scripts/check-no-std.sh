@@ -13,4 +13,6 @@ echo "== rti-mem --no-default-features =="
 cargo check -p rti-mem --no-default-features
 echo "== rti-buffer --no-default-features =="
 cargo check -p rti-buffer --no-default-features
+echo "== rti-query --no-default-features (v0.9) =="
+cargo check -p rti-query --no-default-features
 echo "no_std smoke check: OK"

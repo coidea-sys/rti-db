@@ -1,10 +1,15 @@
 [package]
 name = "rti-query"
-version.workspace = true
+version = "0.8.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "rti-db query engine: predicate pushdown, vectorized scan, aggregations"
 
+[features]
+default = ["std"]
+# when disabled: no_std (core + alloc); the scan/aggregation APIs are identical.
+std = ["rti-core/std"]
+
 [dependencies]
-rti-core = { path = "../rti-core" , version = "0.8.0" }
+rti-core = { path = "../rti-core" , version = "0.8.0" , default-features = false }

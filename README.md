@@ -42,7 +42,7 @@ The design follows TRIZ separation principles: instead of compromising between "
 - **Crash recovery in ~23 ms.** WAL checkpointing keeps the invariant "the WAL protects exactly the current MemTable" — recovery replays one tail, not the whole log.
 - **Real compression: 1.58×** end-to-end on disk (delta-of-delta timestamps + XOR floats + WAL truncation), beating ClickHouse's 1.22× on the same workload.
 - **Memory safety with an auditable unsafe surface.** `#![forbid(unsafe_code)]` everywhere except four small crates (`rti-mem`, `rti-buffer`, `rti-wal-uring`, and the documented `rti-vla` C ABI boundary), every `unsafe` block annotated with `// SAFETY:`. ~70% of severe CVEs in C/C++ systems are memory bugs — Rust eliminates that class at compile time.
-- **no_std subset.** `rti-core`, `rti-mem`, `rti-buffer` compile for `no_std` (core + alloc) — the same engine runs from an MCU safety island to a cloud server.
+- **no_std subset.** `rti-core`, `rti-mem`, `rti-buffer`, `rti-query` compile for `no_std` (core + alloc) — the same engine runs from an MCU safety island to a cloud server.
 - **io_uring pipelined WAL** (Linux, feature-gated, graceful fallback), **multi-shard Raft replication** (independent per-group election, replication, snapshot, membership — all deterministically tested with a virtual clock), **S3 cold tier** (pure-std HTTP client, zero external dependencies), **TSN time alignment** for deterministic networks.
 - **Deterministic everything.** Raft tests run on a virtual clock with an in-memory transport — leader election, failover, log consistency and partition scenarios are 100% reproducible (30/30 runs green).
 
@@ -106,7 +106,7 @@ Full methodology, raw JSON and a one-command reproduction harness (`run_all.sh`,
 | `rti-buffer` | Lock-free SPSC/MPMC rings, cache-line separated (`no_std`) |
 | `rti-wal` / `rti-wal-uring` | WAL with group commit + checkpointing; io_uring pipelined backend |
 | `rti-store` | Columnar segments, delta-of-delta + XOR compression, zone maps, cold tier (S3/local) |
-| `rti-query` | Predicate pushdown, vectorized decode, zero-copy iterators |
+| `rti-query` | Predicate pushdown, vectorized decode, zero-copy iterators (`no_std`) |
 | `rti-raft` | Raft consensus: single-group core + multi-shard groups (election, replication, snapshot, membership, PreVote) |
 | `rti-net` | Minimal TCP line protocol |
 | `rti-db` | Facade: `Db::open / put / put_durable / scan / latest / compact` — O(1) latest index + segment compaction |
@@ -150,7 +150,7 @@ cargo run -p rti-edge --release --example edge_demo
 cargo run -p rti-ros2 --example ai_pipeline
 ```
 
-Feature flags: `io-uring` (pipelined WAL backend), `s3` (S3 cold tier), `alloc-count` (allocation auditing), `std` (default; disable for `no_std` subset crates).
+Feature flags: `io-uring` (pipelined WAL backend), `s3` (S3 cold tier), `alloc-count` (allocation auditing), `std` (default on `rti-core`/`rti-mem`/`rti-buffer`/`rti-query`; disable for `no_std`).
 
 ## Testing & reproducibility
 
@@ -164,7 +164,7 @@ Feature flags: `io-uring` (pipelined WAL backend), `s3` (S3 cold tier), `alloc-c
 - **v0.1–v0.6 (done)**: core engine → io_uring + block decode + TSN align → deterministic profile + no_std + mirror → Raft + cold tier → pipelined WAL + S3 + edge integration → durability semantics + WAL checkpoint
 - **v0.7 (done)**: AI integration per [docs/v07-ai-integration-spec.md](docs/v07-ai-integration-spec.md) — `rti-ros2` flight recorder, `rti-export` LeRobot episodes, `rti-vla` working memory + C ABI
 - **v0.8 (this release)**: core scalability per [docs/v08-core-spec.md](docs/v08-core-spec.md) — segment compaction, multi-shard Raft, public O(1) `latest`
-- **v0.9**: formal WCET analysis tooling, more `no_std` coverage, TSN hardware timestamping; **Python bindings (done)** — `crates/rti-py` (PyO3 0.26, module `rti_db`: `Db.put/put_durable/latest/scan/flush/seal/compact`, maturin wheel)
+- **v0.9**: formal WCET analysis tooling, TSN hardware timestamping; **`no_std` coverage (in progress)** — `rti-query` joins the `no_std` subset; **Python bindings (done)** — `crates/rti-py` (PyO3 0.26, module `rti_db`: `Db.put/put_durable/latest/scan/flush/seal/compact`, maturin wheel)
 
 ## License
 

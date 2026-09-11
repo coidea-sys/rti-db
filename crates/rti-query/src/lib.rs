@@ -8,8 +8,20 @@
 //! To avoid an `rti-query <-> rti-db` dependency cycle, the scan target is abstracted as the
 //! [`ScanSource`] trait; the facade crate rti-db implements it for `Db` and provides a
 //! `scan(&Db, ...)` free function verbatim per SPEC §3.
+//!
+//! ## no_std (v0.9)
+//!
+//! With the default `std` feature disabled this crate is `no_std` (`core` + `alloc`);
+//! the [`Pred`] / [`Agg`] / [`ScanSource`] / [`scan`] APIs are identical in both modes.
 
 #![forbid(unsafe_code)]
+#![cfg_attr(not(feature = "std"), no_std)]
+
+#[cfg(not(feature = "std"))]
+extern crate alloc;
+
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, vec::Vec};
 
 use rti_core::{Result, Sample, SeriesId, Timestamp};
 
@@ -114,8 +126,8 @@ pub fn scan<S: ScanSource + ?Sized>(
     match agg {
         None => Ok(Box::new(buf.into_iter())),
         Some(a) => match a.apply(&buf) {
-            Some(v) => Ok(Box::new(std::iter::once(Sample { ts: t0, value: v }))),
-            None => Ok(Box::new(std::iter::empty())),
+            Some(v) => Ok(Box::new(core::iter::once(Sample { ts: t0, value: v }))),
+            None => Ok(Box::new(core::iter::empty())),
         },
     }
 }
