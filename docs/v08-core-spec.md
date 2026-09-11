@@ -1,6 +1,6 @@
 # rti-db v0.8 — Core Scalability SPEC
 
-*Status: proposed · Target: v0.8.0 · Supersedes: none · Builds on: v0.7.0 (`docs/v07-ai-integration-spec.md`)*
+*Status: implemented · Target: v0.8.0 · Supersedes: none · Builds on: v0.7.0 (`docs/v07-ai-integration-spec.md`)*
 
 This is the single source of truth for the v0.8 core wave selected for implementation:
 segment compaction, multi-shard Raft, and a public O(1) `latest` read. The wave makes

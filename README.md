@@ -5,8 +5,8 @@
 [中文版 README](README.zh-CN.md)
 
 [![CI](https://github.com/coidea-sys/rti-db/actions/workflows/ci.yml/badge.svg)](https://github.com/coidea-sys/rti-db/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.7.0-blue)](https://github.com/coidea-sys/rti-db)
-[![Tests](https://img.shields.io/badge/tests-179%20passing-brightgreen)](#testing--reproducibility)
+[![Version](https://img.shields.io/badge/version-0.8.0-blue)](https://github.com/coidea-sys/rti-db)
+[![Tests](https://img.shields.io/badge/tests-213%20passing-brightgreen)](#testing--reproducibility)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-lightgrey)](LICENSE-MIT)
 
 ```text
@@ -42,7 +42,7 @@ The design follows TRIZ separation principles: instead of compromising between "
 - **Real compression: 1.58×** end-to-end on disk (delta-of-delta timestamps + XOR floats + WAL truncation), beating ClickHouse's 1.22× on the same workload.
 - **Memory safety with an auditable unsafe surface.** `#![forbid(unsafe_code)]` everywhere except four small crates (`rti-mem`, `rti-buffer`, `rti-wal-uring`, and the documented `rti-vla` C ABI boundary), every `unsafe` block annotated with `// SAFETY:`. ~70% of severe CVEs in C/C++ systems are memory bugs — Rust eliminates that class at compile time.
 - **no_std subset.** `rti-core`, `rti-mem`, `rti-buffer` compile for `no_std` (core + alloc) — the same engine runs from an MCU safety island to a cloud server.
-- **io_uring pipelined WAL** (Linux, feature-gated, graceful fallback), **single-shard Raft replication** (snapshot, membership change, PreVote — all deterministically tested with a virtual clock), **S3 cold tier** (pure-std HTTP client, zero external dependencies), **TSN time alignment** for deterministic networks.
+- **io_uring pipelined WAL** (Linux, feature-gated, graceful fallback), **multi-shard Raft replication** (independent per-group election, replication, snapshot, membership — all deterministically tested with a virtual clock), **S3 cold tier** (pure-std HTTP client, zero external dependencies), **TSN time alignment** for deterministic networks.
 - **Deterministic everything.** Raft tests run on a virtual clock with an in-memory transport — leader election, failover, log consistency and partition scenarios are 100% reproducible (30/30 runs green).
 
 ## rti-db & AI (Strategic position)
@@ -58,7 +58,7 @@ Three roles, one position:
 
 | | What AI needs | What rti-db provides |
 |---|---|---|
-| **Inference time** | S1 fast loops need us-level deterministic access to the latest sensor state; S2 slow reasoning needs episodic context windows | The *working memory of embodied AI* - a KV-cache-for-the-physical-world: lock-free rings for the reflex path, columnar history for attention over the recent past |
+| **Inference time** | S1 fast loops need us-level deterministic access to the latest sensor state; S2 slow reasoning needs episodic context windows | The *working memory of embodied AI* - a KV-cache-for-the-physical-world: O(1) `latest()` reads with zero allocation on the reflex path, columnar history for attention over the recent past |
 | **Training time** | Embodied AI is data-starved; every deployed robot must be a data flywheel | The *flight recorder*: lossless episode logging (zero-loss `put_durable`), compressed cold tier to S3, replay-identical reproduction of any decision window |
 | **Governance** | Safety certification (aerospace, industrial, transport) demands audit | Deterministic replay: what the model saw, when, and what it decided - reproducible to the microsecond |
 
@@ -96,7 +96,7 @@ Full methodology, raw JSON and a one-command reproduction harness (`run_all.sh`,
 
 ## Architecture & Strategy (Design philosophy)
 
-15 crates, layered by the same separation principles:
+14 crates, layered by the same separation principles:
 
 | Crate | Role |
 |---|---|
@@ -106,11 +106,11 @@ Full methodology, raw JSON and a one-command reproduction harness (`run_all.sh`,
 | `rti-wal` / `rti-wal-uring` | WAL with group commit + checkpointing; io_uring pipelined backend |
 | `rti-store` | Columnar segments, delta-of-delta + XOR compression, zone maps, cold tier (S3/local) |
 | `rti-query` | Predicate pushdown, vectorized decode, zero-copy iterators |
-| `rti-raft` | Single-shard Raft: election, replication, snapshot, membership, PreVote |
+| `rti-raft` | Raft consensus: single-group core + multi-shard groups (election, replication, snapshot, membership, PreVote) |
 | `rti-net` | Minimal TCP line protocol |
-| `rti-db` | Facade: `Db::open / put / put_durable / scan` |
+| `rti-db` | Facade: `Db::open / put / put_durable / scan / latest / compact` — O(1) latest index + segment compaction |
 | `rti-edge` | RTI-Edge integration: four presets (safety island / cognition / planning / AI working memory) |
-| `rti-vla` | VLA working-memory adapter: `latest` / `window` / `ChunkBuffer` + frozen C ABI |
+| `rti-vla` | VLA working-memory adapter: O(1) `latest` / `window` / `ChunkBuffer` + frozen C ABI |
 | `rti-export` | LeRobot episode exporter (Parquet, LVCF resampling, O(chunk) streaming) + CLI |
 | `rti-ros2` | ROS 2 flight-recorder bridge (transport-agnostic core; rclrs behind `ros2-rclrs`) |
 
@@ -153,7 +153,7 @@ Feature flags: `io-uring` (pipelined WAL backend), `s3` (S3 cold tier), `alloc-c
 
 ## Testing & reproducibility
 
-- **156 tests green** (`cargo test --workspace`), 179 with all features
+- **190 tests green** (`cargo test --workspace`), 213 with all features
 - Deterministic Raft protocol tests (virtual clock + memory transport)
 - Steady-state zero-allocation proof test
 - Benchmark harness: `bench/run_all.sh` (~35 min full, `--smoke` 2 min) — every number in this README is reproducible
@@ -161,8 +161,8 @@ Feature flags: `io-uring` (pipelined WAL backend), `s3` (S3 cold tier), `alloc-c
 ## Roadmap
 
 - **v0.1–v0.6 (done)**: core engine → io_uring + block decode + TSN align → deterministic profile + no_std + mirror → Raft + cold tier → pipelined WAL + S3 + edge integration → durability semantics + WAL checkpoint
-- **v0.7 (this release)**: AI integration per [docs/v07-ai-integration-spec.md](docs/v07-ai-integration-spec.md) — `rti-ros2` flight recorder, `rti-export` LeRobot episodes, `rti-vla` working memory + C ABI
-- **v0.8**: multi-shard Raft, fast conflict backtracking, segment compaction
+- **v0.7 (done)**: AI integration per [docs/v07-ai-integration-spec.md](docs/v07-ai-integration-spec.md) — `rti-ros2` flight recorder, `rti-export` LeRobot episodes, `rti-vla` working memory + C ABI
+- **v0.8 (this release)**: core scalability per [docs/v08-core-spec.md](docs/v08-core-spec.md) — segment compaction, multi-shard Raft, public O(1) `latest`
 - **v0.9**: formal WCET analysis tooling, more `no_std` coverage, TSN hardware timestamping, Python bindings
 
 ## License
