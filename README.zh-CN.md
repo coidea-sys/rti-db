@@ -150,6 +150,22 @@ cargo run -p rti-ros2 --example ai_pipeline
 
 Feature 开关：`io-uring`（流水化 WAL 后端）、`s3`（S3 冷层）、`alloc-count`（分配审计）、`std`（`rti-core`/`rti-mem`/`rti-buffer`/`rti-query` 默认开启；关闭后进入 no_std）。
 
+## 旗舰示例
+
+四个可运行演示，把差异化能力变成实测数字——详见 [docs/examples.md](docs/examples.md)：
+
+- **具身智能工作记忆**——S1 反射 O(1) `latest()` p999=2.7µs，与 S2 窗口推理并发互不惊扰
+- **飞行记录器**——写入中途真实 SIGKILL：已确认点逐字节零丢失、1.3ms 恢复、确定性回放
+- **多分片 Raft 故障转移**——虚拟时钟下各分片独立选举/隔离/分区换主/愈合，逐次可复现
+- **压实价值**——合并因子 -92%、扫描 +46%、重传幂等、可见数据逐字节不变
+
+```bash
+cargo run -p rti-db --release --example embodied_memory
+cargo run -p rti-db --release --example flight_recorder
+cargo run -p rti-raft --release --example multishard_failover
+cargo run -p rti-db --release --example compaction_value
+```
+
 ## 测试与可复现性
 
 - **191 个测试全绿**（`cargo test --workspace`），全 feature 214 个

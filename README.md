@@ -152,6 +152,22 @@ cargo run -p rti-ros2 --example ai_pipeline
 
 Feature flags: `io-uring` (pipelined WAL backend), `s3` (S3 cold tier), `alloc-count` (allocation auditing), `std` (default on `rti-core`/`rti-mem`/`rti-buffer`/`rti-query`; disable for `no_std`).
 
+## Flagship examples
+
+Four runnable demos that turn the differentiators into measured numbers — see [docs/examples.md](docs/examples.md):
+
+- **Embodied working memory** — S1 reflex O(1) `latest()` p999 = 2.7µs vs S2 windowed reasoning, both live
+- **Flight recorder** — real SIGKILL mid-write: every acked point survives byte-perfect, 1.3 ms recovery, deterministic replay
+- **Multi-shard Raft failover** — independent per-shard election/isolation/partition/heal on a virtual clock, fully reproducible
+- **Compaction value** — merge factor -92%, scan +46%, idempotent retransmits, byte-identical visible data
+
+```bash
+cargo run -p rti-db --release --example embodied_memory
+cargo run -p rti-db --release --example flight_recorder
+cargo run -p rti-raft --release --example multishard_failover
+cargo run -p rti-db --release --example compaction_value
+```
+
 ## Testing & reproducibility
 
 - **191 tests green** (`cargo test --workspace`), 214 with all features
