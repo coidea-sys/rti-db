@@ -29,9 +29,16 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use rti_buffer::SpscRing;
-use rti_core::{Config, Error, Profile, Result, Sample, SeriesId, SyncPolicy, Timestamp};
-use rti_query::{Agg, Pred, ScanSource};
-use rti_store::{ColdTier, MemTable, SegmentReader, SegmentWriter, ZoneMap};
+// Facade re-exports: the types every `Db` caller needs, so a downstream crate depends
+// only on `rti-db` — the internal crate split stays an implementation detail. (This is
+// also what the README quickstart assumes.)
+pub use rti_core::{Config, Error, Mirror, Profile, Result, Sample, SeriesId, SyncPolicy, Timestamp};
+pub use rti_query::{Agg, Pred};
+// Cold-tier plumbing: `Db::set_cold_tier` takes `Arc<dyn ColdTier>` and `LocalFsColdTier`
+// is the built-in local implementation.
+pub use rti_store::{ColdTier, LocalFsColdTier};
+use rti_query::ScanSource;
+use rti_store::{MemTable, SegmentReader, SegmentWriter, ZoneMap};
 use rti_wal::{Record, Wal};
 
 mod compact;
