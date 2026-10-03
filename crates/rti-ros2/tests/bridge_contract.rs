@@ -2,6 +2,7 @@
 //! transport sender), unknown-topic skip accounting, and `BridgeStats` semantics.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rti_core::{Config, Timestamp};
@@ -14,6 +15,15 @@ fn now_ns() -> Timestamp {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos() as Timestamp
+}
+
+/// Strictly increasing timestamps. `Db::collect_into` deduplicates samples by
+/// `ts`, so a test asserting on scanned contents must not let two samples of one
+/// series share a timestamp — `now_ns()` calls in a tight loop can collide.
+fn mono_ts(last: &AtomicI64) -> Timestamp {
+    let next = last.load(Ordering::Relaxed).max(now_ns()) + 1;
+    last.store(next, Ordering::Relaxed);
+    next
 }
 
 fn test_db() -> Arc<Db> {
@@ -144,15 +154,16 @@ fn bridge_stats_counter_semantics() {
     assert_eq!(bridge.stats(), BridgeStats::default());
     let tx = bridge.sender().unwrap();
 
+    let last = AtomicI64::new(0);
     for i in 0..5 {
-        tx.send_value("/a", now_ns(), json!({ "value": i as f64 })).unwrap(); // durable ok
+        tx.send_value("/a", mono_ts(&last), json!({ "value": i as f64 })).unwrap(); // durable ok
     }
     for i in 0..3 {
-        tx.send_value("/b", now_ns(), json!({ "pose": { "x": i as f64 } })).unwrap(); // non-durable ok
+        tx.send_value("/b", mono_ts(&last), json!({ "pose": { "x": i as f64 } })).unwrap(); // non-durable ok
     }
-    tx.send_value("/unknown", now_ns(), json!({ "value": 0.0 })).unwrap(); // skipped: topic
-    tx.send_value("/a", now_ns(), json!({ "other": 1.0 })).unwrap(); // skipped: field missing
-    tx.send_value("/b", now_ns(), json!({ "pose": { "x": "NaNish" } })).unwrap(); // skipped: not a number
+    tx.send_value("/unknown", mono_ts(&last), json!({ "value": 0.0 })).unwrap(); // skipped: topic
+    tx.send_value("/a", mono_ts(&last), json!({ "other": 1.0 })).unwrap(); // skipped: field missing
+    tx.send_value("/b", mono_ts(&last), json!({ "pose": { "x": "NaNish" } })).unwrap(); // skipped: not a number
 
     const TOTAL: u64 = 11;
     assert!(wait_until(

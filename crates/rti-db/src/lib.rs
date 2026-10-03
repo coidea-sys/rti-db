@@ -450,6 +450,13 @@ impl Db {
     ///
     /// `pred` is pushed down to the decode layer; when `agg` is `Some`, returns a single-sample iterator
     /// (`ts = t0`, `value = aggregate result`). Semantics match [`rti_query::scan`].
+    ///
+    /// **Duplicate timestamps collapse:** samples sharing a `ts` are deduplicated
+    /// (stable merge, first-writer-wins — live MemTable data precedes segment data,
+    /// segments in catalog order). Rewriting a sample at an existing timestamp does
+    /// not produce a second point in scan output. This mirrors [`Db::latest`]'s
+    /// equal-timestamp rule; producers that can emit colliding timestamps must
+    /// disambiguate before `put` if every sample must remain visible.
     pub fn scan(
         &self,
         series: SeriesId,
