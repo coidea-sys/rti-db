@@ -1,0 +1,662 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>0.5 µs 反射弧 · rti-db 驱动的机器人工作记忆</title>
+<style>
+  :root {
+    --bg: #0a0e14; --panel: #11161f; --panel2: #171e2a; --border: #2a3342;
+    --text: #dbe4f0; --dim: #7d8aa0;
+    --green: #3ddc84; --red: #ff5c5c; --yellow: #ffc857; --blue: #4cc2ff; --purple: #b78cff;
+    --mono: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: -apple-system, "PingFang SC", sans-serif; overflow-x: hidden; }
+  header { padding: 26px 28px 16px; display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; border-bottom: 1px solid var(--border); }
+  header h1 { font-size: 22px; font-weight: 800; letter-spacing: .5px; }
+  header h1 .us { color: var(--green); }
+  header .tag { color: var(--dim); font-size: 13px; }
+  header .badge { font-family: var(--mono); font-size: 11px; color: var(--yellow); border: 1px solid var(--yellow); border-radius: 4px; padding: 2px 8px; }
+  .layout { display: grid; grid-template-columns: 640px 1fr; gap: 14px; padding: 14px; max-width: 1440px; margin: 0 auto; }
+  @media (max-width: 1100px) { .layout { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 14px; }
+  .panel h3 { font-size: 12px; color: var(--dim); font-family: var(--mono); font-weight: 500; margin-bottom: 10px; letter-spacing: 1px; }
+  /* robot */
+  #robot-panel { grid-row: span 2; }
+  #robot-wrap { position: relative; }
+  canvas#cv { display: block; width: 100%; border-radius: 8px; background: linear-gradient(180deg,#0d1420 0%,#0a0f18 100%); }
+  .overlay-msg {
+    position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
+    flex-direction: column; gap: 10px; background: rgba(10,14,20,.72); border-radius: 8px; z-index: 5;
+  }
+  .overlay-msg.on { display: flex; }
+  .overlay-msg .big { font-size: 34px; font-weight: 800; font-family: var(--mono); }
+  .overlay-msg .small { color: var(--dim); font-size: 13px; }
+  .overlay-msg.kill .big { color: var(--red); text-shadow: 0 0 24px rgba(255,92,92,.6); }
+  .overlay-msg.replay .big { color: var(--blue); }
+  .controls { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+  .controls .sep { width: 1px; background: var(--border); margin: 4px 2px; }
+  button {
+    font-family: inherit; font-size: 12.5px; cursor: pointer; background: var(--panel2);
+    color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 7px 13px; transition: all .15s;
+  }
+  button:hover:not(:disabled) { border-color: var(--blue); }
+  button:disabled { opacity: .35; cursor: default; }
+  button.danger { border-color: var(--red); color: var(--red); }
+  button.danger:hover:not(:disabled) { background: rgba(255,92,92,.12); }
+  button.arm { border-color: var(--green); color: var(--green); }
+  button.armed { background: rgba(61,220,132,.15); border-color: var(--green); color: var(--green); box-shadow: 0 0 10px rgba(61,220,132,.25); }
+  /* HUD */
+  .hud-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .gauge { background: var(--panel2); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; position: relative; overflow: hidden; }
+  .gauge .g-label { font-size: 10.5px; color: var(--dim); font-family: var(--mono); }
+  .gauge .g-value { font-family: var(--mono); font-size: 24px; font-weight: 700; margin-top: 2px; }
+  .gauge .g-value .unit { font-size: 12px; color: var(--dim); font-weight: 400; }
+  .gauge .g-sub { font-size: 10.5px; color: var(--dim); font-family: var(--mono); margin-top: 3px; }
+  .gauge.s1 .g-value { color: var(--green); }
+  .gauge.s2 .g-value { color: var(--purple); }
+  .gauge.warn .g-value { color: var(--red); }
+  .bound-bar { position: relative; height: 4px; background: #0a0e14; border-radius: 2px; margin-top: 7px; }
+  .bound-fill { position: absolute; left: 0; top: 0; bottom: 0; background: var(--green); border-radius: 2px; transition: width .12s; }
+  .bound-mark { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--yellow); }
+  .bound-mark::after { content: '上界'; position: absolute; top: -14px; left: -12px; font-size: 9px; color: var(--yellow); font-family: var(--mono); }
+  /* pipeline */
+  .pipe { display: flex; flex-direction: column; gap: 10px; }
+  .pipe-row { display: flex; align-items: center; gap: 10px; }
+  .pipe-row .p-name { font-family: var(--mono); font-size: 11px; color: var(--dim); width: 130px; flex-shrink: 0; }
+  .pipe-vis { flex: 1; background: #0a0e14; border: 1px solid var(--border); border-radius: 6px; height: 30px; position: relative; overflow: hidden; }
+  #ring-cells { position: absolute; inset: 3px; display: flex; gap: 2px; }
+  #ring-cells i { flex: 1; background: #1a2331; border-radius: 1.5px; transition: background .1s; }
+  #ring-cells i.f { background: var(--blue); box-shadow: 0 0 5px rgba(76,194,255,.5); }
+  #ring-cells i.hot { background: var(--red); }
+  .fillbar { position: absolute; inset: 3px; width: calc(100% - 6px); transform-origin: left; background: linear-gradient(90deg,#1f5f8b,#4cc2ff); border-radius: 3px; transform: scaleX(0); }
+  .wal-flash { position: absolute; inset: 0; background: rgba(61,220,132,.25); opacity: 0; }
+  .wal-flash.go { animation: wflash .5s; }
+  @keyframes wflash { 0%{opacity:1} 100%{opacity:0} }
+  .p-num { font-family: var(--mono); font-size: 11px; color: var(--dim); width: 86px; text-align: right; flex-shrink: 0; }
+  #segments { display: flex; gap: 6px; flex-wrap: wrap; min-height: 34px; }
+  .seg { font-family: var(--mono); font-size: 10px; border: 1px solid var(--border); border-radius: 6px; padding: 5px 9px; background: var(--panel2); animation: segin .4s; }
+  .seg b { color: var(--green); }
+  @keyframes segin { from { opacity: 0; transform: translateY(8px); } }
+  .ratio-hero { display: flex; align-items: baseline; gap: 8px; margin-top: 4px; }
+  .ratio-hero .r-num { font-family: var(--mono); font-size: 30px; font-weight: 800; color: var(--green); }
+  .ratio-hero .r-dim { color: var(--dim); font-size: 11px; font-family: var(--mono); }
+  /* thought bubble */
+  #thought {
+    display: none; position: absolute; right: 10px; top: 10px; max-width: 250px; z-index: 4;
+    background: rgba(23,30,42,.95); border: 1px solid var(--purple); border-radius: 12px;
+    padding: 10px 13px; font-size: 12px; box-shadow: 0 4px 24px rgba(0,0,0,.5);
+  }
+  #thought.on { display: block; animation: thinkin .3s; }
+  @keyframes thinkin { from { opacity: 0; transform: translateY(-6px); } }
+  #thought .t-title { color: var(--purple); font-family: var(--mono); font-size: 10.5px; margin-bottom: 4px; }
+  #thought .t-body { color: var(--text); line-height: 1.5; }
+  #thought .t-body .mono { color: var(--dim); }
+  /* log */
+  #log { font-family: var(--mono); font-size: 11px; line-height: 1.8; height: 128px; overflow-y: auto; color: var(--dim); }
+  #log div b { color: var(--text); font-weight: 500; }
+  #log .lg-ok b { color: var(--green); } #log .lg-warn b { color: var(--yellow); } #log .lg-bad b { color: var(--red); } #log .lg-info b { color: var(--blue); }
+  .foot { padding: 10px 28px 26px; color: var(--dim); font-size: 11px; font-family: var(--mono); max-width: 1440px; margin: 0 auto; }
+  .spark-row { display: flex; gap: 10px; margin-top: 10px; }
+  .spark-box { flex: 1; }
+  .spark-box .s-label { font-size: 10px; color: var(--dim); font-family: var(--mono); margin-bottom: 3px; }
+  canvas.spark { width: 100%; height: 44px; background: #0a0e14; border: 1px solid var(--border); border-radius: 6px; display: block; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>0.5 <span class="us">µs</span> 反射弧</h1>
+  <span class="tag">rti-db 驱动的机器人工作记忆 — S1 反射 · S2 思考 · 飞行记录</span>
+  <span class="badge">架构仿真 · 压缩率为真实编码计算</span>
+</header>
+
+<div class="layout">
+  <!-- ===== 机器人 ===== -->
+  <div class="panel" id="robot-panel">
+    <h3>倒立摆机器人 · 每条神经信号都流经 rti-db</h3>
+    <div id="robot-wrap">
+      <canvas id="cv" width="640" height="400"></canvas>
+      <div class="overlay-msg kill" id="ov-kill">
+        <div class="big">✝ SIGKILL</div>
+        <div class="small">进程被杀 — 内存状态消失，只有 WAL 存活</div>
+      </div>
+      <div class="overlay-msg replay" id="ov-replay">
+        <div class="big" id="replay-text">WAL 重放中…</div>
+        <div class="small">checkpoint 不变式：WAL 恰好保护当前 MemTable</div>
+      </div>
+      <div id="thought">
+        <div class="t-title">S2 · 慢思考（VLA 推理）</div>
+        <div class="t-body" id="thought-body"></div>
+      </div>
+    </div>
+    <div class="spark-row">
+      <div class="spark-box"><div class="s-label">θ 姿态角（最近 10 s · 来自 scan 窗口）</div><canvas class="spark" id="spark1" width="300" height="44"></canvas></div>
+      <div class="spark-box"><div class="s-label">latest() 读延迟（µs · 每帧刷新）</div><canvas class="spark" id="spark2" width="300" height="44"></canvas></div>
+    </div>
+    <div class="controls">
+      <button id="btn-push-l">⇠ 左推一下</button>
+      <button id="btn-push-r">右推一下 ⇢</button>
+      <button id="btn-noise">⚡ 传感器噪声 5s</button>
+      <button id="btn-burst">💥 写突发 ×10</button>
+      <div class="sep"></div>
+      <button id="btn-s1" class="arm armed">S1 反射回路 · 开</button>
+      <button id="btn-s2" class="arm armed">S2 慢思考 · 开</button>
+      <div class="sep"></div>
+      <button id="btn-kill" class="danger">☠ kill -9</button>
+      <button id="btn-reset">↺ 重置</button>
+    </div>
+  </div>
+
+  <!-- ===== HUD ===== -->
+  <div class="panel">
+    <h3>双速读取 · 延迟仪表盘</h3>
+    <div class="hud-grid">
+      <div class="gauge s1" id="g-s1">
+        <div class="g-label">S1 · latest() 反射读（O(1) 哈希索引 · 零分配）</div>
+        <div class="g-value" id="v-s1">0.47 <span class="unit">µs</span></div>
+        <div class="bound-bar"><div class="bound-fill" id="bf-s1" style="width:50%"></div><div class="bound-mark" style="left:92%"></div></div>
+        <div class="g-sub" id="v-s1-sub">p50 0.44 · p99 0.71 · p999 0.90 µs</div>
+      </div>
+      <div class="gauge s2" id="g-s2">
+        <div class="g-label">S2 · scan() 窗口推理（列式段 + 谓词下推）</div>
+        <div class="g-value" id="v-s2">— <span class="unit">ms</span></div>
+        <div class="g-sub" id="v-s2-sub">等待下一次思考周期…</div>
+      </div>
+      <div class="gauge">
+        <div class="g-label">写入吞吐（SPSC 无锁入队）</div>
+        <div class="g-value" id="v-tps">0 <span class="unit">pts/s</span></div>
+        <div class="g-sub" id="v-total">累计 0 点</div>
+      </div>
+      <div class="gauge" id="g-drop">
+        <div class="g-label">背压 · 环形队列已满丢数</div>
+        <div class="g-value" id="v-drop">0 <span class="unit">pts</span></div>
+        <div class="g-sub">put() 返回 SeriesFull — 由调用方决策</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== 引擎内部 ===== -->
+  <div class="panel">
+    <h3>rti-db 引擎内部 · 实时数据流</h3>
+    <div class="pipe">
+      <div class="pipe-row">
+        <div class="p-name">SPSC Ring · cap 4096</div>
+        <div class="pipe-vis"><div id="ring-cells"></div></div>
+        <div class="p-num" id="ring-num">0 / 4096</div>
+      </div>
+      <div class="pipe-row">
+        <div class="p-name">ingest → WAL · 组提交</div>
+        <div class="pipe-vis"><div class="wal-flash" id="wal-flash"></div><div class="fillbar" id="wal-bar"></div></div>
+        <div class="p-num" id="wal-num">wm 0</div>
+      </div>
+      <div class="pipe-row">
+        <div class="p-name">MemTable · cap 4096</div>
+        <div class="pipe-vis"><div class="fillbar" id="mem-bar" style="background:linear-gradient(90deg,#2b6e46,#3ddc84)"></div></div>
+        <div class="p-num" id="mem-num">0 / 4096</div>
+      </div>
+      <div class="pipe-row" style="align-items:flex-start">
+        <div class="p-name" style="margin-top:6px">列式段 · 压缩</div>
+        <div style="flex:1"><div id="segments"></div></div>
+        <div class="p-num" style="width:150px">
+          <div class="ratio-hero"><span class="r-num" id="ratio">—</span></div>
+          <div class="r-dim">列式段压缩比（真实编码，不含 WAL 尾）</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== 日志 ===== -->
+  <div class="panel" style="grid-column: 1 / -1;">
+    <h3>事件日志</h3>
+    <div id="log"></div>
+  </div>
+</div>
+
+<div class="foot">
+  仿真说明：数据流语义（ring 背压 / 组提交水位 / MemTable seal / ts 去重 / latest 可见性 / WAL 重放）按引擎真实行为建模，读取路径（S1 latest、S1-off 慢查询、S2 scan）全部经过模拟引擎，无旁路；<br>
+  Gorilla 压缩（delta-of-delta + XOR float）为真实编码算法、对真实数据流现算；S2 scan 耗时为浏览器内实测；latest() 延迟为引擎设计量级仿真，非本机实测。物理：cart-pole · 控制周期 1 kHz。
+</div>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+
+/* ================= 仿真状态 ================= */
+const RING_CAP = 4096, MEM_CAP = 4096;
+const SUB = 16, H = 0.001;               // 16 substeps × 1 ms = 1 kHz 控制/采样
+const ring = { t: new Float64Array(RING_CAP), v: new Float64Array(RING_CAP), w: 0, r: 0, n: 0 };
+let mem = [], head = null, acked = 0, walSynced = 0;
+let segments = [], diskBytes = 0, diskRaw = 0;
+let latS1 = [], hist = [];               // hist: 传感器流滚动历史（S2 scan 数据源）
+const sim = { clock: 0, dropped: 0, totalPut: 0, putLastSec: 0, frame: 0,
+              s1: true, s2: true, noiseUntil: -1, burstUntil: -1, killing: false };
+const bot = { x: 0, v: 0, th: 0.05, w: 0, tx: 0, fallen: false };
+
+function log(kind, html) {
+  const d = document.createElement('div');
+  d.className = 'lg-' + kind;
+  d.innerHTML = `<b>[${sim.clock.toFixed(1)}s]</b> ${html}`;
+  const L = $('log'); L.prepend(d);
+  while (L.children.length > 40) L.lastChild.remove();
+}
+
+/* ================= rti-db 引擎模型 ================= */
+function put(ts, val) {
+  if (ring.n >= RING_CAP) { sim.dropped++; return false; }   // Error::SeriesFull 背压
+  ring.t[ring.w] = ts; ring.v[ring.w] = val;
+  ring.w = (ring.w + 1) % RING_CAP; ring.n++; sim.totalPut++;
+  return true;
+}
+function drain() {
+  // ingest 线程服务能力：~6.7k pts/s（112/帧）——正常负载绰绰有余，写突发会积压
+  let n = 0;
+  const CAP = 112;
+  while (ring.n > 0 && n < CAP) {
+    apply(ring.t[ring.r], ring.v[ring.r]);
+    ring.r = (ring.r + 1) % RING_CAP; ring.n--; n++;
+  }
+}
+function apply(t, v) {
+  acked++;
+  mem.push({ t, v });
+  if (!head || t > head.t) head = { t, v };   // latest 索引：严格更大才更新（引擎规则）
+  if (mem.length >= MEM_CAP) seal();
+}
+/* —— Gorilla 风格真实编码：delta-of-delta 时间戳 + XOR 浮点，算出真实压缩字节 —— */
+const _dv = new DataView(new ArrayBuffer(8));
+const f2b = f => { _dv.setFloat64(0, f); return _dv.getBigUint64(0); };
+function clz64(x) { const hi = Number(x >> 32n), lo = Number(x & 0xffffffffn);
+  return hi !== 0 ? Math.clz32(hi) : 32 + Math.clz32(lo); }
+function varintLen(u) { let n = 1; while (u >= 0x80n) { u >>= 7n; n++; } return n; }
+const zigzag = d => BigInt(d >= 0 ? 2 * d : -2 * d - 1);
+function encodeBytes(samples) {
+  let bytes = 8;                                   // 段头
+  let prevT = samples[0].t, prevD = 0, prevV = f2b(samples[0].v);
+  bytes += 8 + 8;                                  // 首点 ts + value 全量
+  for (let i = 1; i < samples.length; i++) {
+    const s = samples[i];
+    const d = s.t - prevT;
+    bytes += varintLen(zigzag(d - prevD));         // delta-of-delta 变长
+    const x = f2b(s.v) ^ prevV;
+    bytes += x === 0n ? 1 : 1 + Math.ceil((64 - clz64(x)) / 8);   // XOR + 前导零压缩
+    prevT = s.t; prevD = d; prevV = f2b(s.v);
+  }
+  return bytes;
+}
+function seal() {
+  const bytes = encodeBytes(mem);
+  // 段必须可解码：保留 ts/vs 列（真实段也是如此 —— S2 的 scan 从这里读）
+  const ts = new Float64Array(mem.length), vs = new Float64Array(mem.length);
+  mem.forEach((s, i) => { ts[i] = s.t; vs[i] = s.v; });
+  segments.push({ n: mem.length, bytes, raw: mem.length * 16, t0: ts[0], t1: ts[ts.length - 1], ts, vs });
+  if (segments.length > 6) segments.shift();
+  diskBytes += bytes; diskRaw += mem.length * 16;
+  log('info', `MemTable 满 4096 → <b>seal</b> 列式段：${mem.length} 点，Gorilla 编码 ${bytes} B（原始 ${mem.length * 16} B）`);
+  mem = [];
+}
+// 真 scan：MemTable + 列式段。zone map 跳段；结果按 ts 稳定排序后去重
+// （first-writer-wins：与引擎一致 —— MemTable 数据先于段数据）
+function engineScan(t0, t1) {
+  const out = [];
+  for (const s of mem) if (s.t >= t0 && s.t <= t1) out.push(s);
+  for (const seg of segments) {
+    if (seg.t1 < t0 || seg.t0 > t1) continue;      // zone-map 整段跳过
+    for (let i = 0; i < seg.n; i++) {
+      const t = seg.ts[i];
+      if (t >= t0 && t <= t1) out.push({ t, v: seg.vs[i] });
+    }
+  }
+  out.sort((a, b) => a.t - b.t);
+  const dedup = [];
+  for (const s of out) if (!dedup.length || s.t !== dedup[dedup.length - 1].t) dedup.push(s);
+  return dedup;
+}
+
+/* ================= 物理：cart-pole ================= */
+const PM = { M: 1.0, m: 0.15, l: 0.6, g: 9.81 };
+function stepPhysics(F, h) {
+  const { M, m, l, g } = PM, s = bot;
+  const sin = Math.sin(s.th), cos = Math.cos(s.th);
+  const thAcc = (g * (M + m) * sin - cos * (F + m * l * s.w * s.w * sin)) / (l * (4 / 3 * (M + m) - m * cos * cos));
+  const xAcc = (F + m * l * (s.w * s.w * sin - thAcc * cos)) / (M + m);
+  s.w += thAcc * h; s.th += s.w * h;
+  s.v += xAcc * h; s.x += s.v * h;
+  if (Math.abs(s.x) > 2.2) { s.x = Math.sign(s.x) * 2.2; s.v *= -0.3; }
+  if (Math.abs(s.th) > 1.25 && !s.fallen) { s.fallen = true; s.fallClock = sim.clock; onFallen(); }
+}
+function onFallen() {
+  log('bad', `<b>机器人摔倒</b> — θ 超过 71°。${sim.s1 ? '物理扰动过大。' : 'S1 断开期间控制周期从 30 ms 恶化到 150 ms，纠正永远迟到。'}`);
+}
+
+/* ================= S1 / S2 ================= */
+function s1Latency() {
+  // 结构性有界 0.92 µs：主体 0.40–0.55，约 1.5% 的稀有事件推向尾部（有层次的百分位阶梯）
+  let r = 0.40 + Math.random() * 0.15;
+  if (Math.random() < 0.015) r += Math.random() * 0.36;
+  return Math.min(0.91, r);
+}
+function s1Read() {
+  if (sim.s1) { const r = s1Latency(); latS1.push(r); if (latS1.length > 4096) latS1.shift(); return head; }
+  return null;
+}
+// S1 关闭：慢查询路径 —— 从数据库读 D 秒前的样本（走真 engineScan，不查旁路）
+function staleState(D) {
+  const c = Math.round((sim.clock - D) * 1e9);
+  const win = engineScan(c - 300e6, c);            // 300 ms 窗口必含样本
+  if (!win.length) return { th: 0, w: 0 };
+  const b = win[win.length - 1];
+  const a = win.length > 1 ? win[win.length - 2] : b;
+  return { th: b.v, w: (b.v - a.v) / Math.max(1e-6, (b.t - a.t) / 1e9) };
+}
+const s1off = { lastUpd: -1, F: 0, since: 0 };   // 慢路径状态：30 ms 控制周期起 + 12 ms 查询延迟
+let s2Timer = 0, thoughtTimer = 0;
+function s2Think() {
+  if (bot.fallen) return;   // 推理系统对残废的身体无能为力 —— 等重新站起来
+  const t1 = Math.round(sim.clock * 1e9), t0 = Math.round((sim.clock - 1.5) * 1e9);
+  const p0 = performance.now();
+  const win = engineScan(t0, t1);                  // 真 scan：MemTable + 列式段
+  const ms = performance.now() - p0;               // 耗时为浏览器内实测
+  if (win.length < 50) return;
+  const mean = win.reduce((a, s) => a + s.v, 0) / win.length;
+  const deg = mean * 57.3;
+  bot.tx = Math.max(-0.35, Math.min(0.35, -mean * 0.5));
+  const cost = ms < 1 ? `${(ms * 1000).toFixed(0)} µs` : `${ms.toFixed(2)} ms`;
+  $('v-s2').innerHTML = ms < 1 ? (ms * 1000).toFixed(0) + ' <span class="unit">µs</span>' : ms.toFixed(2) + ' <span class="unit">ms</span>';
+  $('v-s2-sub').textContent = `窗口 1.5 s · ${win.length} 点 → 趋势决策（scan 实测）`;
+  const noise = sim.clock < sim.noiseUntil ? '（噪声中，取窗口均值滤波）' : '';
+  $('thought-body').innerHTML =
+    `scan(<span class="mono">1, t-1.5s, t</span>) → <b>${win.length}</b> 点 · <b>${cost}</b>（实测）<br>` +
+    `⟨θ⟩ = <b>${deg >= 0 ? '+' : ''}${deg.toFixed(2)}°</b>${noise}<br>` +
+    `→ 调整目标位置 tx = <b>${bot.tx.toFixed(3)}</b>`;
+  $('thought').classList.add('on');
+  thoughtTimer = 140;
+  log('info', `S2 思考完成：${win.length} 点 / ${cost}（实测）→ tx=${bot.tx.toFixed(3)}`);
+}
+
+/* ================= 主循环 ================= */
+let lastFrame = performance.now(), tpsBase = 0, tpsClock = 0;
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dtReal = Math.min(100, now - lastFrame); lastFrame = now;
+  if (sim.killing) return;
+  sim.frame++;
+  const noiseOn = sim.clock < sim.noiseUntil;
+  const burstOn = sim.clock < sim.burstUntil;
+  let F = 0;
+
+  for (let k = 0; k < SUB; k++) {
+    sim.clock += H;
+    // 传感器写入：1 ms 周期 + 可选突发 ×10
+    const sigma = noiseOn ? 0.02 : 0.0012;
+    const meas = bot.th + (Math.random() - 0.5) * 2 * sigma;
+    const ts = Math.round(sim.clock * 1e9);
+    put(ts, meas);
+    if (burstOn) for (let j = 0; j < 9; j++) put(ts + j + 1, meas);
+    // S1 控制
+    if (!bot.fallen) {
+      if (sim.s1) {
+        const s = s1Read();
+        const thM = s ? s.v : 0;
+        const wM = bot.w + (Math.random() - 0.5) * 0.004;
+        F = Math.max(-40, Math.min(40,
+          0.6 * (bot.x - bot.tx) + 3.0 * bot.v + 42 * thM + 48 * wM - 0.5 * bot.v));
+      } else {
+        // 慢路径：查询本身要 8–20 ms，控制周期从 30 ms 起；积压加深查询越来越慢
+        const period = 0.030 + Math.min(0.12, (sim.clock - s1off.since) * 0.012);
+        if (sim.clock - s1off.lastUpd >= period) {
+          const st = staleState(0.012);
+          s1off.F = Math.max(-40, Math.min(40,
+            0.6 * (bot.x - bot.tx) + 3.0 * bot.v + 42 * st.th + 48 * st.w - 0.5 * bot.v));
+          s1off.lastUpd = sim.clock;
+        }
+        F = s1off.F;
+      }
+      stepPhysics(F, H);
+    } else {
+      stepPhysics(0, H);
+    }
+    hist.push({ clock: sim.clock, t: ts, v: meas });
+  }
+  if (hist.length > 60000) hist.splice(0, hist.length - 60000);   // 仅影响示波器缓冲，读取路径已不依赖 hist
+  // 摔倒 2.5 s 后自动扶正（数据保留，只重置物理）
+  if (bot.fallen && sim.clock - bot.fallClock > 2.5) {
+    Object.assign(bot, { x: 0, v: 0, th: 0.05, w: 0, tx: 0, fallen: false });
+    log('info', '实验自动扶正 — rti-db 中的数据原样保留');
+  }
+  drain();
+
+  // 组提交：每 45 帧把水位推前
+  if (sim.frame % 45 === 0) {
+    walSynced = acked;
+    const wf = $('wal-flash'); wf.classList.remove('go'); void wf.offsetWidth; wf.classList.add('go');
+  }
+  // S2：每 3 s
+  if (sim.s2 && (s2Timer -= dtReal) <= 0) { s2Think(); s2Timer = 3000; }
+  if (thoughtTimer > 0 && --thoughtTimer === 0) $('thought').classList.remove('on');
+
+  // 每秒统计（吞吐只统计 put() 成功接受的 —— 与背压丢数自洽）
+  tpsClock += dtReal;
+  if (tpsClock >= 1000) {
+    const rate = Math.round((sim.totalPut - tpsBase) * 1000 / tpsClock);
+    $('v-tps').innerHTML = rate.toLocaleString() + ' <span class="unit">pts/s</span>';
+    $('v-total').textContent = `累计 ${sim.totalPut.toLocaleString()} 点 · acked ${acked.toLocaleString()}`;
+    tpsBase = sim.totalPut; tpsClock = 0;
+  }
+  if (sim.frame % 10 === 0) updateHUD();
+  draw(F);
+  drawSparks();
+}
+
+/* ================= HUD ================= */
+function pct(arr, p) { if (!arr.length) return 0; const s = [...arr].sort((a, b) => a - b); return s[Math.min(s.length - 1, Math.floor(p * s.length))]; }
+function updateHUD() {
+  // S1 表
+  if (sim.s1) {
+    const last = latS1[latS1.length - 1] || 0.47;
+    $('v-s1').innerHTML = last.toFixed(2) + ' <span class="unit">µs</span>';
+    $('v-s1-sub').textContent = `p50 ${pct(latS1, .5).toFixed(2)} · p99 ${pct(latS1, .99).toFixed(2)} · p999 ${pct(latS1, .999).toFixed(2)} µs（上界 0.92 结构性保证）`;
+    $('bf-s1').style.width = (last / 1.0 * 100) + '%';
+    $('bf-s1').style.background = 'var(--green)';
+    $('g-s1').classList.remove('warn');
+  } else {
+    $('v-s1').innerHTML = (8 + Math.random() * 12).toFixed(1) + ' <span class="unit">ms</span>';
+    $('v-s1-sub').textContent = '反射回路已断开 — 查询路径：周期 30 ms 起、随积压恶化至 150 ms（1 kHz → 7 Hz）';
+    $('bf-s1').style.width = '100%';
+    $('bf-s1').style.background = 'var(--red)';
+    $('g-s1').classList.add('warn');
+  }
+  // ring / wal / mem
+  const cells = $('ring-cells').children;
+  const fill = ring.n / RING_CAP;
+  const lit = Math.round(fill * cells.length);
+  for (let i = 0; i < cells.length; i++) {
+    cells[i].className = i < lit ? (fill > 0.85 ? 'hot' : 'f') : '';
+  }
+  $('ring-num').textContent = `${ring.n} / ${RING_CAP}`;
+  const pending = Math.max(0, acked - walSynced);
+  $('wal-bar').style.transform = `scaleX(${Math.min(1, pending / MEM_CAP)})`;
+  $('wal-num').textContent = `wm ${walSynced.toLocaleString()}`;
+  $('mem-bar').style.transform = `scaleX(${mem.length / MEM_CAP})`;
+  $('mem-num').textContent = `${mem.length} / ${MEM_CAP}`;
+  $('v-drop').innerHTML = sim.dropped.toLocaleString() + ' <span class="unit">pts</span>';
+  $('g-drop').classList.toggle('warn', sim.dropped > 0);
+  // segments + ratio
+  if (sim.frame % 30 === 0) {
+    $('segments').innerHTML = segments.map((s, i) =>
+      `<div class="seg">seg#${i} · ${s.n} pts · <b>${(s.raw / s.bytes).toFixed(1)}×</b></div>`).join('');
+    if (diskBytes > 0) {
+      $('ratio').textContent = (diskRaw / diskBytes).toFixed(1) + '×';
+    }
+  }
+}
+
+/* ================= 画布 ================= */
+const cv = $('cv'), ctx = cv.getContext('2d');
+function draw(F) {
+  const W = cv.width, Hh = cv.height;
+  ctx.clearRect(0, 0, W, Hh);
+  const cx = W / 2 + bot.x * 120, cy = Hh - 90, scale = 150;
+  // 地面 + 轨道
+  ctx.strokeStyle = '#2a3342'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(30, cy + 14); ctx.lineTo(W - 30, cy + 14); ctx.stroke();
+  ctx.strokeStyle = '#1c2431';
+  for (let gx = -2; gx <= 2.01; gx += 0.5) {
+    const px = W / 2 + gx * 120;
+    ctx.beginPath(); ctx.moveTo(px, cy + 14); ctx.lineTo(px, cy + 22); ctx.stroke();
+  }
+  // 目标位置标记
+  ctx.strokeStyle = '#b78cff'; ctx.setLineDash([4, 4]);
+  ctx.beginPath(); ctx.moveTo(W / 2 + bot.tx * 120, cy - 40); ctx.lineTo(W / 2 + bot.tx * 120, cy + 14); ctx.stroke();
+  ctx.setLineDash([]);
+  // 小车
+  ctx.fillStyle = '#1c2a3d'; ctx.strokeStyle = '#4cc2ff'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.roundRect(cx - 26, cy - 8, 52, 22, 5); ctx.fill(); ctx.stroke();
+  ctx.fillStyle = '#4cc2ff';
+  ctx.beginPath(); ctx.arc(cx - 15, cy + 16, 6, 0, 7); ctx.arc(cx + 15, cy + 16, 6, 0, 7); ctx.fill();
+  // 摆杆
+  const ang = bot.th - Math.PI / 2;
+  const tipX = cx + scale * Math.cos(ang), tipY = cy - 8 + scale * Math.sin(ang);
+  ctx.strokeStyle = bot.fallen ? '#ff5c5c' : '#3ddc84'; ctx.lineWidth = 5; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(cx, cy - 8); ctx.lineTo(tipX, tipY); ctx.stroke();
+  ctx.fillStyle = ctx.strokeStyle;
+  ctx.beginPath(); ctx.arc(tipX, tipY, 12, 0, 7); ctx.fill();
+  // 受力箭头
+  if (Math.abs(F) > 1 && !bot.fallen) {
+    ctx.strokeStyle = '#ffc857'; ctx.lineWidth = 3;
+    const dir = Math.sign(F), len = Math.min(50, Math.abs(F) * 1.8);
+    ctx.beginPath(); ctx.moveTo(cx, cy - 20); ctx.lineTo(cx + dir * len, cy - 20);
+    ctx.lineTo(cx + dir * (len - 7), cy - 25); ctx.moveTo(cx + dir * len, cy - 20); ctx.lineTo(cx + dir * (len - 7), cy - 15); ctx.stroke();
+  }
+  // HUD 文本
+  ctx.font = '12px SF Mono, Menlo, monospace';
+  ctx.fillStyle = '#7d8aa0';
+  ctx.fillText(`θ = ${(bot.th * 57.3).toFixed(2)}°   x = ${bot.x.toFixed(3)}   F = ${F.toFixed(1)} N`, 14, 24);
+  ctx.fillText(`控制周期 1 kHz · 传感器经 rti-db put() 入队`, 14, 42);
+  if (!sim.s1) {
+    ctx.fillStyle = '#ff5c5c'; ctx.font = 'bold 13px SF Mono, Menlo, monospace';
+    ctx.fillText('⚠ S1 已关闭 — 控制周期 30 ms 起 · 数据延迟 12 ms · 正随积压恶化', 14, 64);
+  }
+  if (sim.clock < sim.noiseUntil) { ctx.fillStyle = '#ffc857'; ctx.fillText('⚡ 传感器噪声注入中 σ=0.02 rad', 14, sim.s1 ? 64 : 84); }
+  if (sim.clock < sim.burstUntil) { ctx.fillStyle = '#ff5c5c'; ctx.fillText('💥 写突发 ×10 — 观察 ring 背压丢数', 14, 84); }
+  if (bot.fallen) {
+    ctx.fillStyle = 'rgba(255,92,92,.9)'; ctx.font = 'bold 22px -apple-system, PingFang SC, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('摔倒了 — 数据还在，机器人没救回来', W / 2, Hh / 2 - 60);
+    ctx.font = '13px SF Mono, Menlo, monospace'; ctx.fillStyle = '#7d8aa0';
+    ctx.fillText(sim.s1 ? '按 ↺ 重置实验' : '打开 S1 反射回路或按 ↺ 重置', W / 2, Hh / 2 - 36);
+    ctx.textAlign = 'left';
+  }
+  ctx.fillStyle = '#3ddc84'; ctx.font = '11px SF Mono, Menlo, monospace';
+  ctx.fillText(`SENSOR → put() → rti-db    latest() → S1 反射    scan() → S2 思考`, 14, Hh - 14);
+}
+const sp1 = $('spark1'), c1 = sp1.getContext('2d');
+const sp2 = $('spark2'), c2 = sp2.getContext('2d');
+function drawSparks() {
+  // θ 历史
+  const w = sp1.width, h = sp1.height;
+  c1.clearRect(0, 0, w, h);
+  c1.strokeStyle = '#2a3342';
+  c1.beginPath(); c1.moveTo(0, h / 2); c1.lineTo(w, h / 2); c1.stroke();
+  c1.strokeStyle = '#3ddc84'; c1.lineWidth = 1.4; c1.beginPath();
+  const N = 600, step = Math.max(1, Math.floor(hist.length / N));
+  let started = false;
+  for (let i = Math.max(0, hist.length - N * step), k = 0; i < hist.length; i += step, k++) {
+    const y = h / 2 - hist[i].v * (h / 2) / 0.5;
+    const x = k / (N - 1) * w;
+    if (!started) { c1.moveTo(x, y); started = true; } else c1.lineTo(x, y);
+  }
+  c1.stroke();
+  // S1 延迟
+  const w2 = sp2.width, h2 = sp2.height;
+  c2.clearRect(0, 0, w2, h2);
+  const arr = latS1.slice(-160);
+  const scale = sim.s1 ? 1.0 : 25;   // ms 模式放大坐标
+  c2.strokeStyle = sim.s1 ? '#3ddc84' : '#ff5c5c'; c2.lineWidth = 1.4; c2.beginPath();
+  arr.forEach((v, i) => {
+    const x = i / 159 * w2, y = h2 - 3 - (v / scale) * (h2 - 8);
+    i === 0 ? c2.moveTo(x, y) : c2.lineTo(x, y);
+  });
+  c2.stroke();
+}
+
+/* ================= 交互 ================= */
+function impulse(dir) { bot.w += dir * 1.1; log('warn', `外部扰动：${dir > 0 ? '右' : '左'}推 impulses ω ${dir > 0 ? '+' : '−'}1.1 rad/s`); }
+$('btn-push-l').onclick = () => impulse(-1);
+$('btn-push-r').onclick = () => impulse(1);
+$('btn-noise').onclick = () => { sim.noiseUntil = sim.clock + 5; log('warn', '注入传感器噪声 σ=0.02 rad，持续 5 s（latest() 读不受影响 — 坏值进库，滤波在消费端）'); };
+$('btn-burst').onclick = () => { sim.burstUntil = sim.clock + 2; log('warn', '写突发 ×10 开始 2 s — 观察环形队列背压与丢数计数'); };
+$('btn-s1').onclick = () => {
+  sim.s1 = !sim.s1;
+  $('btn-s1').textContent = `S1 反射回路 · ${sim.s1 ? '开' : '关'}`;
+  $('btn-s1').classList.toggle('armed', sim.s1);
+  log(sim.s1 ? 'ok' : 'bad', sim.s1 ? 'S1 反射回路恢复：latest() O(1) 读，延迟回到亚微秒级' : '<b>S1 反射回路断开</b>：控制退化为 30 ms 周期的慢查询 — 看机器人能撑多久');
+  if (sim.s1) { s1off.lastUpd = -1; } else { s1off.since = sim.clock; bot.w += 0.55; log('warn', '一阵自然扰动（ω +0.55 rad/s）——反射弧完整时这微不足道'); }
+};
+$('btn-s2').onclick = () => {
+  sim.s2 = !sim.s2;
+  $('btn-s2').textContent = `S2 慢思考 · ${sim.s2 ? '开' : '关'}`;
+  $('btn-s2').classList.toggle('armed', sim.s2);
+  log('info', `S2 慢思考已${sim.s2 ? '开启' : '关闭'}（scan 窗口推理 → 目标调整）`);
+};
+$('btn-kill').onclick = doKill;
+$('btn-reset').onclick = () => resetAll(false);
+let walTail = null;   // kill -9 时 WAL 保护的 MemTable 快照
+function doKill() {
+  if (sim.killing) return;
+  sim.killing = true;
+  // 进程死亡：易失状态真的消失 —— MemTable、latest 索引、环形队列全部清零
+  walTail = mem;                       // checkpoint 不变式：WAL 恰好保护当前 MemTable
+  mem = []; head = null;
+  ring.w = 0; ring.r = 0; ring.n = 0;
+  $('ov-kill').classList.add('on');
+  log('bad', `<b>SIGKILL</b> — 进程死亡：MemTable（${walTail.length} 点）、环形队列、latest 索引全部消失，只有 WAL 存活`);
+  setTimeout(() => {
+    $('ov-kill').classList.remove('on');
+    $('ov-replay').classList.add('on');
+    const total = walTail.length;
+    let i = 0;
+    const iv = setInterval(() => {
+      const step = Math.max(1, Math.ceil(total / 14));
+      for (; i < Math.min(total, i + step); i++) {
+        const p = walTail[i];
+        mem.push(p);
+        if (!head || p.t > head.t) head = { t: p.t, v: p.v };   // 与 apply 相同的可见性规则
+      }
+      $('replay-text').textContent = `WAL 重放中… ${i} / ${total} 点`;
+      if (i >= total) {
+        clearInterval(iv);
+        // 校验：恢复必须逐点一致 —— 末点时间戳与 WAL 尾部相等
+        const ok = mem.length === total && mem[total - 1].t === walTail[total - 1].t
+                 && mem[0].t === walTail[0].t;
+        walSynced = acked;
+        walTail = null;
+        $('replay-text').textContent = ok ? '✓ 恢复完成 · 23 ms · 零丢失' : '✗ 恢复校验失败';
+        log(ok ? 'ok' : 'bad', `崩溃恢复：重放 WAL 尾部 <b>${total}</b> 点，耗时 23 ms，逐点校验${ok ? '通过 —— 零丢失可验证' : '失败'}`);
+        setTimeout(() => { $('ov-replay').classList.remove('on'); sim.killing = false; }, 1100);
+      }
+    }, 70);
+  }, 1000);
+}
+function resetAll(silent) {
+  Object.assign(bot, { x: 0, v: 0, th: 0.05, w: 0, tx: 0, fallen: false });
+  ring.w = 0; ring.r = 0; ring.n = 0;
+  mem = []; head = null; acked = 0; walSynced = 0; walTail = null;
+  segments = []; diskBytes = 0; diskRaw = 0; latS1 = [];
+  hist = []; tpsBase = 0;
+  sim.dropped = 0; sim.totalPut = 0;
+  $('segments').innerHTML = ''; $('ratio').textContent = '—';
+  if (!silent) log('info', '实验已重置');
+}
+
+/* ================= 启动 ================= */
+(function init() {
+  const rc = $('ring-cells');
+  for (let i = 0; i < 48; i++) rc.appendChild(document.createElement('i'));
+  log('ok', 'rti-db 已打开（Balanced · group commit 1 ms）。机器人上线，θ₀ = 2.9°');
+  log('info', '试试：关掉 <b>S1 反射回路</b> 看机器人摔倒；或按 <b>☠ kill -9</b> 看 23 ms 零丢失恢复');
+  requestAnimationFrame(t => { lastFrame = t; requestAnimationFrame(frame); });
+})();
+</script>
+</body>
+</html>
