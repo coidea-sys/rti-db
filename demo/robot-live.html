@@ -137,7 +137,26 @@
     </div>
   </div>
 
-  <div class="panel" style="grid-column: 2; grid-row: 2;">
+  <div class="panel" style="grid-column: 2;" id="challenge-panel">
+    <h3>挑战 · 饱和 Torture 下的零丢失 Episode（全部真实，判决由引擎 scan 得出）</h3>
+    <div style="font-size:12px;color:var(--dim);margin-bottom:10px;line-height:1.7">
+      16 通道多速率真实写入（6 关节 1 kHz · 6 力/力矩 4 kHz · 3 IMU 2 kHz · 摆杆 1 kHz，~37k pts/s）<br>
+      三重 torture：全通道 ×10 写压 + 3 个并发全量回放客户端 + 随机时刻真实 kill -9
+    </div>
+    <div class="controls" style="margin-top:0">
+      <button id="btn-challenge" class="primary" style="border-color:var(--purple);color:var(--purple)" onclick="startChallenge()">▶ 开始挑战</button>
+      <span class="mono" id="ch-status" style="align-self:center;color:var(--dim)"></span>
+    </div>
+    <div id="verdict" style="margin-top:12px;display:none"></div>
+    <div style="margin-top:12px;font-size:11px;color:var(--dim);font-family:var(--mono);line-height:1.7;border-top:1px solid var(--border);padding-top:8px">
+      领域基线（已发表实测）：ros2 工具链 1 kHz 饱和丢 8.6–16.9%（ros2probe, arXiv 2606.10746）·
+      rosbag2 大分片每 10 分钟静默丢 1 分钟（issue #2108）·
+      崩溃标准答案 = 丢当前打开的 bag chunk（官方文档）·
+      rosbag2 丢失可观测性 2026 年 5 月才加入（Lyrical Luth）
+    </div>
+  </div>
+
+  <div class="panel" style="grid-column: 2;">
     <h3>事件日志</h3>
     <div id="log"></div>
   </div>
@@ -220,6 +239,115 @@ async function waitRevive() {
         return;
       }
     } catch (e) { /* 还没起来 */ }
+  }
+}
+
+/* ================= 挑战模式 ================= */
+let ch = null;   // {t0, killAt, stopped, digest}
+async function startChallenge() {
+  if (ch) return;
+  await post('/episode/start');
+  let st;
+  try { st = await (await fetch(API + '/episode/status')).json(); } catch (e) { return; }
+  ch = { t0: st.t0, t0wall: Date.now(), killed: false, revived: false, done: false };
+  $('btn-challenge').disabled = true;
+  $('verdict').style.display = 'none';
+  log('info', '<b>挑战开始</b>：16 通道 37k pts/s 额定负载写入中，episode 元数据已写入引擎（series 999）');
+  const later = (ms, fn) => setTimeout(fn, ms);
+  later(2000, () => { post('/torture?replay=3&sec=12'); log('warn', 'torture 1/3：3 个并发全量回放客户端启动（真实 scan 竞争）'); });
+  later(4000, () => { post('/burst?sec=3'); log('warn', 'torture 2/3：全通道 ×10 写入压测 3 s'); });
+  ch.killAt = 6000 + Math.random() * 2000;
+  later(ch.killAt, () => challengeKill());
+  later(15000, () => challengeStop());
+  ch.tick = setInterval(challengeTick, 500);
+}
+async function challengeKill() {
+  if (!ch || ch.killed) return;
+  ch.killed = true;
+  $('ov-kill').classList.add('on');
+  log('bad', '<b>SIGKILL</b> — 真实终止进程（episode 进行中！）');
+  try { await fetch(API + '/crash', { method: 'POST' }); } catch (e) {}
+  // 等复活：episode 状态存在引擎里，新进程自动恢复
+  const iv = setInterval(async () => {
+    try {
+      const r = await fetch(API + '/episode/status');
+      if (r.ok) {
+        clearInterval(iv);
+        ch.revived = true;
+        $('ov-kill').classList.remove('on');
+        log('ok', '进程已复活 —— episode 窗口从引擎内的标记通道恢复（kill 杀不掉存在 DB 里的元数据）');
+      }
+    } catch (e) {}
+  }, 250);
+}
+async function challengeStop() {
+  if (!ch || ch.done) return;
+  ch.done = true;
+  clearInterval(ch.tick);
+  let d = null;
+  for (let i = 0; i < 20 && !d; i++) {
+    try {
+      const r = await fetch(API + '/episode/stop', { method: 'POST' });
+      if (r.ok) d = await r.json();
+      else if (r.status === 404) break;
+    } catch (e) {}
+    if (!d) await new Promise(r => setTimeout(r, 500));
+  }
+  if (!d) { log('bad', '判决失败：episode 不可用'); $('btn-challenge').disabled = false; ch = null; return; }
+  ch.digest = d.digest;
+  renderVerdict(d);
+  $('btn-challenge').disabled = false;
+  ch = null;
+}
+async function challengeTick() {
+  if (!ch || ch.done) return;
+  try {
+    const s = await (await fetch(API + '/state')).json();
+    const el = ((Date.now() - ch.t0wall) / 1000).toFixed(0);
+    $('ch-status').textContent =
+      `进行中 ${el}s · 回放客户端 ${s.replay_clients}（最差 ${s.replay_worst_ms.toFixed(1)} ms）· ` +
+      `额定丢数 ${s.w_drop_rated} · 压测丢数 ${s.w_drop_tort}` +
+      (ch.killed ? (ch.revived ? ' · 已 kill -9 并复活 ✓' : ' · 进程已死，等待复活…') : '');
+  } catch (e) {
+    $('ch-status').textContent = '进程已死，等待 supervisor 重启…';
+  }
+}
+function renderVerdict(d) {
+  const v = $('verdict');
+  v.style.display = 'block';
+  const pass = d.pass;
+  const rows = d.series.map(r =>
+    `<tr><td>${r.series}</td><td>${r.rate.toFixed(0)} Hz</td><td>${r.expected.toLocaleString()}</td>` +
+    `<td>${r.actual.toLocaleString()}</td><td>${r.interrupt > 0 ? r.interrupt + ' 次' : '—'}</td>` +
+    `<td style="color:${r.ok ? 'var(--green)' : 'var(--red)'}">${r.ok ? '✓' : '✗'}</td></tr>`).join('');
+  v.innerHTML = `
+    <div style="font-family:var(--mono);font-size:13px;padding:10px 14px;border-radius:8px;margin-bottom:10px;
+      background:${pass ? 'rgba(61,220,132,.1)' : 'rgba(255,92,92,.1)'};border:1px solid ${pass ? 'var(--green)' : 'var(--red)'};
+      color:${pass ? 'var(--green)' : 'var(--red)'}">
+      ${pass ? '✓ 挑战通过' : '✗ 挑战失败'} — ${(d.duration_ms / 1000).toFixed(1)} s · ${d.total.toLocaleString()} 点 ·
+      额定丢数 ${d.dropped_rated} · 压测丢数 ${d.dropped_torture}
+    </div>
+    <table style="width:100%;border-collapse:collapse;font-family:var(--mono);font-size:11px;color:var(--dim)">
+      <tr style="color:var(--text)"><td>series</td><td>速率</td><td>期望</td><td>实测(scan)</td><td>中断</td><td>判定</td></tr>
+      ${rows}
+    </table>
+    <div style="font-family:var(--mono);font-size:11px;margin-top:8px;color:var(--dim)">
+      全窗口 digest（FNV-1a，真实 scan 计算）：<span style="color:var(--blue)">${d.digest}</span>
+      <button style="margin-left:10px;font-size:11px;padding:3px 10px" onclick="reverify('${d.digest}')">kill -9 后再校验</button>
+      <span id="reverify-result" style="margin-left:8px"></span>
+    </div>`;
+  log(pass ? 'ok' : 'bad', `<b>判决：${pass ? 'PASS' : 'FAIL'}</b> — ${d.total.toLocaleString()} 点，额定丢数 ${d.dropped_rated}，digest ${d.digest.slice(0, 12)}…`);
+}
+async function reverify(expect) {
+  try {
+    const v = await (await fetch(API + '/verify')).json();
+    const ok = v.digest === expect;
+    $('reverify-result').innerHTML = ok
+      ? '<span style="color:var(--green)">✓ 重扫 digest 一致 —— kill -9 + WAL 重放后逐字节可复现</span>'
+      : '<span style="color:var(--red)">✗ digest 不一致</span>';
+    log(ok ? 'ok' : 'bad', `重校验：${ok ? 'digest 一致，零丢失可复现' : 'digest 不一致！'}`);
+  } catch (e) {
+    $('reverify-result').innerHTML = '<span style="color:var(--yellow)">（先等 episode 关闭 / 服务可用）</span>';
   }
 }
 
