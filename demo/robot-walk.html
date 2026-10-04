@@ -277,58 +277,97 @@ function hud(margin) {
   $('p-replay').textContent = s.rc > 0 ? `${s.rc} 客户端 · ${s.rq.toLocaleString()} 次 · 最差 ${s.rw.toFixed(1)} ms` : '—';
 }
 
-/* ---- 画布：侧视双足 ---- */
+/* ---- 画布：结构火柴人（髋-膝-踝双段腿 + 摆臂） ---- */
 const cv = $('cv'), ctx = cv.getContext('2d');
-const ZC = 0.85, SCALE = 220, GY = 320;      // 地面 y
-function wx(x) { return 90 + x * SCALE; }     // 世界→屏幕（跟随相机：以 x 为视口中心附近的 S.x）
-function wy(z) { return GY - z * SCALE; }
+const ZC = 0.85, SCALE = 195, GY = 338;
 function draw() {
   requestAnimationFrame(draw);
   const W = cv.width, Hh = cv.height;
   ctx.clearRect(0, 0, W, Hh);
-  const s = S || { x: 0, vx: 0, p: 0, swing: false, fallen: false, steps: 0 };
+  const s = S || { x: 0, vx: 0, p: 0, pfrom: 0, ptgt: 0, tsw: 0, swing: false, fallen: false, steps: 0 };
   const cam = s.x;
+  const X = wx => 90 + (wx - cam) * SCALE;
+  const Y = wz => GY - wz * SCALE;
   // 地面
   ctx.strokeStyle = '#2a3342'; ctx.lineWidth = 2;
   ctx.beginPath(); ctx.moveTo(0, GY); ctx.lineTo(W, GY); ctx.stroke();
-  for (let gx = Math.floor((cam - 1)); gx < cam + 2.5; gx += 0.5) {
-    const px = wx(gx) - cam * SCALE;
+  for (let gx = Math.floor(cam - 1); gx < cam + 2.5; gx += 0.5) {
     ctx.strokeStyle = '#1c2431';
-    ctx.beginPath(); ctx.moveTo(px, GY); ctx.lineTo(px, GY + 8); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(X(gx), GY); ctx.lineTo(X(gx), GY + 8); ctx.stroke();
   }
-  const cx = W / 2 + (s.x - cam) * SCALE;
-  const hipY = wy(ZC);
-  const leg = (footX, color, width) => {
-    const fx = wx(footX) - cam * SCALE;
-    ctx.strokeStyle = color; ctx.lineWidth = width; ctx.lineCap = 'round';
-    ctx.beginPath(); ctx.moveTo(cx, hipY); ctx.lineTo(fx, GY); ctx.stroke();
-    ctx.fillStyle = color;
-    ctx.beginPath(); ctx.arc(fx, GY, 5, 0, 7); ctx.fill();
+  const hip = { x: X(s.x), y: Y(ZC) };
+  const sh  = { x: hip.x, y: Y(ZC + 0.48) };        // 肩
+  const hed = { x: hip.x, y: Y(ZC + 0.66) };        // 头心
+  const margin = Math.abs(s.x - s.p);
+  const danger = margin > 0.2;
+
+  // 双足位置：支撑足在 p；摆动足沿 pfrom→ptgt 带抬升弧线
+  const T_SW = 0.15;
+  const prog = s.swing ? Math.min(s.tsw / T_SW, 1) : 0;
+  const supF = { x: X(s.p), y: GY };
+  const swf = s.swing
+    ? { x: X(s.pfrom + (s.ptgt - s.pfrom) * prog), y: GY - 0.10 * SCALE * Math.sin(Math.PI * prog) }
+    : { x: X(s.p), y: GY };
+
+  // 腿：髋→膝→踝（等长大腿小腿，膝后弯）
+  const leg = (foot, isSupport) => {
+    const dx = foot.x - hip.x, dy = foot.y - hip.y;
+    const d = Math.hypot(dx, dy);
+    const T = 0.47;                                    // 大腿=小腿=0.47（最大触达 0.94 > 0.85）
+    const h = Math.sqrt(Math.max(T * T - (d / 2) * (d / 2), 0.0004));
+    const mx = hip.x + dx / 2, my = hip.y + dy / 2;
+    // 膝朝行进反方向凸：法向 n=(-dy/d, dx/d)，腿朝下时指向 -x（后侧）
+    const nx = -dy / d, ny = dx / d;
+    const knee = { x: mx + nx * h, y: my + ny * h };
+    ctx.strokeStyle = isSupport ? (danger ? '#ff5c5c' : '#3ddc84') : '#ffc857';
+    ctx.lineWidth = 4; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    ctx.beginPath(); ctx.moveTo(hip.x, hip.y); ctx.lineTo(knee.x, knee.y); ctx.lineTo(foot.x, foot.y); ctx.stroke();
+    // 足
+    ctx.fillStyle = ctx.strokeStyle;
+    ctx.beginPath(); ctx.ellipse(foot.x + 5, foot.y - 2, 8, 3, 0, 0, 7); ctx.fill();
   };
-  // 摆动腿（向前伸的浅色腿）与支撑腿
-  const swX = s.swing ? s.p : s.p;
-  leg(s.p, s.swing ? '#3a4a5f' : '#3ddc84', s.swing ? 3 : 5);
-  if (s.swing) leg(s.p + 0.25, '#ffc857', 3);
-  // 躯干
-  ctx.fillStyle = s.fallen ? '#3d1518' : '#1c2a3d';
-  ctx.strokeStyle = s.fallen ? '#ff5c5c' : '#4cc2ff'; ctx.lineWidth = 2;
-  ctx.beginPath(); ctx.roundRect(cx - 14, hipY - 46, 28, 46, 6); ctx.fill(); ctx.stroke();
+  // 先画摆动腿（后层），再画支撑腿（前层）
+  if (s.swing) leg(swf, false);
+  leg(supF, true);
+  if (!s.swing) leg(swf, true);
+
+  // 躯干（脊柱）+ 骨盆
+  ctx.strokeStyle = s.fallen ? '#ff5c5c' : '#4cc2ff'; ctx.lineWidth = 4; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(hip.x, hip.y); ctx.lineTo(sh.x, sh.y); ctx.stroke();
+  ctx.fillStyle = '#4cc2ff';
+  ctx.beginPath(); ctx.arc(hip.x, hip.y, 5, 0, 7); ctx.fill();
   // 头
-  ctx.beginPath(); ctx.arc(cx, hipY - 56, 9, 0, 7); ctx.fill(); ctx.stroke();
-  // CoM 标记
+  ctx.beginPath(); ctx.arc(hed.x, hed.y, 10, 0, 7); ctx.stroke();
+
+  // 双臂：支撑侧臂前摆、摆动侧臂后摆（对角摆动）
+  const arm = (dir, a) => {
+    // a：与竖直方向的偏角（rad），dir：前后镜像
+    const ex = sh.x + dir * Math.sin(a) * 0.22 * SCALE;
+    const ey = sh.y + Math.cos(a) * 0.22 * SCALE;
+    const hx = ex + dir * Math.sin(a + 0.6) * 0.20 * SCALE;
+    const hy = ey + Math.cos(a + 0.6) * 0.20 * SCALE;
+    ctx.strokeStyle = '#8fa3bf'; ctx.lineWidth = 3; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(sh.x, sh.y); ctx.lineTo(ex, ey); ctx.lineTo(hx, hy); ctx.stroke();
+  };
+  // 对角摆臂：与摆动腿相反
+  const swA = s.swing ? 0.45 * Math.sin(Math.PI * prog) : 0;
+  arm(-1, 0.30 + swA);   // 支撑侧臂前摆
+  arm(1, 0.30 - swA);    // 摆动侧臂后摆
+
+  // CoM 标记（髋部绿点）+ 捕获点
   ctx.fillStyle = '#3ddc84';
-  ctx.beginPath(); ctx.arc(cx, hipY - 20, 4, 0, 7); ctx.fill();
-  // 捕获点
+  ctx.beginPath(); ctx.arc(hip.x, hip.y - 14, 3.5, 0, 7); ctx.fill();
   const xc = s.x + s.vx / 3.3995;
-  ctx.strokeStyle = '#b78cff'; ctx.setLineDash([3, 3]);
-  ctx.beginPath(); ctx.moveTo(wx(xc) - cam * SCALE, GY - 10); ctx.lineTo(wx(xc) - cam * SCALE, GY); ctx.stroke();
+  ctx.strokeStyle = '#b78cff'; ctx.setLineDash([3, 3]); ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(X(xc), GY - 12); ctx.lineTo(X(xc), GY); ctx.stroke();
   ctx.setLineDash([]);
   ctx.fillStyle = '#b78cff'; ctx.font = '10px SF Mono, Menlo, monospace';
-  ctx.fillText('捕获点', wx(xc) - cam * SCALE - 14, GY - 14);
+  ctx.fillText('捕获点', X(xc) - 14, GY - 16);
+
   // 文字
   ctx.font = '12px SF Mono, Menlo, monospace';
   ctx.fillStyle = '#7d8aa0';
-  ctx.fillText(`x=${s.x.toFixed(2)}  vx=${s.vx.toFixed(2)}  ${s.swing ? '摆动相' : '支撑相'}  步数 ${s.steps}`, 14, 24);
+  ctx.fillText(`x=${s.x.toFixed(2)}  vx=${s.vx.toFixed(2)}  ${s.swing ? '摆动相 ' + (prog * 100).toFixed(0) + '%' : '支撑相'}  步数 ${s.steps}`, 14, 24);
   ctx.fillText('LIPM ẍ=λ²(x−p) · 捕获点落脚 · 支撑裕度 |x−p| ≤ 0.30', 14, 42);
   if (s.fallen) {
     ctx.fillStyle = 'rgba(255,92,92,.9)'; ctx.font = 'bold 20px -apple-system, PingFang SC, sans-serif';
@@ -337,7 +376,7 @@ function draw() {
     ctx.textAlign = 'left';
   }
   if (lane === 'slow') { ctx.fillStyle = '#ffc857'; ctx.fillText('⚠ S1 断开：200 ms 慢查询 + 无紧急重踏', 14, 64); }
-  drawSpark($('spark1'), marginHist, v => v, 0.3, marginHist[marginHist.length-1] > 0.2 ? '#ffc857' : '#3ddc84');
+  drawSpark($('spark1'), marginHist, v => v, 0.3, marginHist.length && marginHist[marginHist.length - 1] > 0.2 ? '#ffc857' : '#3ddc84');
   drawSpark($('spark2'), latHist, v => v, 1.0, '#3ddc84');
 }
 function drawSpark(cnv, arr, f, scale, color) {

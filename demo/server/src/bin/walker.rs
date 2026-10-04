@@ -51,7 +51,6 @@ struct WState {
     acc_rated: u64, drop_rated: u64, acc_tort: u64, drop_tort: u64,
     episode_active: bool, episode_t0: i64,
     replay_clients: u32, replay_queries: u64, replay_worst_ms: f64,
-    burst_on: bool,
 }
 
 struct WFlags {
@@ -337,11 +336,12 @@ fn handle(s: &mut TcpStream, db: &Arc<Db>, st: &Arc<Mutex<WState>>, f: &Arc<WFla
         ("GET", "/state") => {
             let g = st.lock().unwrap();
             let body = format!(
-                "{{\"t\":{:.1},\"x\":{:.4},\"vx\":{:.3},\"p\":{:.4},\"swing\":{},\"fallen\":{},\"steps\":{},\"xd\":{:.2},\
+                "{{\"t\":{:.1},\"x\":{:.4},\"vx\":{:.3},\"p\":{:.4},\"pfrom\":{:.4},\"ptgt\":{:.4},\"tsw\":{:.3},\"swing\":{},\"fallen\":{},\"steps\":{},\"xd\":{:.2},\
                  \"slow\":{},\"s2\":{},\"p50\":{:.4},\"p99\":{:.4},\"p999\":{:.4},\"scan_ms\":{:.2},\"s2_ms\":{:.2},\
                  \"w_acc_r\":{},\"w_drop_r\":{},\"w_acc_t\":{},\"w_drop_t\":{},\"ep\":{},\"ep_t0\":{},\
                  \"rc\":{},\"rq\":{},\"rw\":{:.2},\"wm\":{},\"segs\":{}}}",
-                g.clock, g.x, g.vx, g.p, g.phase_swing, g.fallen, g.steps, g.x_d,
+                g.clock, g.x, g.vx, g.p, g.p_from, g.p_target, if g.phase_swing { g.t_sw } else { 0.0 },
+                g.phase_swing, g.fallen, g.steps, g.x_d,
                 g.slow, g.s2_on, pct(&g.lat_us, 0.5), pct(&g.lat_us, 0.99), pct(&g.lat_us, 0.999),
                 g.scan_ms, g.s2_ms,
                 g.acc_rated, g.drop_rated, g.acc_tort, g.drop_tort,
