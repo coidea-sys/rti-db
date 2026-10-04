@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>行走反射 · LIVE — LIPM 双足行走 × 真实 rti-db</title>
+<style>
+  :root {
+    --bg: #0a0e14; --panel: #11161f; --panel2: #171e2a; --border: #2a3342;
+    --text: #dbe4f0; --dim: #7d8aa0;
+    --green: #3ddc84; --red: #ff5c5c; --yellow: #ffc857; --blue: #4cc2ff; --purple: #b78cff;
+    --mono: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: -apple-system, "PingFang SC", sans-serif; overflow-x: hidden; }
+  header { padding: 22px 28px 14px; display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; border-bottom: 1px solid var(--border); }
+  header h1 { font-size: 21px; font-weight: 800; }
+  header h1 .live { color: var(--red); font-family: var(--mono); font-size: 14px; vertical-align: 3px; }
+  header h1 .us { color: var(--green); }
+  header .tag { color: var(--dim); font-size: 13px; }
+  header .real { font-family: var(--mono); font-size: 11px; color: var(--green); border: 1px solid var(--green); border-radius: 4px; padding: 2px 8px; }
+  .layout { display: grid; grid-template-columns: 620px 1fr; gap: 14px; padding: 14px; max-width: 1400px; margin: 0 auto; }
+  @media (max-width: 1080px) { .layout { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 14px; }
+  .panel h3 { font-size: 12px; color: var(--dim); font-family: var(--mono); font-weight: 500; margin-bottom: 10px; letter-spacing: 1px; }
+  #robot-panel { grid-row: span 2; }
+  #robot-wrap { position: relative; }
+  canvas#cv { display: block; width: 100%; border-radius: 8px; background: linear-gradient(180deg,#0d1420 0%,#0a0f18 100%); }
+  .overlay-msg { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; flex-direction: column; gap: 10px; background: rgba(10,14,20,.78); border-radius: 8px; z-index: 5; }
+  .overlay-msg.on { display: flex; }
+  .overlay-msg .big { font-size: 30px; font-weight: 800; font-family: var(--mono); }
+  .overlay-msg .small { color: var(--dim); font-size: 13px; }
+  .overlay-msg.kill .big { color: var(--red); text-shadow: 0 0 24px rgba(255,92,92,.6); }
+  .overlay-msg.replay .big { color: var(--blue); }
+  .offline { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; flex-direction: column; gap: 12px; background: rgba(10,14,20,.92); border-radius: 8px; z-index: 6; text-align: center; padding: 20px; }
+  .offline.on { display: flex; }
+  .offline .big { color: var(--red); font-size: 20px; font-weight: 700; }
+  .offline .code { font-family: var(--mono); font-size: 12px; color: var(--blue); background: #0a0e14; border: 1px solid var(--border); border-radius: 6px; padding: 8px 14px; }
+  .controls { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+  .controls .sep { width: 1px; background: var(--border); margin: 4px 2px; }
+  button { font-family: inherit; font-size: 12.5px; cursor: pointer; background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 7px 13px; transition: all .15s; }
+  button:hover:not(:disabled) { border-color: var(--blue); }
+  button:disabled { opacity: .35; cursor: default; }
+  button.danger { border-color: var(--red); color: var(--red); }
+  button.arm { border-color: var(--green); color: var(--green); }
+  button.armed { background: rgba(61,220,132,.15); box-shadow: 0 0 10px rgba(61,220,132,.25); }
+  button.arm.slowmode { border-color: var(--yellow); color: var(--yellow); background: rgba(255,200,87,.12); }
+  .hud-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .gauge { background: var(--panel2); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; position: relative; overflow: hidden; }
+  .gauge .g-label { font-size: 10.5px; color: var(--dim); font-family: var(--mono); }
+  .gauge .g-value { font-family: var(--mono); font-size: 24px; font-weight: 700; margin-top: 2px; }
+  .gauge .g-value .unit { font-size: 12px; color: var(--dim); font-weight: 400; }
+  .gauge .g-sub { font-size: 10.5px; color: var(--dim); font-family: var(--mono); margin-top: 3px; }
+  .gauge.s1 .g-value { color: var(--green); }
+  .gauge.s2 .g-value { color: var(--purple); }
+  .gauge.warn .g-value { color: var(--red); }
+  .pipe { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 14px; font-family: var(--mono); font-size: 12px; }
+  .pipe .k { color: var(--dim); } .pipe .v { text-align: right; color: var(--text); }
+  .pipe .v b { color: var(--green); } .pipe .v b.bad { color: var(--red); }
+  .spark-row { display: flex; gap: 10px; margin-top: 10px; }
+  .spark-box { flex: 1; }
+  .spark-box .s-label { font-size: 10px; color: var(--dim); font-family: var(--mono); margin-bottom: 3px; }
+  canvas.spark { width: 100%; height: 44px; background: #0a0e14; border: 1px solid var(--border); border-radius: 6px; display: block; }
+  #thought { display: none; position: absolute; right: 10px; top: 10px; max-width: 260px; z-index: 4; background: rgba(23,30,42,.95); border: 1px solid var(--purple); border-radius: 12px; padding: 10px 13px; font-size: 12px; box-shadow: 0 4px 24px rgba(0,0,0,.5); }
+  #thought.on { display: block; }
+  #thought .t-title { color: var(--purple); font-family: var(--mono); font-size: 10.5px; margin-bottom: 4px; }
+  #log { font-family: var(--mono); font-size: 11px; line-height: 1.8; height: 120px; overflow-y: auto; color: var(--dim); }
+  #log div b { color: var(--text); font-weight: 500; }
+  #log .lg-ok b { color: var(--green); } #log .lg-warn b { color: var(--yellow); } #log .lg-bad b { color: var(--red); } #log .lg-info b { color: var(--blue); }
+  .foot { padding: 8px 28px 24px; color: var(--dim); font-size: 11px; font-family: var(--mono); max-width: 1400px; margin: 0 auto; line-height: 1.7; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>行走反射 <span class="live">● LIVE</span></h1>
+  <span class="tag">2D 线性倒立摆行走（Kajita LIPM + 捕获点落脚）· 真实 rti-db 数据面 · 全部实测</span>
+  <span class="real">物理真实 · 判决真实</span>
+</header>
+
+<div class="layout">
+  <div class="panel" id="robot-panel">
+    <h3>双足行走机器人 · 控制状态全部经真实 rti-db 读写（1 kHz）</h3>
+    <div id="robot-wrap">
+      <canvas id="cv" width="620" height="380"></canvas>
+      <div class="overlay-msg kill" id="ov-kill"><div class="big">✝ SIGKILL</div><div class="small">进程已死 —— 只有 WAL 字节留在磁盘上</div></div>
+      <div class="overlay-msg replay" id="ov-replay"><div class="big" id="replay-text">进程重启中…</div><div class="small">新进程打开同一 Db —— 真实 WAL 重放</div></div>
+      <div class="offline" id="ov-off">
+        <div class="big">后端未启动</div>
+        <div>在仓库目录运行：</div>
+        <div class="code">cd demo/server && sh -c 'while true; do ./target/release/walker 2>>walker.log; sleep 0.3; done'</div>
+      </div>
+      <div id="thought"><div class="t-title">S2 · 步态调节（真实 scan）</div><div class="t-body" id="thought-body"></div></div>
+    </div>
+    <div class="spark-row">
+      <div class="spark-box"><div class="s-label">稳定裕度 |x−p|（裕度越接近 0.30 越危险）</div><canvas class="spark" id="spark1" width="290" height="44"></canvas></div>
+      <div class="spark-box"><div class="s-label">latest() 实测延迟（µs）</div><canvas class="spark" id="spark2" width="290" height="44"></canvas></div>
+    </div>
+    <div class="controls">
+      <button onclick="post('/kick?w=-0.5')">⇠ 后推一下</button>
+      <button onclick="post('/kick?w=0.5')">前推一下 ⇢</button>
+      <button id="btn-push" class="arm" onclick="togglePush()">随机扰动 · 关</button>
+      <div class="sep"></div>
+      <button id="btn-lane" class="arm armed" onclick="toggleLane()">S1 行走反射 · 开</button>
+      <button id="btn-s2" class="arm armed" onclick="toggleS2()">S2 步态调节 · 开</button>
+      <div class="sep"></div>
+      <button class="danger" onclick="doCrash()">☠ kill -9</button>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h3>行走状态 · 全部实测</h3>
+    <div class="hud-grid">
+      <div class="gauge s1" id="g-s1">
+        <div class="g-label">S1 · Db::latest() 行走反射读（真实调用）</div>
+        <div class="g-value" id="v-s1">— <span class="unit">µs</span></div>
+        <div class="g-sub" id="v-s1-sub">等待数据…</div>
+      </div>
+      <div class="gauge s2" id="g-s2">
+        <div class="g-label">S2 · Db::scan() 速度窗口（真实调用）</div>
+        <div class="g-value" id="v-s2">— <span class="unit">ms</span></div>
+        <div class="g-sub" id="v-s2-sub">每 3 s 一次</div>
+      </div>
+      <div class="gauge">
+        <div class="g-label">行走速度（期望 <span id="v-xd">0.5</span> m/s）</div>
+        <div class="g-value" id="v-spd">— <span class="unit">m/s</span></div>
+        <div class="g-sub" id="v-steps">步数 —</div>
+      </div>
+      <div class="gauge" id="g-margin">
+        <div class="g-label">稳定裕度 |x−p|（0.30 = 摔倒线）</div>
+        <div class="g-value" id="v-margin">— <span class="unit">m</span></div>
+        <div class="g-sub">LIPM 支撑多边形约束</div>
+      </div>
+    </div>
+    <div style="margin-top:12px">
+      <h3>rti-db 引擎 · 真实计数器</h3>
+      <div class="pipe">
+        <span class="k">durable watermark</span><span class="v" id="p-wm">—</span>
+        <span class="k">列式段数量</span><span class="v" id="p-segs">—</span>
+        <span class="k">额定丢数 / 压测丢数</span><span class="v" id="p-drop">—</span>
+        <span class="k">慢路径查询（实测）</span><span class="v" id="p-scan">—</span>
+        <span class="k">回放 torture（3 客户端时）</span><span class="v" id="p-replay">—</span>
+        <span class="k">控制环周期</span><span class="v">1 kHz（真实节拍）</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel" style="grid-column: 2;">
+    <h3>事件日志</h3>
+    <div id="log"></div>
+  </div>
+</div>
+
+<div class="foot">
+  物理：2D 线性倒立摆（Kajita LIPM）ẍ = λ²(x−p)，λ=√(g/zc)，捕获点 x<sub>c</sub> = x + ẋ/λ 落脚；
+  S1 断开 = 控制状态来自 200 ms 一拍的 scan 慢查询（数据陈旧 + 触发阈值放宽），且失去紧急重踏反射。<br>
+  全部数字实测：latest()/scan() 由服务端计时；kill -9 为真实 exit(9)，episode 判决由引擎 scan 得出。
+  对照基线：人形机器人平衡控制的标准解法即捕获点/CoP 判据（Kajita et al. 2003；Vukobratović CoP 准则）。
+</div>
+
+<script>
+'use strict';
+const $ = id => document.getElementById('id'.length ? id : id);
+const API = 'http://127.0.0.1:8792';
+let S = null, lane = 'fast', s2on = true, pushOn = false, fallenPrev = false;
+let crashMark = 0, wmBeforeCrash = 0, countBeforeCrash = 0, lastS2ms = -1;
+let marginHist = [], latHist = [];
+
+function log(kind, html) {
+  const d = document.createElement('div');
+  d.className = 'lg-' + kind;
+  d.innerHTML = `<b>[${S ? S.t.toFixed(1) : '0.0'}s]</b> ${html}`;
+  const L = $('log'); L.prepend(d);
+  while (L.children.length > 40) L.lastChild.remove();
+}
+async function post(path) { try { await fetch(API + path, { method: 'POST' }); } catch (e) {} }
+function togglePush() {
+  pushOn = !pushOn;
+  post('/push?on=' + (pushOn ? 1 : 0));
+  $('btn-push').textContent = `随机扰动 · ${pushOn ? '开' : '关'}`;
+  $('btn-push').classList.toggle('armed', pushOn);
+  log(pushOn ? 'warn' : 'info', pushOn ? '随机推力扰动开启（每 ~1.2 s，0.4–0.7 m/s）' : '扰动关闭');
+}
+function toggleLane() {
+  lane = lane === 'fast' ? 'slow' : 'fast';
+  post('/mode?slow=' + (lane === 'slow' ? 1 : 0));
+  const b = $('btn-lane');
+  b.textContent = `S1 行走反射 · ${lane === 'fast' ? '开' : '关'}`;
+  b.classList.toggle('armed', lane === 'fast');
+  b.classList.toggle('slowmode', lane === 'slow');
+  if (lane === 'slow') log('bad', '<b>S1 断开</b>：控制改为 200 ms 一拍的 scan 慢查询（数据陈旧、无紧急重踏反射）');
+  else log('ok', 'S1 恢复：latest() 每拍实测读取 + 紧急重踏反射上线');
+}
+function toggleS2() {
+  s2on = !s2on; post('/s2?on=' + (s2on ? 1 : 0));
+  $('btn-s2').textContent = `S2 步态调节 · ${s2on ? '开' : '关'}`;
+  $('btn-s2').classList.toggle('armed', s2on);
+}
+async function doCrash() {
+  if (crashMark) return;
+  try { countBeforeCrash = (await (await fetch(API + '/count' in {} ? '/verify' : '/state')).json(), 0); } catch (e) {}
+  wmBeforeCrash = S ? S.wm : 0;
+  crashMark = performance.now();
+  $('ov-kill').classList.add('on');
+  log('bad', `<b>SIGKILL</b> — 真实终止进程（exit 9，不走 Drop）。杀前 watermark = ${wmBeforeCrash.toLocaleString()}`);
+  try { await fetch(API + '/crash', { method: 'POST' }); } catch (e) {}
+  waitRevive();
+}
+async function waitRevive() {
+  while (true) {
+    await new Promise(r => setTimeout(r, 250));
+    try {
+      const r = await fetch(API + '/state');
+      if (r.ok) {
+        const s = await r.json();
+        const downtime = Math.round(performance.now() - crashMark);
+        crashMark = 0;
+        $('ov-kill').classList.remove('on');
+        $('ov-replay').classList.remove('on');
+        log('ok', `复活：实测停机 <b>${downtime} ms</b>（exit→supervisor 重启→真实 WAL 重放），watermark ${s.wm.toLocaleString()}`);
+        return;
+      }
+    } catch (e) {}
+  }
+}
+
+/* ---- 轮询 ---- */
+async function poll() {
+  try {
+    const r = await fetch(API + '/state');
+    if (!r.ok) throw 0;
+    const s = await r.json();
+    $('ov-off').classList.remove('on');
+    S = s;
+    const margin = Math.abs(s.x - s.p);
+    marginHist.push(margin); if (marginHist.length > 300) marginHist.shift();
+    latHist.push(s.p50); if (latHist.length > 300) latHist.shift();
+    if (s.fallen && !fallenPrev) log('bad', `<b>摔倒</b> — 裕度越界，2 s 后自动起立继续实验`);
+    if (!s.fallen && fallenPrev) log('info', '已自动起立 — 数据原样保留');
+    fallenPrev = s.fallen;
+    if (s.s2_ms !== lastS2ms && s.s2_ms > 0) {
+      lastS2ms = s.s2_ms;
+      const cost = s.s2_ms < 1 ? (s.s2_ms * 1000).toFixed(0) + ' µs' : s.s2_ms.toFixed(2) + ' ms';
+      $('thought-body').innerHTML = `scan(2, t-3s, t) 实测 <b>${cost}</b><br>→ 期望速度调整为 <b>${s.xd.toFixed(2)}</b> m/s`;
+      $('thought').classList.add('on');
+      setTimeout(() => $('thought').classList.remove('on'), 2400);
+    }
+    hud(margin);
+  } catch (e) { $('ov-off').classList.add('on'); }
+}
+setInterval(poll, 100);
+
+function hud(margin) {
+  const s = S;
+  if (lane === 'fast') {
+    $('v-s1').innerHTML = s.p50 < 0.1 ? (s.p50 * 1000).toFixed(0) + ' <span class="unit">ns</span>' : s.p50.toFixed(3) + ' <span class="unit">µs</span>';
+    $('v-s1-sub').textContent = `p50 ${s.p50.toFixed(3)} · p99 ${s.p99.toFixed(3)} · p999 ${s.p999.toFixed(3)} µs（真实调用计时）`;
+    $('g-s1').classList.remove('warn');
+  } else {
+    $('v-s1').innerHTML = '200 <span class="unit">ms/拍</span>';
+    $('v-s1-sub').textContent = `慢路径：scan 实测 ${s.scan_ms.toFixed(1)} ms · 数据陈旧 200 ms+ · 无紧急重踏`;
+    $('g-s1').classList.add('warn');
+  }
+  if (s.s2_ms > 0) {
+    $('v-s2').innerHTML = s.s2_ms < 1 ? (s.s2_ms * 1000).toFixed(0) + ' <span class="unit">µs</span>' : s.s2_ms.toFixed(2) + ' <span class="unit">ms</span>';
+    $('v-s2-sub').textContent = '3 s 速度窗口 → 期望速度调节（实测）';
+  }
+  $('v-spd').innerHTML = s.vx.toFixed(2) + ' <span class="unit">m/s</span>';
+  $('v-steps').textContent = `步数 ${s.steps} · 前进 ${s.x.toFixed(1)} m`;
+  $('v-xd').textContent = s.xd.toFixed(2);
+  $('v-margin').innerHTML = margin.toFixed(3) + ' <span class="unit">m</span>';
+  $('g-margin').classList.toggle('warn', margin > 0.2);
+  $('p-wm').innerHTML = `<b>${s.wm.toLocaleString()}</b>`;
+  $('p-segs').textContent = s.segs.toLocaleString();
+  $('p-drop').innerHTML = s.w_drop_r > 0 ? `<b style="color:var(--red)">${s.w_drop_r}</b> / ${s.w_drop_t}` : `0 / ${s.w_drop_t}`;
+  $('p-scan').textContent = lane === 'slow' ? s.scan_ms.toFixed(1) + ' ms' : '—（快路径 O(1)）';
+  $('p-replay').textContent = s.rc > 0 ? `${s.rc} 客户端 · ${s.rq.toLocaleString()} 次 · 最差 ${s.rw.toFixed(1)} ms` : '—';
+}
+
+/* ---- 画布：侧视双足 ---- */
+const cv = $('cv'), ctx = cv.getContext('2d');
+const ZC = 0.85, SCALE = 220, GY = 320;      // 地面 y
+function wx(x) { return 90 + x * SCALE; }     // 世界→屏幕（跟随相机：以 x 为视口中心附近的 S.x）
+function wy(z) { return GY - z * SCALE; }
+function draw() {
+  requestAnimationFrame(draw);
+  const W = cv.width, Hh = cv.height;
+  ctx.clearRect(0, 0, W, Hh);
+  const s = S || { x: 0, vx: 0, p: 0, swing: false, fallen: false, steps: 0 };
+  const cam = s.x;
+  // 地面
+  ctx.strokeStyle = '#2a3342'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(0, GY); ctx.lineTo(W, GY); ctx.stroke();
+  for (let gx = Math.floor((cam - 1)); gx < cam + 2.5; gx += 0.5) {
+    const px = wx(gx) - cam * SCALE;
+    ctx.strokeStyle = '#1c2431';
+    ctx.beginPath(); ctx.moveTo(px, GY); ctx.lineTo(px, GY + 8); ctx.stroke();
+  }
+  const cx = W / 2 + (s.x - cam) * SCALE;
+  const hipY = wy(ZC);
+  const leg = (footX, color, width) => {
+    const fx = wx(footX) - cam * SCALE;
+    ctx.strokeStyle = color; ctx.lineWidth = width; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(cx, hipY); ctx.lineTo(fx, GY); ctx.stroke();
+    ctx.fillStyle = color;
+    ctx.beginPath(); ctx.arc(fx, GY, 5, 0, 7); ctx.fill();
+  };
+  // 摆动腿（向前伸的浅色腿）与支撑腿
+  const swX = s.swing ? s.p : s.p;
+  leg(s.p, s.swing ? '#3a4a5f' : '#3ddc84', s.swing ? 3 : 5);
+  if (s.swing) leg(s.p + 0.25, '#ffc857', 3);
+  // 躯干
+  ctx.fillStyle = s.fallen ? '#3d1518' : '#1c2a3d';
+  ctx.strokeStyle = s.fallen ? '#ff5c5c' : '#4cc2ff'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.roundRect(cx - 14, hipY - 46, 28, 46, 6); ctx.fill(); ctx.stroke();
+  // 头
+  ctx.beginPath(); ctx.arc(cx, hipY - 56, 9, 0, 7); ctx.fill(); ctx.stroke();
+  // CoM 标记
+  ctx.fillStyle = '#3ddc84';
+  ctx.beginPath(); ctx.arc(cx, hipY - 20, 4, 0, 7); ctx.fill();
+  // 捕获点
+  const xc = s.x + s.vx / 3.3995;
+  ctx.strokeStyle = '#b78cff'; ctx.setLineDash([3, 3]);
+  ctx.beginPath(); ctx.moveTo(wx(xc) - cam * SCALE, GY - 10); ctx.lineTo(wx(xc) - cam * SCALE, GY); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = '#b78cff'; ctx.font = '10px SF Mono, Menlo, monospace';
+  ctx.fillText('捕获点', wx(xc) - cam * SCALE - 14, GY - 14);
+  // 文字
+  ctx.font = '12px SF Mono, Menlo, monospace';
+  ctx.fillStyle = '#7d8aa0';
+  ctx.fillText(`x=${s.x.toFixed(2)}  vx=${s.vx.toFixed(2)}  ${s.swing ? '摆动相' : '支撑相'}  步数 ${s.steps}`, 14, 24);
+  ctx.fillText('LIPM ẍ=λ²(x−p) · 捕获点落脚 · 支撑裕度 |x−p| ≤ 0.30', 14, 42);
+  if (s.fallen) {
+    ctx.fillStyle = 'rgba(255,92,92,.9)'; ctx.font = 'bold 20px -apple-system, PingFang SC, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('摔倒了 — 数据无损，2 s 后自动起立', W / 2, Hh / 2 - 30);
+    ctx.textAlign = 'left';
+  }
+  if (lane === 'slow') { ctx.fillStyle = '#ffc857'; ctx.fillText('⚠ S1 断开：200 ms 慢查询 + 无紧急重踏', 14, 64); }
+  drawSpark($('spark1'), marginHist, v => v, 0.3, marginHist[marginHist.length-1] > 0.2 ? '#ffc857' : '#3ddc84');
+  drawSpark($('spark2'), latHist, v => v, 1.0, '#3ddc84');
+}
+function drawSpark(cnv, arr, f, scale, color) {
+  const c = cnv.getContext('2d'), w = cnv.width, h = cnv.height;
+  c.clearRect(0, 0, w, h);
+  c.strokeStyle = '#2a3342';
+  c.beginPath(); c.moveTo(0, h - 4); c.lineTo(w, h - 4); c.stroke();
+  if (arr.length < 2) return;
+  c.strokeStyle = color; c.lineWidth = 1.3; c.beginPath();
+  arr.forEach((v, i) => {
+    const x = i / (arr.length - 1) * w;
+    const y = h - 4 - f(v) * (h - 10) / scale;
+    i === 0 ? c.moveTo(x, y) : c.lineTo(x, y);
+  });
+  c.stroke();
+}
+requestAnimationFrame(draw);
+log('info', '连接 walker-server … 打开 S1 行走反射，机器人开始行走');
+</script>
+</body>
+</html>
