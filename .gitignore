@@ -1,1 +1,13 @@
+# Rust build artifacts
 /target
+demo/server/target/
+
+# Demo runtime state (WAL, segments, logs) — never commit runtime data
+demo/server/data/
+demo/server/data-*/
+*.log
+
+# OS / editor noise
+.DS_Store
+.idea/
+.vscode/
