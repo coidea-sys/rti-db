@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>rti-db 修复可视化演示</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --panel2: #1c2330;
+    --border: #30363d;
+    --text: #e6edf3;
+    --dim: #8b949e;
+    --green: #3fb950;
+    --red: #f85149;
+    --yellow: #d29922;
+    --blue: #58a6ff;
+    --purple: #bc8cff;
+    --mono: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, "PingFang SC", "Helvetica Neue", sans-serif;
+    line-height: 1.6;
+  }
+  header {
+    padding: 48px 24px 24px; text-align: center;
+    border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 28px; font-weight: 700; }
+  header h1 .accent { color: var(--blue); }
+  header p { color: var(--dim); margin-top: 8px; font-size: 14px; }
+  nav {
+    display: flex; justify-content: center; gap: 12px; padding: 16px;
+    position: sticky; top: 0; background: rgba(13,17,23,.92);
+    backdrop-filter: blur(8px); z-index: 50; border-bottom: 1px solid var(--border);
+  }
+  nav a {
+    color: var(--dim); text-decoration: none; font-size: 13px; padding: 6px 14px;
+    border: 1px solid var(--border); border-radius: 20px; transition: all .2s;
+  }
+  nav a:hover { color: var(--text); border-color: var(--blue); }
+  section { max-width: 1080px; margin: 0 auto; padding: 56px 24px; }
+  .sec-head { margin-bottom: 28px; }
+  .sec-num {
+    display: inline-block; font-family: var(--mono); font-size: 12px; color: var(--blue);
+    border: 1px solid var(--blue); border-radius: 4px; padding: 2px 8px; margin-bottom: 10px;
+  }
+  .sec-head h2 { font-size: 22px; }
+  .sec-head p { color: var(--dim); font-size: 14px; margin-top: 6px; max-width: 760px; }
+  .stage {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 24px; overflow: hidden;
+  }
+  .controls { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
+  button {
+    font-family: inherit; font-size: 13px; cursor: pointer;
+    background: var(--panel2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px; padding: 8px 18px;
+    transition: all .15s;
+  }
+  button:hover:not(:disabled) { border-color: var(--blue); color: var(--blue); }
+  button:disabled { opacity: .35; cursor: default; }
+  button.primary { background: #123a5e; border-color: var(--blue); color: var(--blue); }
+  button.primary:hover:not(:disabled) { background: #164a78; }
+  .mono { font-family: var(--mono); font-size: 12.5px; }
+  .code {
+    font-family: var(--mono); font-size: 12.5px; background: #0a0e14;
+    border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px;
+    overflow-x: auto; white-space: pre; line-height: 1.55;
+  }
+  .tok-k { color: #ff7b72; } .tok-s { color: #a5d6ff; } .tok-c { color: #7d8590; }
+  .tok-f { color: #d2a8ff; } .tok-n { color: #79c0ff; } .tok-g { color: #7ee787; }
+  .tok-y { color: #e3b341; } .tok-r { color: #ff7b72; } .tok-d { color: #ffa657; }
+  /* ===== Scene 1 ===== */
+  .s1-grid { display: grid; grid-template-columns: 1fr; gap: 18px; }
+  .lane-label { font-size: 12px; color: var(--dim); margin-bottom: 8px; font-family: var(--mono); }
+  .clock-box {
+    display: flex; align-items: center; gap: 10px; margin-bottom: 10px;
+  }
+  .clock-face {
+    font-family: var(--mono); font-size: 15px; background: #0a0e14;
+    border: 1px solid var(--border); border-radius: 6px; padding: 6px 14px;
+    min-width: 240px; text-align: center; color: var(--blue);
+  }
+  .clock-face.collide { color: var(--red); border-color: var(--red); }
+  .tsline { position: relative; height: 108px; background: #0a0e14; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 14px; overflow: hidden; }
+  .msg {
+    position: absolute; top: 12px; width: 46px; text-align: center;
+    transition: left .5s cubic-bezier(.4,0,.2,1);
+  }
+  .msg .dot {
+    width: 26px; height: 26px; margin: 0 auto; border-radius: 50%;
+    background: #123a5e; border: 2px solid var(--blue);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 11px; font-family: var(--mono); color: var(--blue); font-weight: 700;
+    transition: all .3s;
+  }
+  .msg .ts { font-family: var(--mono); font-size: 9.5px; color: var(--dim); margin-top: 4px; word-break: break-all; }
+  .msg.collide .dot { border-color: var(--red); color: var(--red); background: #3d1518; box-shadow: 0 0 12px rgba(248,81,73,.5); }
+  .msg.collide .ts { color: var(--red); }
+  .msg.merged { opacity: 0; transform: scale(.3); transition: all .45s; }
+  .msg .drop-x {
+    position: absolute; top: -6px; left: 50%; transform: translateX(-50%);
+    color: var(--red); font-size: 16px; font-weight: 700; opacity: 0; transition: opacity .3s;
+  }
+  .msg.merged .drop-x { opacity: 1; }
+  .flow-arrow { text-align: center; color: var(--dim); font-size: 18px; margin: 2px 0; }
+  .scanbox {
+    background: #0a0e14; border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px;
+  }
+  .scanbox .scan-title { font-family: var(--mono); font-size: 12px; color: var(--purple); margin-bottom: 10px; }
+  .scan-steps { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+  .chip {
+    font-family: var(--mono); font-size: 11.5px; padding: 4px 12px; border-radius: 14px;
+    border: 1px solid var(--border); color: var(--dim); transition: all .3s;
+  }
+  .chip.active { border-color: var(--purple); color: var(--purple); background: rgba(188,140,255,.08); }
+  .chip.danger { border-color: var(--red); color: var(--red); background: rgba(248,81,73,.08); }
+  .outrow { display: flex; gap: 10px; align-items: center; min-height: 40px; flex-wrap: wrap; }
+  .outdot {
+    width: 30px; height: 30px; border-radius: 50%; border: 2px solid var(--green);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 11px; font-family: var(--mono); color: var(--green); font-weight: 700;
+    opacity: 0; transform: scale(.4); transition: all .35s;
+  }
+  .outdot.show { opacity: 1; transform: scale(1); }
+  .verdict { margin-top: 14px; font-family: var(--mono); font-size: 13px; padding: 10px 14px; border-radius: 8px; display: none; }
+  .verdict.fail { display: block; background: rgba(248,81,73,.1); border: 1px solid var(--red); color: var(--red); }
+  .verdict.pass { display: block; background: rgba(63,185,80,.1); border: 1px solid var(--green); color: var(--green); }
+  .mono-ts-box { display: none; align-items: center; gap: 10px; margin-bottom: 10px; }
+  .mono-ts-box.on { display: flex; }
+  /* ===== Scene 2 ===== */
+  .s2-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  @media (max-width: 860px) { .s2-cols { grid-template-columns: 1fr; } }
+  .term {
+    background: #0a0e14; border: 1px solid var(--border); border-radius: 8px;
+    font-family: var(--mono); font-size: 12px; line-height: 1.7; padding: 14px 16px;
+    min-height: 240px; white-space: pre-wrap; word-break: break-all;
+  }
+  .term .t-err { color: var(--red); } .term .t-ok { color: var(--green); }
+  .term .t-cmd { color: var(--blue); } .term .t-dim { color: var(--dim); }
+  .term .t-note { color: var(--yellow); } .term .t-num { color: #79c0ff; }
+  .cursor { display: inline-block; width: 7px; height: 14px; background: var(--green); vertical-align: -2px; animation: blink 1s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  .diff-add { background: rgba(63,185,80,.12); display: block; }
+  .diff-del { background: rgba(248,81,73,.12); display: block; color: var(--red); }
+  .diff-ctx { display: block; color: var(--dim); }
+  /* ===== Scene 3 ===== */
+  .s3-wrap { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  @media (max-width: 860px) { .s3-wrap { grid-template-columns: 1fr; } }
+  .crate-node {
+    border: 1px solid var(--border); border-radius: 10px; padding: 10px 14px;
+    font-family: var(--mono); font-size: 12.5px; background: var(--panel2);
+    transition: all .4s; position: relative;
+  }
+  .crate-node .uses { font-size: 10.5px; color: var(--dim); margin-top: 3px; }
+  .crate-node.core { border-color: var(--blue); }
+  .crate-node.query { border-color: var(--purple); }
+  .crate-node.store { border-color: var(--yellow); }
+  .crate-node.facade { border-color: var(--green); }
+  .crate-node.absorb { opacity: .25; transform: scale(.92); border-style: dashed; }
+  .crate-node .absorb-tag {
+    position: absolute; top: -10px; right: 8px; font-size: 10px;
+    background: var(--bg); color: var(--green); padding: 0 6px; border-radius: 4px;
+    opacity: 0; transition: opacity .4s;
+  }
+  .crate-node.absorb .absorb-tag { opacity: 1; }
+  .graph-box { background: #0a0e14; border: 1px solid var(--border); border-radius: 8px; padding: 18px; min-height: 260px; }
+  .graph-cols { display: flex; gap: 14px; align-items: stretch; }
+  .graph-col { flex: 1; display: flex; flex-direction: column; gap: 10px; }
+  .graph-col .col-title { font-size: 11px; color: var(--dim); font-family: var(--mono); text-align: center; margin-bottom: 2px; }
+  .graph-col .crate-node { flex: 0 0 auto; }
+  .edge-label { font-size: 10px; color: var(--dim); font-family: var(--mono); text-align: center; }
+  .compile-badge {
+    display: inline-flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 12px;
+    padding: 3px 10px; border-radius: 12px; margin-top: 8px;
+  }
+  .compile-badge.err { color: var(--red); border: 1px solid var(--red); }
+  .compile-badge.ok { color: var(--green); border: 1px solid var(--green); }
+  footer { text-align: center; color: var(--dim); font-size: 12px; padding: 32px; border-top: 1px solid var(--border); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>rti-db <span class="accent">修复可视化演示</span></h1>
+  <p>三批改动的处理过程：时间戳碰撞 flaky 测试 · macOS 平台门控 · 门面再导出 — 全部可交互回放</p>
+</header>
+
+<nav>
+  <a href="#s1">① 时间戳碰撞</a>
+  <a href="#s2">② 平台门控</a>
+  <a href="#s3">③ 门面再导出</a>
+</nav>
+
+<!-- ==================== Scene 1 ==================== -->
+<section id="s1">
+  <div class="sec-head">
+    <span class="sec-num">Scene 1 / flaky 测试根因</span>
+    <h2>两个样本撞了同一个纳秒，scan  silently 丢掉了一条</h2>
+    <p>测试在紧循环里用 <span class="mono">now_ns()</span> 给 5 条消息打时间戳；纳秒时钟两次返回同一值 →
+    <span class="mono">collect_into</span> 排序后按 ts 去重 → scan 只返回 4 条 → 断言 <span class="mono">a.len() == 5</span> 间歇性失败。
+    修复：测试改用严格递增的 <span class="mono">mono_ts()</span>。点播放看两条路径的对比。</p>
+  </div>
+  <div class="stage">
+    <div class="controls">
+      <button class="primary" id="s1-play-before" onclick="s1Play('before')">▶ 播放：修复前（会碰撞）</button>
+      <button class="primary" id="s1-play-after" onclick="scanBefore = false; s1Play('after')">▶ 播放：修复后（mono_ts）</button>
+      <button onclick="s1Reset()">↺ 重置</button>
+      <span class="mono" id="s1-status" style="align-self:center;color:var(--dim)"></span>
+    </div>
+
+    <div class="s1-grid">
+      <div>
+        <div class="lane-label">// 测试代码发送端：5 条 /a 消息，紧循环</div>
+        <div class="mono-ts-box" id="s1-mono-box">
+          <span class="chip" style="border-color:var(--green);color:var(--green)">mono_ts(): 严格递增，永不碰撞</span>
+        </div>
+        <div class="clock-box" id="s1-clock-box">
+          <div class="clock-face" id="s1-clock">SystemTime::now() = …</div>
+          <span class="mono" style="color:var(--dim);font-size:11px" id="s1-clock-note"></span>
+        </div>
+        <div class="tsline" id="s1-tsline"></div>
+      </div>
+
+      <div class="flow-arrow">▼ 入队 → ingest 线程应用 → MemTable（5 条都在）</div>
+
+      <div class="scanbox">
+        <div class="scan-title">Db::collect_into(series=1, ...) — scan 的合并逻辑</div>
+        <div class="scan-steps">
+          <span class="chip" id="s1-chip-mem">读 MemTable：5 条</span>
+          <span class="chip" id="s1-chip-sort">sort_by_key(ts) 稳定排序</span>
+          <span class="chip" id="s1-chip-dedup">dedup_by_key(ts) ⚠ 同 ts 只留一条</span>
+          <span class="chip" id="s1-chip-out">输出迭代器</span>
+        </div>
+        <div class="outrow" id="s1-outrow"></div>
+        <div class="verdict" id="s1-verdict"></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ==================== Scene 2 ==================== -->
+<section id="s2">
+  <div class="sec-head">
+    <span class="sec-num">Scene 2 / macOS 全特性构建</span>
+    <h2>一个 Linux-only 的 import 让 <span class="mono">--all-features</span> 在 macOS 上炸掉</h2>
+    <p><span class="mono">wal_bench.rs</span> 无条件引用只在 Linux 存在的 <span class="mono">rti_wal_uring</span>；
+    macOS 上开 <span class="mono">io-uring</span> 特性编译示例即 E0433。库里其它代码本就有
+    <span class="mono">cfg(target_os = "linux")</span> 门控，只有示例漏了。修复：补上同样的门控，非 Linux 平台优雅降级为只跑 std 后端。</p>
+  </div>
+  <div class="stage">
+    <div class="controls">
+      <button class="primary" id="s2-play" onclick="s2Play()">▶ 播放对比</button>
+      <button onclick="s2Reset()">↺ 重置</button>
+    </div>
+    <div class="s2-cols">
+      <div>
+        <div class="lane-label">修复前：编译即失败</div>
+        <div class="term" id="s2-term-before"><span class="t-dim"># 等待播放…</span></div>
+      </div>
+      <div>
+        <div class="lane-label">修复后：优雅降级</div>
+        <div class="term" id="s2-term-after"><span class="t-dim"># 等待播放…</span></div>
+      </div>
+    </div>
+    <div style="margin-top:18px">
+      <div class="lane-label">关键改动（crates/rti-wal/examples/wal_bench.rs）</div>
+      <div class="code"><span class="diff-ctx">use rti_core::SyncPolicy;</span><span class="diff-del">- use rti_wal::{IoUringPipelinedWalWriter, IoUringWalWriter, Record, ...};</span><span class="diff-add">+ #[cfg(target_os = "linux")]</span><span class="diff-add">+ use rti_wal::{IoUringPipelinedWalWriter, IoUringWalWriter};</span><span class="diff-add">+ use rti_wal::{Record, StdWalWriter, Wal, WalWriter};</span><span class="diff-ctx"></span><span class="diff-add">+ #[cfg(not(target_os = "linux"))]</span><span class="diff-add">+ let backends = { println!("NOTE: io_uring is Linux-only; …"); vec!["std"] };</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- ==================== Scene 3 ==================== -->
+<section id="s3">
+  <div class="sec-head">
+    <span class="sec-num">Scene 3 / 门面再导出</span>
+    <h2>README 的 Quickstart 声称单依赖，实测 4 个编译错误</h2>
+    <p><span class="mono">rti-db</span> 门面没有 re-export <span class="mono">rti_core</span> 的类型，
+    用户被迫同时依赖 3 个 crate 并理解内部拆分。修复：门面补全
+    <span class="mono">pub use rti_core::{…} / rti_query::{Agg, Pred} / rti_store::{ColdTier, LocalFsColdTier}</span>，
+    内部 crate 拆分回归为实现细节。</p>
+  </div>
+  <div class="stage">
+    <div class="controls">
+      <button class="primary" id="s3-play" onclick="s3Play()">▶ 播放：门面吸收</button>
+      <button onclick="s3Reset()">↺ 重置</button>
+    </div>
+    <div class="s3-wrap">
+      <div class="graph-box">
+        <div class="graph-cols">
+          <div class="graph-col">
+            <div class="col-title">用户代码</div>
+            <div class="crate-node" style="border-color:var(--text)">main.rs<span class="uses">Db::open / put / scan</span></div>
+            <div class="compile-badge err" id="s3-badge">✗ 4 × E0603 编译错误</div>
+          </div>
+          <div class="graph-col" id="s3-col-before">
+            <div class="col-title">依赖（修复前）</div>
+            <div class="crate-node facade" id="s3-n-facade">rti-db<span class="uses">use rti_db::Db ✓</span><span class="absorb-tag">吸收中…</span></div>
+            <div class="crate-node core" id="s3-n-core">rti-core<span class="uses">use rti_core::{Config, Sample, …}</span><span class="absorb-tag">被门面 re-export</span></div>
+            <div class="crate-node query" id="s3-n-query">rti-query<span class="uses">use rti_query::{Agg, Pred}</span><span class="absorb-tag">被门面 re-export</span></div>
+            <div class="crate-node store" id="s3-n-store">rti-store<span class="uses">set_cold_tier(Arc&lt;dyn ColdTier&gt;)</span><span class="absorb-tag">被门面 re-export</span></div>
+          </div>
+        </div>
+      </div>
+      <div>
+        <div class="lane-label">修复后：单依赖编译（实测 cargo run 通过）</div>
+        <div class="code" id="s3-code"><span class="tok-c">// Cargo.toml: 只声明 rti-db = "0.8"</span>
+<span class="tok-k">use</span> rti_db::{Db, Config, SyncPolicy, Profile, Sample};
+
+<span class="tok-k">fn</span> <span class="tok-f">main</span>() {
+    <span class="tok-k">let mut</span> cfg = Config::default();
+    cfg.profile = Profile::Balanced;
+    cfg.wal_sync = SyncPolicy::Group { interval_us: <span class="tok-n">1000</span> };
+    <span class="tok-k">let mut</span> db = Db::open(cfg)<span class="tok-d">?</span>;
+    db.put(<span class="tok-n">1</span>, Sample { ts: <span class="tok-n">1_700_000_000_000_000_000</span>, value: <span class="tok-n">42.0</span> })<span class="tok-d">?</span>;
+    <span class="tok-k">for</span> s <span class="tok-k">in</span> db.scan(<span class="tok-n">1</span>, <span class="tok-n">0</span>, <span class="tok-n">i64::MAX</span>, <span class="tok-k">None</span>, <span class="tok-k">None</span>)? { … }
+} <span class="tok-c">// → "quickstart OK"</span></div>
+        <div class="compile-badge ok" id="s3-badge2" style="display:none">✓ cargo run → quickstart OK</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>rti-db 修复演示 · 数据与代码细节均来自真实仓库验证 · /Volumes/2nd-HD/KiMi-Work/rti-db</footer>
+
+<script>
+const $ = id => document.getElementById(id);
+const wait = ms => new Promise(r => setTimeout(r, ms));
+
+/* ============ Scene 1 ============ */
+const S1_BASE = 1762204800000000000n;
+let s1Timers = [];
+function s1Reset() {
+  s1Timers.forEach(clearTimeout); s1Timers = [];
+  $('s1-tsline').innerHTML = ''; $('s1-outrow').innerHTML = '';
+  $('s1-verdict').className = 'verdict'; $('s1-verdict').textContent = '';
+  ['s1-chip-mem','s1-chip-sort','s1-chip-dedup','s1-chip-out'].forEach(i => $(i).className = 'chip');
+  $('s1-mono-box').classList.remove('on');
+  $('s1-clock').className = 'clock-face';
+  $('s1-clock').textContent = 'SystemTime::now() = …';
+  $('s1-clock-note').textContent = '';
+  $('s1-status').textContent = '';
+  $('s1-play-before').disabled = false; $('s1-play-after').disabled = false;
+}
+
+async function s1Play(mode) {
+  s1Reset();
+  const before = mode === 'before';
+  $('s1-play-before').disabled = true; $('s1-play-after').disabled = true;
+  if (!before) { $('s1-mono-box').classList.add('on'); $('s1-clock-box').style.display = 'none'; }
+
+  // 生成 5 个消息：before 模式 m3/m4 同 ts；after 模式全部递增
+  const tsVals = [];
+  if (before) { for (let i = 0; i < 5; i++) tsVals.push(S1_BASE + BigInt([0,1,2,2,3][i])); }
+  else { for (let i = 0; i < 5; i++) tsVals.push(S1_BASE + BigInt(i * 1000)); }
+
+  const line = $('s1-tsline');
+  const spacing = Math.min(110, (line.clientWidth - 60) / 5);
+  const msgs = [];
+  for (let i = 0; i < 5; i++) {
+    const d = document.createElement('div');
+    d.className = 'msg';
+    d.style.left = (14 + i * spacing) + 'px';
+    const collide = before && i >= 3 && tsVals[i] === tsVals[2];
+    d.innerHTML = `<span class="drop-x">✕</span><div class="dot">m${i+1}</div><div class="ts">${before ? '…' : ''}</div>`;
+    if (collide) d.dataset.collide = '1';
+    line.appendChild(d); msgs.push(d);
+  }
+
+  // 时钟逐条打戳
+  for (let i = 0; i < 5; i++) {
+    if (before) {
+      $('s1-clock').textContent = `SystemTime::now() = ${tsVals[i]}`;
+      const c = msgs[i].dataset.collide;
+      if (c) {
+        $('s1-clock').classList.add('collide');
+        $('s1-clock-note').textContent = '← 与 m3 同一个纳秒！';
+        msgs[i].classList.add('collide');
+        msgs[2].classList.add('collide');
+        $('s1-status').textContent = '⚠ 时钟碰撞：m3 与 m4 时间戳相同';
+        $('s1-status').style.color = 'var(--red)';
+      }
+      msgs[i].querySelector('.ts').textContent = String(tsVals[i]).slice(-6);
+    } else {
+      msgs[i].querySelector('.ts').textContent = String(tsVals[i]).slice(-6);
+      msgs[i].querySelector('.ts').style.color = 'var(--green)';
+      $('s1-status').textContent = `mono_ts() = max(上一条, now) + 1 → ${String(tsVals[i]).slice(-6)}`;
+      $('s1-status').style.color = 'var(--green)';
+    }
+    await wait(520);
+  }
+  if (before) await wait(600);
+
+  // MemTable 步
+  $('s1-chip-mem').classList.add('active');
+  await wait(650);
+  $('s1-chip-sort').classList.add('active');
+  await wait(650);
+
+  // dedup
+  $('s1-chip-dedup').classList.add('active');
+  if (before) {
+    $('s1-chip-dedup').classList.add('danger');
+    await wait(500);
+    msgs[3].classList.add('merged');   // m4 被去重吞掉
+    await wait(600);
+  } else {
+    await wait(500);
+  }
+
+  // 输出
+  $('s1-chip-out').classList.add('active');
+  const out = $('s1-outrow');
+  const count = before ? 4 : 5;
+  for (let i = 0; i < count; i++) {
+    const o = document.createElement('div');
+    o.className = 'outdot';
+    o.textContent = 'm' + (i + 1);
+    out.appendChild(o);
+    requestAnimationFrame(() => requestAnimationFrame(() => o.classList.add('show')));
+    await wait(240);
+  }
+  await wait(400);
+
+  const v = $('s1-verdict');
+  if (before) {
+    v.className = 'verdict fail';
+    v.textContent = 'assertion `left == right` failed: left: 4, right: 5  →  bridge_stats_counter_semantics FAILED（间歇性）';
+  } else {
+    v.className = 'verdict pass';
+    v.textContent = '✓ 3 passed; 0 failed — 连跑 20 次全绿（修复后实测）';
+  }
+  $('s1-play-before').disabled = false; $('s1-play-after').disabled = false;
+}
+
+/* ============ Scene 2 ============ */
+async function typeInto(el, html, speed) {
+  // 简易打字机：按行注入（保留 HTML span）
+  const lines = html.split('\n');
+  for (const ln of lines) {
+    const div = document.createElement('div');
+    div.innerHTML = ln.length ? ln : '&nbsp;';
+    el.appendChild(div);
+    el.scrollTop = el.scrollHeight;
+    await wait(speed);
+  }
+}
+let s2Busy = false;
+function s2Reset() {
+  $('s2-term-before').innerHTML = '<span class="t-dim"># 等待播放…</span>';
+  $('s2-term-after').innerHTML = '<span class="t-dim"># 等待播放…</span>';
+  s2Busy = false; $('s2-play').disabled = false;
+}
+async function s2Play() {
+  if (s2Busy) return; s2Busy = true; $('s2-play').disabled = true;
+  s2Reset(); s2Busy = true; $('s2-play').disabled = true;
+  const B = $('s2-term-before'), A = $('s2-term-after');
+  B.innerHTML = ''; A.innerHTML = '';
+
+  await typeInto(B, `<span class="t-cmd">$ cargo test --workspace --all-features</span>`, 300);
+  await typeInto(A, `<span class="t-cmd">$ cargo test --workspace --all-features</span>`, 300);
+  await wait(500);
+  await typeInto(B, `<span class="t-dim">   Compiling rti-wal v0.8.0 …</span>`, 40);
+  await typeInto(A, `<span class="t-dim">   Compiling rti-wal v0.8.0 …</span>`, 40);
+  await wait(400);
+
+  await typeInto(B, `<span class="t-err">error[E0433]: failed to resolve: use of unresolved module or unlinked crate \`rti_wal_uring\`</span>
+<span class="t-dim">  --&gt; crates/rti-wal/examples/wal_bench.rs:21:9</span>
+<span class="t-err">error[E0433]: failed to resolve … \`rti_wal_uring::PipelineConfig\`</span>
+<span class="t-dim">  --&gt; crates/rti-wal/examples/wal_bench.rs:144:17</span>
+<span class="t-err">error: could not compile \`rti-wal\` (example "wal_bench")</span>`, 90);
+  await typeInto(A, `<span class="t-ok">   Finished \`test\` profile [unoptimized]</span>`, 60);
+  await wait(600);
+
+  await typeInto(B, `<span class="t-dim"># 原因：io-uring 依赖只在 target_os = "linux" 下存在，</span>
+<span class="t-dim"># 但示例无条件 import → macOS 开特性即炸</span>`, 40);
+  await typeInto(A, `<span class="t-cmd">$ cargo run -p rti-wal --features io-uring --example wal_bench</span>`, 300);
+  await wait(500);
+  await typeInto(A, `<span class="t-num">== wal bench: uring-pipeline vs std write ==</span>
+<span class="t-note">NOTE: io_uring is Linux-only; only std numbers are real.</span>
+<span class="t-dim">backend          thrput ops/s     group ops/s  group p99 (us)</span>
+<span class="t-ok">std              4258830          24213        5747.1</span>`, 120);
+
+  await typeInto(B, `<span class="t-err">✗ macOS 贡献者按 README 跑的第一步就卡住</span>`, 60);
+  await typeInto(A, `<span class="t-ok">✓ cfg(target_os = "linux") 门控 + 优雅降级（实测输出）</span>`, 60);
+  s2Busy = false; $('s2-play').disabled = false;
+}
+
+/* ============ Scene 3 ============ */
+function s3Reset() {
+  ['s3-n-core','s3-n-query','s3-n-store'].forEach(i => $(i).classList.remove('absorb'));
+  $('s3-badge').className = 'compile-badge err';
+  $('s3-badge').textContent = '✗ 4 × E0603 编译错误';
+  $('s3-badge2').style.display = 'none';
+  $('s3-col-before').querySelector('.col-title').textContent = '依赖（修复前）';
+  $('s3-n-facade').querySelector('.uses').textContent = 'use rti_db::Db ✓';
+}
+async function s3Play() {
+  s3Reset();
+  $('s3-play').disabled = true;
+  await wait(500);
+  const order = ['s3-n-core', 's3-n-query', 's3-n-store'];
+  for (const id of order) {
+    $(id).classList.add('absorb');
+    $(id).querySelector('.uses').textContent = '类型由 rti-db 门面 re-export';
+    await wait(650);
+  }
+  $('s3-col-before').querySelector('.col-title').textContent = '依赖（修复后：用户只面对门面）';
+  $('s3-n-facade').querySelector('.uses').textContent = 'use rti_db::{Db, Config, Sample, Agg, Pred, ColdTier, …} ✓';
+  await wait(500);
+  $('s3-badge').className = 'compile-badge ok';
+  $('s3-badge').textContent = '✓ 单依赖编译通过';
+  $('s3-badge2').style.display = 'inline-flex';
+  $('s3-play').disabled = false;
+}
+
+s1Reset(); s2Reset(); s3Reset();
+</script>
+</body>
+</html>

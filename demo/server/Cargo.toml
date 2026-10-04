@@ -1,0 +1,15 @@
+[package]
+name = "robot-server"
+version = "0.1.0"
+edition = "2021"
+description = "Live cart-pole robot driven by a real rti-db engine (demo backend)"
+
+[dependencies]
+rti-db = { path = "../../crates/rti-db" }
+
+[workspace]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

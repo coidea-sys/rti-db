@@ -17,9 +17,9 @@
 use std::time::Instant;
 
 use rti_core::SyncPolicy;
-use rti_wal::{
-    IoUringPipelinedWalWriter, IoUringWalWriter, Record, StdWalWriter, Wal, WalWriter,
-};
+#[cfg(target_os = "linux")]
+use rti_wal::{IoUringPipelinedWalWriter, IoUringWalWriter};
+use rti_wal::{Record, StdWalWriter, Wal, WalWriter};
 
 const N: u32 = 500_000;
 const GROUP: u32 = 64;
@@ -80,22 +80,31 @@ fn verify(path: &std::path::Path) {
 fn main() {
     println!("== wal bench: uring-pipeline vs std write (N={N}, group={GROUP}, best of {ROUNDS}) ==");
 
-    // backend availability probe: when io_uring is blocked by kernel policy, note the limitation and run only std.
-    let probe_dir = tmpdir("probe");
-    let uring_ok = IoUringPipelinedWalWriter::open(
-        probe_dir.join("probe.log"),
-        SyncPolicy::None,
-        rti_wal_uring::PipelineConfig::default(),
-    )
-    .is_ok();
-    std::fs::remove_dir_all(&probe_dir).ok();
-    if !uring_ok {
-        println!("NOTE: io_uring unavailable in this environment; only std numbers are real.");
-    }
-
-    let backends: Vec<&str> = if uring_ok {
-        vec!["std", "uring-sync", "uring-pipeline"]
-    } else {
+    // Backend availability probe: io_uring is compiled out entirely on non-Linux
+    // targets (the `rti-wal-uring` dependency is Linux-only); on Linux, when
+    // io_uring is blocked by kernel policy, note the limitation and run only std.
+    #[cfg(target_os = "linux")]
+    let backends: Vec<&str> = {
+        let probe_dir = tmpdir("probe");
+        let uring_ok = IoUringPipelinedWalWriter::open(
+            probe_dir.join("probe.log"),
+            SyncPolicy::None,
+            rti_wal_uring::PipelineConfig::default(),
+        )
+        .is_ok();
+        std::fs::remove_dir_all(&probe_dir).ok();
+        if !uring_ok {
+            println!("NOTE: io_uring unavailable in this environment; only std numbers are real.");
+        }
+        if uring_ok {
+            vec!["std", "uring-sync", "uring-pipeline"]
+        } else {
+            vec!["std"]
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let backends: Vec<&str> = {
+        println!("NOTE: io_uring is Linux-only; only std numbers are real.");
         vec!["std"]
     };
 
@@ -136,7 +145,9 @@ fn main() {
 fn open_backend(name: &str, p: &std::path::Path, sync: SyncPolicy) -> Box<dyn WalWriter> {
     match name {
         "std" => Box::new(StdWalWriter::open(p, sync).unwrap()),
+        #[cfg(target_os = "linux")]
         "uring-sync" => Box::new(IoUringWalWriter::open(p, sync).unwrap()),
+        #[cfg(target_os = "linux")]
         "uring-pipeline" => Box::new(
             IoUringPipelinedWalWriter::open(
                 p,
