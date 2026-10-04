@@ -166,6 +166,16 @@ cargo run -p rti-raft --release --example multishard_failover
 cargo run -p rti-db --release --example compaction_value
 ```
 
+## 交互式演示（可玩）
+
+三层递进，一个比一个"真"——所有数字均为实测，合成值会明确标注。运行方式见 [demo/README.md](demo/README.md)。
+
+- **[demo/index.html](demo/index.html)** — 三个真实修复的动画回放（时间戳碰撞 flaky 测试、非 Linux 平台门控、门面再导出）。浏览器直接打开。
+- **[demo/robot-brain.html](demo/robot-brain.html)** — 架构仿真：cart-pole 机器人的神经信号流经忠实建模的引擎（ring 背压、组提交、seal、ts 去重；Gorilla 编码真实现算压缩率）。浏览器直接打开。
+- **[demo/robot-live.html](demo/robot-live.html) / [demo/robot-walk.html](demo/robot-walk.html)** — **零仿真**：真实 cart-pole / LIPM 双足行走在本地 Rust 进程内运行，控制环的每个状态读、每个传感样本写都经过真实 rti-db（1 kHz 网格时间戳；`latest()`/`scan()` 读路径）。断开 S1 反射回路机器人摔倒；`kill -9` 真实死亡并经 WAL 重放恢复，零丢失由 digest 校验；挑战模式在 16 通道 ~37k pts/s + 三重 torture 下录得 15 s / ~54 万点 episode，**零丢失**，判决由真实 scan 得出。
+
+本机实测：`latest()` p50 **0.042 µs** / p999 **1.08 µs**；判决书并排展示机器人领域已发表基线（ros2 工具链 1 kHz 饱和丢 8.6–16.9%；rosbag2 大分片每 10 分钟静默丢 1 分钟；崩溃丢当前打开的 chunk）。
+
 ## 测试与可复现性
 
 - **191 个测试全绿**（`cargo test --workspace`），全 feature 214 个

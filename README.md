@@ -168,6 +168,30 @@ cargo run -p rti-raft --release --example multishard_failover
 cargo run -p rti-db --release --example compaction_value
 ```
 
+## Interactive demos (playable)
+
+Three layers, each more real than the last — every number measured, synthetic
+values labelled as such. See [demo/README.md](demo/README.md) to run them.
+
+- **[demo/index.html](demo/index.html)** — animated replay of three real fixes
+  (timestamp-collision flake, non-Linux `wal_bench`, facade re-export). Open in a browser.
+- **[demo/robot-brain.html](demo/robot-brain.html)** — architecture simulation: a
+  cart-pole robot whose nerve signals flow through a faithfully modelled engine
+  (ring backpressure, group commit, seal, ts-dedup; real Gorilla encoding for
+  compression stats). Open in a browser.
+- **[demo/robot-live.html](demo/robot-live.html) / [demo/robot-walk.html](demo/robot-walk.html)** —
+  **zero simulation**: a real cart-pole / LIPM biped runs in a local Rust process
+  with a real `Db` in the control loop (1 kHz grid-timestamped writes; controller
+  state read via `latest()`/`scan()`). Disconnect the S1 reflex lane and the robot
+  falls; `kill -9` really dies and recovers via WAL replay with digest-verified
+  zero loss; the challenge mode records a 15 s episode of ~540k samples from 16
+  channels under triple torture with **0 loss** — verdict computed by real `scan`.
+
+Measured on this repo's dev machine: `latest()` p50 **0.042 µs** / p999 **1.08 µs**;
+published robotics baselines shown side-by-side in the verdict panel (ros2 tooling
+drops 8.6–16.9% at 1 kHz saturation; rosbag2 silently loses ~1 min per 10 min on
+splits; a crash loses the open chunk).
+
 ## Testing & reproducibility
 
 - **191 tests green** (`cargo test --workspace`), 214 with all features
