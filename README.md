@@ -187,7 +187,7 @@ values labelled as such. See [demo/README.md](demo/README.md) to run them.
   zero loss; the challenge mode records a 15 s episode of ~540k samples from 16
   channels under triple torture with **0 loss** — verdict computed by real `scan`.
 
-Measured on this repo's dev machine: `latest()` p50 **0.042 µs** / p999 **1.08 µs**;
+Measured on this repo's dev machine: `latest()` p50 **0.042 µs**, quiet-machine p999 **≈1 µs** (rises to a few µs under read contention — the dashboard histogram shows it live);
 published robotics baselines shown side-by-side in the verdict panel (ros2 tooling
 drops 8.6–16.9% at 1 kHz saturation; rosbag2 silently loses ~1 min per 10 min on
 splits; a crash loses the open chunk).

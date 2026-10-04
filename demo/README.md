@@ -15,7 +15,7 @@ cd demo/server
 cargo build --release          # 纯 std，零新依赖
 sh run.sh                      # cart-pole @ http://127.0.0.1:8791（监督进程：kill -9 自动重启 + WAL 重放）
 # 行走版（第二个终端）：
-while true; do ./target/release/walker 2>>walker.log; sleep 0.3; done   # @ http://127.0.0.1:8792
+sh walker-supervisor.sh        # @ http://127.0.0.1:8792（同样带 kill -9 自动重启）
 ```
 
 然后浏览器打开 `robot-live.html` / `robot-walk.html`。
