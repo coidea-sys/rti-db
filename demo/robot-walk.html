@@ -232,6 +232,7 @@ async function poll() {
     const s = await r.json();
     $('ov-off').classList.remove('on');
     S = s;
+    S._at = performance.now();   // 采样墙钟，用于外推平滑
     const margin = Math.abs(s.x - s.p);
     marginHist.push(margin); if (marginHist.length > 300) marginHist.shift();
     latHist.push(s.p50); if (latHist.length > 300) latHist.shift();
@@ -284,8 +285,16 @@ function draw() {
   requestAnimationFrame(draw);
   const W = cv.width, Hh = cv.height;
   ctx.clearRect(0, 0, W, Hh);
-  const s = S || { x: 0, vx: 0, p: 0, pfrom: 0, ptgt: 0, tsw: 0, swing: false, fallen: false, steps: 0 };
-  const cam = s.x;
+  let s = S || { x: 0, vx: 0, p: 0, pfrom: 0, ptgt: 0, tsw: 0, swing: false, fallen: false, steps: 0, _at: 0 };
+  // 客户端外推：位置量按速度线性前推 ≤150 ms，消除 10 Hz 轮询的跳动
+  if (S && !S.fallen) {
+    const dt = Math.min((performance.now() - (S._at || 0)) / 1000, 0.15);
+    s = Object.assign({}, s, {
+      x: s.x + s.vx * dt,
+      tsw: s.swing ? s.tsw + dt : 0,
+    });
+  }
+  const cam = s.x + (S ? S.vx * 0.12 : 0);   // 相机微前瞻，构图更稳
   const X = wx => 90 + (wx - cam) * SCALE;
   const Y = wz => GY - wz * SCALE;
   // 地面
