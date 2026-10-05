@@ -5,12 +5,22 @@
 ## 安装
 
 ```bash
-# 需要 Rust 工具链
+pip install rtidb        # PyPI 分发名（rti-py 与已占用的 pypi.org/project/rti 冲突）
+import rti_db            # 导入名仍是 rti_db
+```
+
+源码构建（需要 Rust 工具链）：
+
+```bash
 pip install maturin
 cd crates/rti-py
-maturin build --release          # 产出 target/wheels/rti_db-*.whl
-pip install target/wheels/rti_db-*.whl
+maturin build --release          # 产出 target/wheels/rtidb-*.whl
+pip install target/wheels/rtidb-*.whl
 ```
+
+> 已发布：rtidb 0.8.0 @ PyPI（macOS arm64；其他平台从源码构建同款命令）。
+> macOS 若遇 "mis-aligned LINKEDIT string pool"（ld_prime 链接器 bug），
+> 用 `scripts/fix-macho-linkedit.py` 修补后再安装。
 
 ## 快速上手
 

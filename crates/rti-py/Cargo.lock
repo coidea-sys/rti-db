@@ -169,18 +169,8 @@ name = "rti-mem"
 version = "0.8.0"
 
 [[package]]
-name = "rti-py"
-version = "0.8.0"
-dependencies = [
- "pyo3",
- "rti-core",
- "rti-db",
- "rti-query",
-]
-
-[[package]]
 name = "rti-query"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "rti-core",
 ]
@@ -200,6 +190,16 @@ version = "0.8.0"
 dependencies = [
  "crc32fast",
  "rti-core",
+]
+
+[[package]]
+name = "rtidb"
+version = "0.8.0"
+dependencies = [
+ "pyo3",
+ "rti-core",
+ "rti-db",
+ "rti-query",
 ]
 
 [[package]]

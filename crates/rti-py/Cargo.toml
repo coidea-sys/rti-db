@@ -1,5 +1,5 @@
 [package]
-name = "rti-py"
+name = "rtidb"   # PyPI 分发名：rti-py 与已占用的 pypi.org/project/rti 冲突；import 名仍为 rti_db
 version = "0.8.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
